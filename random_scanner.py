@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v12.0 – The Unstoppable Pentester Platform
+ULTRA-DAST v12.7 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -199,7 +199,7 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
 try:
-    import grpc
+    import grpcio as grpc
     from grpc_reflection.v1alpha import reflection_pb2_grpc, reflection_pb2
     GRPC_AVAILABLE = True
 except ImportError:
@@ -227,10 +227,11 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QPushButton,
     QTextEdit, QProgressBar, QStatusBar, QFileDialog, QMessageBox,
     QFormLayout, QCheckBox, QTabWidget, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-    QDialog, QDialogButtonBox, QPlainTextEdit, QAction, QToolBar, QComboBox, QMenu, QMenuBar
+    QDialog, QDialogButtonBox, QPlainTextEdit, QAction, QToolBar, QComboBox, QMenu, QMenuBar,
+    QGroupBox, QFrame, QScrollArea
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt
-from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextDocument
+from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextDocument, QPalette
 
 # ---------------------------------------------------------------------
 # CONSTANTS
@@ -603,21 +604,99 @@ AWS_META_PATTERN = re.compile(r"(ami-id|instance-id|public-keys|security-credent
 _obfuscation_cache = {}
 
 def obfuscate(payload, context="param"):
+    """
+    Context-aware payload obfuscation for different injection contexts.
+    
+    Contexts:
+    - param: URL parameter injection (default)
+    - json: JSON body injection
+    - html: HTML injection (innerHTML, etc.)
+    - js: JavaScript code injection
+    - url: URL fragment/path injection
+    - css: CSS injection
+    - sql: SQL injection context
+    """
     cache_key = (payload, context)
     if cache_key in _obfuscation_cache:
         return _obfuscation_cache[cache_key]
+    
     def generate_variants():
         yield payload
+        
+        # Context-specific escaping
+        if context == "json":
+            # JSON-in-HTML context: Handle JSON encoding and HTML entity encoding
+            yield json_escape(payload)
+            yield json_unicode_escape(payload)
+            yield json_html_escape(payload)
+            # JSON property name obfuscation
+            if "=" in payload or ":" in payload:
+                obfuscated = json_property_obfuscation(payload)
+                if obfuscated != payload:
+                    yield obfuscated
+                
+        elif context == "html":
+            # HTML injection context: Handle entity encoding and script tags
+            yield html_entity_encode(payload)
+            yield html_hex_encode(payload)
+            yield html_decimal_encode(payload)
+            # Script tag obfuscation
+            if "<script" in payload.lower() or "alert(" in payload.lower():
+                yield script_tag_obfuscation(payload)
+                
+        elif context == "js":
+            # JavaScript injection context: Handle string escaping and code obfuscation
+            yield js_string_escape(payload)
+            yield js_unicode_escape(payload)
+            yield js_backtick_escape(payload)
+            # JavaScript code obfuscation
+            if "alert(" in payload.lower() or "document." in payload.lower():
+                yield js_code_obfuscation(payload)
+                
+        elif context == "url":
+            # URL fragment/path injection: Handle URL encoding and JavaScript protocols
+            yield url_encode(payload)
+            yield url_double_encode(payload)
+            url_obf = url_fragment_obfuscation(payload)
+            if url_obf != payload:
+                yield url_obf
+            # JavaScript protocol obfuscation
+            if "javascript:" in payload.lower():
+                js_proto_obf = javascript_protocol_obfuscation(payload)
+                if js_proto_obf != payload:
+                    yield js_proto_obf
+                
+        elif context == "css":
+            # CSS injection context: Handle CSS encoding and expression obfuscation
+            yield css_escape(payload)
+            yield css_hex_escape(payload)
+            css_expr_obf = css_expression_obfuscation(payload)
+            if css_expr_obf != payload:
+                yield css_expr_obf
+            
+        elif context == "sql":
+            # SQL injection context: Handle SQL comment obfuscation
+            yield sql_comment_obfuscation(payload)
+            yield sql_whitespace_obfuscation(payload)
+            sql_kw_obf = sql_keyword_obfuscation(payload)
+            if sql_kw_obf != payload:
+                yield sql_kw_obf
+        
+        # Default param context and general obfuscations
         yield quote(payload, safe='')
         yield quote(quote(payload, safe=''), safe='')
+        
         def randomize_case(text):
             return ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in text)
+        
         if "SELECT" in payload.upper() or "ALERT" in payload.upper() or "UNION" in payload.upper():
             yield randomize_case(payload)
             yield payload.upper()
             yield payload.lower()
+            
         if " " in payload:
             yield payload.replace(" ", "/**/")
+            
         def to_fullwidth(text):
             result = []
             for c in text:
@@ -627,13 +706,16 @@ def obfuscate(payload, context="param"):
                 else:
                     result.append(c)
             return ''.join(result)
+            
         yield to_fullwidth(payload)
+        
         keywords = ["SELECT", "UNION", "FROM", "WHERE", "AND", "OR", "INSERT", "UPDATE", "DELETE", "DROP", "alert", "script"]
         for keyword in keywords:
             if keyword in payload.upper():
                 yield payload.replace(keyword, keyword[0] + "%09" + keyword[1:])
                 yield payload.replace(keyword, keyword[0] + "%0a" + keyword[1:])
                 break
+        
         def json_unicode_escape(text):
             result = []
             for c in text:
@@ -646,30 +728,216 @@ def obfuscate(payload, context="param"):
                 else:
                     result.append(c)
             return ''.join(result)
-        if context == "json":
-            yield json_unicode_escape(payload)
+        
         html_entity = ''.join(f"&#{ord(c)};" for c in payload)
         yield html_entity
+        
         unicode_escaped = ''.join(f"\\u{ord(c):04x}" for c in payload)
         yield unicode_escaped
+        
         yield quote(quote(quote(payload, safe=''), safe=''))
         yield payload.replace(" ", " %00")
+        
         if " " in payload:
             comment_variant = payload.replace(" ", "/**/")
             yield quote(comment_variant, safe='')
             yield quote(quote(comment_variant, safe=''), safe='')
+            
         if "SELECT" in payload.upper() and " " in payload:
             mixed_case = randomize_case(payload)
             yield mixed_case.replace(" ", "/**/")
+            
         if "SELECT" in payload.upper():
             fullwidth = to_fullwidth(payload)
             for keyword in keywords:
                 if keyword in payload.upper():
                     yield fullwidth.replace(keyword.upper(), keyword.upper()[0] + "%09" + keyword.upper()[1:])
                     break
+    
     variants = list(set(generate_variants()))
     _obfuscation_cache[cache_key] = variants
     return variants
+
+# Context-specific obfuscation functions
+def json_escape(payload):
+    """JSON string escaping with proper quote handling."""
+    escaped = payload.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+def json_unicode_escape(payload):
+    """Unicode escape for JSON context."""
+    result = []
+    for c in payload:
+        if c == "'":
+            result.append("\\u0027")
+        elif c == '"':
+            result.append("\\u0022")
+        elif c == '\\':
+            result.append("\\u005C")
+        elif ord(c) < 32 or ord(c) > 126:
+            result.append(f"\\u{ord(c):04x}")
+        else:
+            result.append(c)
+    return ''.join(result)
+
+def json_html_escape(payload):
+    """Combined JSON and HTML entity escaping for JSON-in-HTML context."""
+    # First JSON escape, then HTML entity encode
+    json_escaped = json_escape(payload)
+    html_escaped = json_escaped.replace('"', '&quot;').replace("'", '&#39;')
+    return html_escaped
+
+def json_property_obfuscation(payload):
+    """Obfuscate JSON property names and structure."""
+    if '=' in payload:
+        key, value = payload.split('=', 1)
+        # Obfuscate key with various techniques
+        obfuscated_keys = [
+            f'"{key}"',
+            f"'{key}'",
+            f'\\u{ord(key[0]):04x}{key[1:]}',
+            key,
+            f' {key} ',
+            f'/*comment*/{key}/*comment*/'
+        ]
+        # Return first variant as string
+        return f'{obfuscated_keys[0]}={value}'
+    return payload
+
+def html_entity_encode(payload):
+    """HTML entity encoding."""
+    return ''.join(f'&#{ord(c)};' for c in payload)
+
+def html_hex_encode(payload):
+    """HTML hexadecimal entity encoding."""
+    return ''.join(f'&#x{ord(c):x};' for c in payload)
+
+def html_decimal_encode(payload):
+    """HTML decimal encoding with mixed case."""
+    return ''.join(f'&#{ord(c)};' if random.random() > 0.5 else f'&#x{ord(c):x};' for c in payload)
+
+def script_tag_obfuscation(payload):
+    """Script tag obfuscation techniques."""
+    obfuscated = payload.lower()
+    # Replace script tag variations
+    obfuscated = obfuscated.replace('<script', '<scr\0ipt')
+    obfuscated = obfuscated.replace('<script', '<scr<!-- -->ipt')
+    obfuscated = obfuscated.replace('<script', '<script/x')
+    # Replace alert variations
+    obfuscated = obfuscated.replace('alert(', 'window[\'alert\'](')
+    obfuscated = obfuscated.replace('alert(', 'window["alert"](')
+    obfuscated = obfuscated.replace('alert(', '\\u0061\\u006c\\u0065\\u0072\\u0074(')
+    return obfuscated
+
+def js_string_escape(payload):
+    """JavaScript string escaping."""
+    escaped = payload.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"')
+    return f"'{escaped}'"
+
+def js_unicode_escape(payload):
+    """JavaScript unicode escaping."""
+    return ''.join(f'\\u{ord(c):04x}' for c in payload)
+
+def js_backtick_escape(payload):
+    """JavaScript template literal escaping."""
+    escaped = payload.replace('`', '\\`').replace('${', '\\${')
+    return f'`{escaped}`'
+
+def js_code_obfuscation(payload):
+    """JavaScript code obfuscation."""
+    obfuscated = payload
+    # Replace common JavaScript patterns
+    obfuscated = obfuscated.replace('document.', 'window[\'document\'].')
+    obfuscated = obfuscated.replace('document.', 'window["document"].')
+    obfuscated = obfuscated.replace('window.', 'self[\'window\'].')
+    obfuscated = obfuscated.replace('location.', 'window[\'location\'].')
+    obfuscated = obfuscated.replace('alert(', 'window[\\\'alert\\\'](')
+    # Access property obfuscation
+    obfuscated = obfuscated.replace('.cookie', '[\\\'cookie\\\']')
+    obfuscated = obfuscated.replace('.location', '[\\\'location\\\']')
+    return obfuscated
+
+def url_encode(payload):
+    """URL encoding."""
+    return quote(payload, safe='')
+
+def url_double_encode(payload):
+    """Double URL encoding."""
+    return quote(quote(payload, safe=''), safe='')
+
+def url_fragment_obfuscation(payload):
+    """URL fragment obfuscation."""
+    # Encode for URL fragment context
+    encoded = quote(payload, safe='!#$&\'()*+,/:;=?@[]~')
+    # Return first variant
+    return encoded
+
+def javascript_protocol_obfuscation(payload):
+    """JavaScript protocol obfuscation for URL context."""
+    obfuscated = payload.lower()
+    # JavaScript protocol variations - use first one
+    if 'javascript:' in obfuscated:
+        return obfuscated.replace('javascript:', 'javascript\\u003a')
+    return payload
+
+def css_escape(payload):
+    """CSS escaping."""
+    escaped = payload.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+    return f'"{escaped}"'
+
+def css_hex_escape(payload):
+    """CSS hexadecimal escaping."""
+    return ''.join(f'\\{ord(c):x} ' if ord(c) > 127 else c for c in payload)
+
+def css_expression_obfuscation(payload):
+    """CSS expression obfuscation."""
+    obfuscated = payload.lower()
+    # CSS expression variations
+    obfuscated = obfuscated.replace('expression(', 'exp/*comment*/ression(')
+    obfuscated = obfuscated.replace('expression(', 'e\\xpression(')
+    obfuscated = obfuscated.replace('expression(', 'e\\78 xpression(')
+    return obfuscated
+
+def sql_comment_obfuscation(payload):
+    """SQL comment obfuscation."""
+    obfuscated = payload
+    # SQL comment variations
+    obfuscated = obfuscated.replace('--', '-- /*comment*/')
+    obfuscated = obfuscated.replace('--', '--#')
+    obfuscated = obfuscated.replace('--', '--%0a')
+    obfuscated = obfuscated.replace('--', '--%23')
+    return obfuscated
+
+def sql_whitespace_obfuscation(payload):
+    """SQL whitespace obfuscation."""
+    obfuscated = payload
+    # SQL whitespace variations
+    obfuscated = obfuscated.replace(' ', '/**/')
+    obfuscated = obfuscated.replace(' ', '%20')
+    obfuscated = obfuscated.replace(' ', '%09')
+    obfuscated = obfuscated.replace(' ', '%0a')
+    obfuscated = obfuscated.replace(' ', '%0b')
+    obfuscated = obfuscated.replace(' ', '%0c')
+    obfuscated = obfuscated.replace(' ', '%0d')
+    obfuscated = obfuscated.replace(' ', '%a0')
+    return obfuscated
+
+def sql_keyword_obfuscation(payload):
+    """SQL keyword obfuscation."""
+    obfuscated = payload.upper()
+    # SQL keyword variations
+    keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR', 'INSERT', 'UPDATE', 'DELETE', 'DROP']
+    for keyword in keywords:
+        if keyword in obfuscated:
+            # Mixed case
+            mixed = ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(keyword))
+            obfuscated = obfuscated.replace(keyword, mixed)
+            # Fullwidth
+            fullwidth = ''.join(chr(ord(c) + 0xFEE0) for c in keyword)
+            obfuscated = obfuscated.replace(keyword, fullwidth)
+            # Tab insertion
+            obfuscated = obfuscated.replace(keyword, keyword[0] + '%09' + keyword[1:])
+    return obfuscated
 
 # ---------------------------------------------------------------------
 # DYNAMIC PAYLOAD GENERATOR
@@ -702,7 +970,8 @@ class DynamicPayloadGenerator:
             'language': 'unknown',
             'database': 'unknown',
             'cdn': 'unknown',
-            'waf': 'unknown'
+            'waf': 'unknown',
+            'content_type': 'unknown'
         }
         
         if headers:
@@ -755,6 +1024,11 @@ class DynamicPayloadGenerator:
             elif 'spring' in x_powered_by:
                 env['framework'] = 'spring'
                 env['language'] = 'java'
+            
+            # Content-Type Detection
+            content_type = headers_dict.get('Content-Type', '')
+            if content_type:
+                env['content_type'] = content_type
             
             # WAF Detection
             waf_headers = ['X-WAF-Status', 'X-CDN', 'X-Sucuri-ID', 'X-AWS-ID', 'CF-Ray']
@@ -1135,13 +1409,63 @@ class DynamicPayloadGenerator:
             waf_payloads = self.generate_waf_evasion_payload(base_payload, environment['waf'])
             adaptive_payloads.extend(waf_payloads)
         
-        # Apply standard obfuscation to all adaptive payloads
+        # Apply context-aware obfuscation to all adaptive payloads
         final_payloads = []
         for payload in adaptive_payloads:
-            obfuscated = obfuscate(payload)
-            final_payloads.extend(obfuscated)
+            # Determine context based on vulnerability type and payload characteristics
+            context = self._determine_injection_context(vuln_type, payload, environment)
+            try:
+                obfuscated = obfuscate(payload, context)
+                final_payloads.extend(obfuscated)
+            except Exception as e:
+                logging.debug(f"Context-aware obfuscation failed for {context}: {e}, falling back to default")
+                # Fallback to default obfuscation
+                obfuscated = obfuscate(payload, "param")
+                final_payloads.extend(obfuscated)
         
         return list(set(final_payloads))
+    
+    def _determine_injection_context(self, vuln_type, payload, environment):
+        """
+        Determine the injection context for context-aware obfuscation.
+        
+        Args:
+            vuln_type: Type of vulnerability (XSS, SQLi, etc.)
+            payload: The payload being tested
+            environment: Detected environment information
+        
+        Returns:
+            str: Context string (json, html, js, url, css, sql, param)
+        """
+        # JSON context detection
+        if vuln_type in ['XSS', 'SQLi'] and environment.get('content_type', '').startswith('application/json'):
+            return 'json'
+        
+        # HTML context detection
+        if vuln_type == 'XSS':
+            if '<script' in payload.lower() or 'alert(' in payload.lower():
+                return 'html'
+            if environment.get('content_type', '').startswith('text/html'):
+                return 'html'
+        
+        # JavaScript context detection
+        if vuln_type == 'XSS' and any(js_pattern in payload.lower() for js_pattern in ['document.', 'window.', 'alert(']):
+            return 'js'
+        
+        # URL context detection
+        if vuln_type == 'OpenRedirect' or 'javascript:' in payload.lower():
+            return 'url'
+        
+        # CSS context detection
+        if vuln_type == 'XSS' and any(css_pattern in payload.lower() for css_pattern in ['expression(', 'style=', 'css(']):
+            return 'css'
+        
+        # SQL context detection
+        if vuln_type == 'SQLi':
+            return 'sql'
+        
+        # Default to parameter context
+        return 'param'
     
     def generate_encrypted_payload_variants(self, base_payload):
         """Generate various encrypted payload variants."""
@@ -2577,7 +2901,7 @@ class MetasploitModule < Msf::Exploit::Remote
     )
 
   def exploit(self)
-    print_status("Sending exploit to #{{{datastore['RHOST']}}}:{{{datastore['RPORT']}}}")
+    print_status("Sending exploit to #{{{{datastore['RHOST']}}}}:#{{{{datastore['RPORT']}}}}")
 
     res = send_request_cgi({{
       'method': vuln.get("method", "GET"),
@@ -2589,7 +2913,7 @@ class MetasploitModule < Msf::Exploit::Remote
 
     if res and res.code == 200
       print_good("Exploit sent successfully")
-      print_status("Response: #{{{res.body[0:200]}}}")
+      print_status("Response: #{{{{res.body[0:200]}}}}")
     else
       print_error("Exploit failed")
     end
@@ -2652,7 +2976,7 @@ class MetasploitModule < Msf::Auxiliary
     )
 
   def run(self)
-    print_status("Testing SQL injection at #{{{datastore['RHOST']}}}:{{{datastore['RPORT']}}}")
+    print_status("Testing SQL injection at #{{{{datastore['RHOST']}}}}:#{{{{datastore['RPORT']}}}}")
 
     sqli_tests = [
       "' OR '1'='1",
@@ -2664,7 +2988,7 @@ class MetasploitModule < Msf::Auxiliary
     ]
 
     for test_payload in sqli_tests
-      print_status("Testing payload: #{{{test_payload}}}")
+      print_status("Testing payload: #{{{{test_payload}}}}")
 
       start_time = time.time()
       res = send_request_cgi({{
@@ -2687,7 +3011,7 @@ class MetasploitModule < Msf::Auxiliary
             'refs': []
           }})
         elsif elapsed > 5
-          print_good("SQL Injection CONFIRMED - Time-based (#{{{round(elapsed, 2)}}}s)")
+          print_good("SQL Injection CONFIRMED - Time-based (#{{{{round(elapsed, 2)}}}}s)")
           report_vuln({{
             'host': datastore['RHOST'],
             'port': datastore['RPORT'],
@@ -2710,7 +3034,7 @@ class MetasploitModule < Msf::Auxiliary
       }})
 
       if res
-        print_good("Database response: #{{{res.body[0:200]}}}")
+        print_good("Database response: #{{{{res.body[0:200]}}}}")
       end
     end
   end
@@ -2769,7 +3093,7 @@ class MetasploitModule < Msf::Exploit::Remote
     )
 
   def exploit(self)
-    print_status("Testing SSTI at #{{{datastore['RHOST']}}}:{{{datastore['RPORT']}}}")
+    print_status("Testing SSTI at #{{{{datastore['RHOST']}}}}:#{{{{datastore['RPORT']}}}}")
 
     ssti_payloads = [
       '{{{{7*7}}}}',
@@ -2779,7 +3103,7 @@ class MetasploitModule < Msf::Exploit::Remote
     ]
 
     for test_payload in ssti_payloads
-      print_status("Testing payload: #{{{test_payload[0..50]}}}...")
+      print_status("Testing payload: #{{{{test_payload[0..50]}}}}...")
 
       res = send_request_cgi({{
         'method': vuln.get("method", "GET"),
@@ -2852,7 +3176,7 @@ class MetasploitModule < Msf::Auxiliary
     )
 
   def run(self)
-    print_status("Testing XSS at #{{{datastore['RHOST']}}}:{{{datastore['RPORT']}}}")
+    print_status("Testing XSS at #{{{{datastore['RHOST']}}}}:#{{{{datastore['RPORT']}}}}")
 
     xss_payloads = [
       '<script>alert(1)</script>',
@@ -2863,7 +3187,7 @@ class MetasploitModule < Msf::Auxiliary
     ]
 
     for test_payload in xss_payloads
-      print_status("Testing payload: #{{{test_payload}}}")
+      print_status("Testing payload: #{{{{test_payload}}}}")
 
       res = send_request_cgi({{
         'method': vuln.get("method", "GET"),
@@ -2875,7 +3199,7 @@ class MetasploitModule < Msf::Auxiliary
 
       if res and test_payload in res.body
         print_good("XSS CONFIRMED - Payload reflected unmodified")
-        print_good("URL: #{{{datastore['TARGETURI']}}}?#{{{datastore['PARAMETER']}}}=#{{{test_payload}}}")
+        print_good("URL: #{{{{datastore['TARGETURI']}}}}?#{{{{datastore['PARAMETER']}}}}=#{{{{test_payload}}}}")
         report_vuln({{
           'host': datastore['RHOST'],
           'port': datastore['RPORT'],
@@ -2936,7 +3260,7 @@ class MetasploitModule < Msf::Auxiliary
     )
 
   def run(self)
-    print_status("Exploiting #{{{vuln_type}}} at #{{{datastore['RHOST']}}}:{{{datastore['RPORT']}}}")
+    print_status("Exploiting #{{{{vuln_type}}}} at #{{{{datastore['RHOST']}}}}:#{{{{datastore['RPORT']}}}}")
 
     res = send_request_cgi({{
       'method': vuln.get("method", "GET"),
@@ -2948,7 +3272,7 @@ class MetasploitModule < Msf::Auxiliary
 
     if res
       print_good("Exploit sent successfully")
-      print_status("Response: #{{{res.body[0..200]}}}")
+      print_status("Response: #{{{{res.body[0..200]}}}}")
       report_vuln({{
         'host': datastore['RHOST'],
         'port': datastore['RPORT'],
@@ -3334,9 +3658,131 @@ class TokenBucket:
         """Get current available tokens (for monitoring)."""
         return self.tokens
 
+class PayloadQueue:
+    """
+    Queue-based payload management to prevent test abortion on rate limiting.
+    
+    Instead of aborting entire parameter testing when rate limiting is detected,
+    this system queues payloads and continues processing at a reduced rate.
+    """
+    def __init__(self, max_queue_size: int = 1000):
+        self.queue = asyncio.Queue(maxsize=max_queue_size)
+        self.priority_queue = asyncio.PriorityQueue(maxsize=max_queue_size // 2)
+        self.lock = asyncio.Lock()
+        self.total_queued = 0
+        self.total_processed = 0
+        self.dropped_count = 0
+    
+    async def enqueue(self, payload: dict, priority: int = 0) -> bool:
+        """
+        Add a payload to the queue.
+        
+        Args:
+            payload: Dictionary containing payload data
+            priority: Higher priority payloads are processed first (0 = normal, 1 = high)
+        
+        Returns:
+            bool: True if enqueued successfully, False if queue is full
+        """
+        async with self.lock:
+            if priority > 0:
+                try:
+                    self.priority_queue.put_nowait((priority, self.total_queued, payload))
+                    self.total_queued += 1
+                    return True
+                except asyncio.QueueFull:
+                    self.dropped_count += 1
+                    logging.warning(f"Priority queue full, dropped high-priority payload")
+                    return False
+            else:
+                try:
+                    self.queue.put_nowait(payload)
+                    self.total_queued += 1
+                    return True
+                except asyncio.QueueFull:
+                    self.dropped_count += 1
+                    logging.warning(f"Queue full, dropped payload")
+                    return False
+    
+    async def dequeue(self) -> Optional[dict]:
+        """
+        Get the next payload to process (priority first, then normal).
+        
+        Returns:
+            dict or None: Next payload or None if queues are empty
+        """
+        # Try priority queue first
+        try:
+            priority, seq_num, payload = self.priority_queue.get_nowait()
+            self.total_processed += 1
+            return payload
+        except asyncio.QueueEmpty:
+            pass
+        
+        # Try normal queue
+        try:
+            payload = self.queue.get_nowait()
+            self.total_processed += 1
+            return payload
+        except asyncio.QueueEmpty:
+            return None
+    
+    async def wait_for_payload(self, timeout: float = 1.0) -> Optional[dict]:
+        """
+        Wait for a payload with timeout.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+        
+        Returns:
+            dict or None: Next payload or None if timeout
+        """
+        try:
+            # Try priority queue first with timeout
+            priority, seq_num, payload = await asyncio.wait_for(
+                self.priority_queue.get(), timeout=timeout
+            )
+            self.total_processed += 1
+            return payload
+        except asyncio.TimeoutError:
+            pass
+        
+        try:
+            # Try normal queue with timeout
+            payload = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            self.total_processed += 1
+            return payload
+        except asyncio.TimeoutError:
+            return None
+    
+    def get_stats(self) -> dict:
+        """Get queue statistics."""
+        return {
+            'total_queued': self.total_queued,
+            'total_processed': self.total_processed,
+            'dropped_count': self.dropped_count,
+            'queue_size': self.queue.qsize(),
+            'priority_queue_size': self.priority_queue.qsize(),
+            'pending': self.total_queued - self.total_processed
+        }
+    
+    def clear(self):
+        """Clear all queues."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        while not self.priority_queue.empty():
+            self.priority_queue.get_nowait()
+        self.total_queued = 0
+        self.total_processed = 0
+
 class AdaptiveThrottler:
     """
     Adaptive throttling that responds to IDS/IPS indicators.
+    
+    Instead of aggressive abort, uses queue-based continuation:
+    - Queues payloads when rate limiting is detected
+    - Continues processing at reduced rate
+    - Gradually recovers when rate limiting subsides
     
     Automatically adjusts request rates based on:
     - HTTP 429 (Too Many Requests)
@@ -3344,20 +3790,24 @@ class AdaptiveThrottler:
     - Connection timeouts
     - Other rate limiting signals
     """
-    def __init__(self, base_rate: float, min_rate: float = 0.1, max_rate: float = 100.0):
+    def __init__(self, base_rate: float, min_rate: float = 0.1, max_rate: float = 100.0, 
+                 payload_queue: Optional[PayloadQueue] = None):
         self.base_rate = base_rate
         self.current_rate = base_rate
         self.min_rate = min_rate
         self.max_rate = max_rate
-        self.backoff_multiplier = 0.5  # Reduce rate by 50% on throttle
-        self.recovery_multiplier = 1.1  # Increase rate by 10% on success
+        self.backoff_multiplier = 0.7  # Less aggressive backoff (was 0.5)
+        self.recovery_multiplier = 1.05  # More gradual recovery (was 1.1)
         self.consecutive_throttles = 0
         self.consecutive_successes = 0
         self.lock = asyncio.Lock()
+        self.payload_queue = payload_queue
+        self.abort_threshold = 10  # Only abort after 10 consecutive throttles
+        self.queue_mode = False  # Enable queue mode when throttled
         
     async def handle_response(self, status_code: int, response_time: float = 0) -> None:
         """
-        Adjust rate based on HTTP response.
+        Adjust rate based on HTTP response with queue-based continuation.
         
         Args:
             status_code: HTTP status code
@@ -3368,16 +3818,24 @@ class AdaptiveThrottler:
             if status_code == 429:
                 self.consecutive_throttles += 1
                 self.consecutive_successes = 0
-                # Aggressive backoff for 429
+                self.queue_mode = True  # Enable queue mode
+                
+                # Moderate backoff for 429 (less aggressive than before)
                 self.current_rate = max(self.min_rate, self.current_rate * self.backoff_multiplier)
-                logging.warning(f"Rate limit detected (429). Reducing rate to {self.current_rate:.2f} req/s")
+                logging.warning(f"Rate limit detected (429). Queueing payloads, reducing rate to {self.current_rate:.2f} req/s")
+                
+                # Check if we should abort (only after many consecutive throttles)
+                if self.consecutive_throttles >= self.abort_threshold:
+                    logging.error(f"Excessive throttling ({self.consecutive_throttles} consecutive). Consider aborting.")
                 
             elif status_code == 503:
                 self.consecutive_throttles += 1
                 self.consecutive_successes = 0
+                self.queue_mode = True
+                
                 # Moderate backoff for 503
-                self.current_rate = max(self.min_rate, self.current_rate * 0.7)
-                logging.warning(f"Service unavailable (503). Reducing rate to {self.current_rate:.2f} req/s")
+                self.current_rate = max(self.min_rate, self.current_rate * 0.8)
+                logging.warning(f"Service unavailable (503). Queueing payloads, reducing rate to {self.current_rate:.2f} req/s")
                 
             elif status_code >= 500:
                 # Other server errors - slight backoff
@@ -3397,6 +3855,10 @@ class AdaptiveThrottler:
                 if self.consecutive_throttles > 0:
                     self.consecutive_throttles -= 1
                 
+                # Disable queue mode after several consecutive successes
+                if self.consecutive_successes >= 5:
+                    self.queue_mode = False
+                
                 # Only recover after several consecutive successes
                 if self.consecutive_successes >= 10:
                     self.current_rate = min(self.max_rate, self.current_rate * self.recovery_multiplier)
@@ -3408,12 +3870,22 @@ class AdaptiveThrottler:
         async with self.lock:
             return self.current_rate
     
+    async def should_queue(self) -> bool:
+        """Check if payloads should be queued due to throttling."""
+        async with self.lock:
+            return self.queue_mode
+    
     async def reset(self) -> None:
         """Reset to base rate."""
         async with self.lock:
             self.current_rate = self.base_rate
             self.consecutive_throttles = 0
             self.consecutive_successes = 0
+            self.queue_mode = False
+    
+    def set_payload_queue(self, queue: PayloadQueue):
+        """Set the payload queue for queue-based continuation."""
+        self.payload_queue = queue
 
 class AsyncRateLimiter:
     def __init__(self, base_delay, jitter=0.05, traffic_shaper=None, ids_ips_config=None):
@@ -3427,16 +3899,21 @@ class AsyncRateLimiter:
         self.ids_ips_enabled = False
         self.token_bucket = None
         self.adaptive_throttler = None
+        self.payload_queue = None
         
         if ids_ips_config:
             self.ids_ips_enabled = ids_ips_config.get('enabled', False)
             if self.ids_ips_enabled:
+                # Initialize payload queue for queue-based continuation
+                queue_size = ids_ips_config.get('queue_size', 1000)
+                self.payload_queue = PayloadQueue(max_queue_size=queue_size)
+                
                 # Initialize token bucket
                 rate = ids_ips_config.get('max_requests_per_second', 10)
                 capacity = ids_ips_config.get('burst_capacity', 20)
                 self.token_bucket = TokenBucket(rate=rate, capacity=capacity)
                 
-                # Initialize adaptive throttler
+                # Initialize adaptive throttler with payload queue
                 min_rate = ids_ips_config.get('min_requests_per_second', 0.1)
                 abs_max_rate = ids_ips_config.get('absolute_max_requests_per_second', 100)
                 self.adaptive_throttler = AdaptiveThrottler(
@@ -3444,8 +3921,10 @@ class AsyncRateLimiter:
                     min_rate=min_rate,
                     max_rate=abs_max_rate
                 )
+                # Set payload queue after initialization
+                self.adaptive_throttler.set_payload_queue(self.payload_queue)
                 
-                logging.info(f"IDS/IPS throttling enabled: {rate} req/s, burst capacity {capacity}")
+                logging.info(f"IDS/IPS throttling enabled: {rate} req/s, burst capacity {capacity}, queue size {queue_size}")
         
         try:
             self.loop = asyncio.get_running_loop()
@@ -3491,12 +3970,36 @@ class AsyncRateLimiter:
                 self.token_bucket.rate = new_rate
                 logging.info(f"Token bucket rate updated to {{{new_rate:.2f}}} req/s")
     
+    async def should_queue_payloads(self) -> bool:
+        """Check if payloads should be queued due to active throttling."""
+        if self.ids_ips_enabled and self.adaptive_throttler:
+            return await self.adaptive_throttler.should_queue()
+        return False
+    
+    async def enqueue_payload(self, payload: dict, priority: int = 0) -> bool:
+        """Enqueue a payload for later processing."""
+        if self.payload_queue:
+            return await self.payload_queue.enqueue(payload, priority)
+        return False
+    
+    async def get_queued_payload(self, timeout: float = 1.0) -> Optional[dict]:
+        """Get a queued payload for processing."""
+        if self.payload_queue:
+            return await self.payload_queue.wait_for_payload(timeout)
+        return None
+    
+    def get_queue_stats(self) -> dict:
+        """Get payload queue statistics."""
+        if self.payload_queue:
+            return self.payload_queue.get_stats()
+        return {}
+    
     async def get_throttle_status(self) -> dict:
         """
         Get current throttling status for monitoring.
         
         Returns:
-            dict: Status information including rates, tokens, etc.
+            dict: Status information including rates, tokens, queue stats, etc.
         """
         status = {
             'ids_ips_enabled': self.ids_ips_enabled,
@@ -3512,10 +4015,137 @@ class AsyncRateLimiter:
             status['adaptive_throttler'] = {
                 'current_rate': await self.adaptive_throttler.get_current_rate(),
                 'consecutive_throttles': self.adaptive_throttler.consecutive_throttles,
-                'consecutive_successes': self.adaptive_throttler.consecutive_successes
+                'consecutive_successes': self.adaptive_throttler.consecutive_successes,
+                'queue_mode': await self.adaptive_throttler.should_queue()
             }
+            status['payload_queue'] = self.get_queue_stats()
         
         return status
+
+class SessionStateManager:
+    """
+    Manages session state for multi-step business logic testing.
+    
+    This class addresses the false negative where multi-step flows fail because
+    session_ids generated in Step 1 are incorrectly reused in Step 3.
+    
+    Features:
+    - Isolated session contexts for each test flow
+    - Cookie and header management per session
+    - Session state preservation across requests
+    - Automatic cleanup and session expiration
+    """
+    
+    def __init__(self):
+        self.sessions = {}
+        self.lock = threading.Lock()
+        self.session_counter = 0
+    
+    def create_session(self) -> str:
+        """Create a new isolated session context."""
+        with self.lock:
+            session_id = f"session_{self.session_counter}_{uuid.uuid4().hex[:8]}"
+            self.session_counter += 1
+            self.sessions[session_id] = {
+                'cookies': {},
+                'headers': {},
+                'state': {},
+                'created_at': time.time(),
+                'last_used': time.time()
+            }
+            logging.debug(f"Created session: {session_id}")
+            return session_id
+    
+    def get_session_cookies(self, session_id: str) -> dict:
+        """Get cookies for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['last_used'] = time.time()
+                return self.sessions[session_id]['cookies'].copy()
+            return {}
+    
+    def set_session_cookies(self, session_id: str, cookies: dict):
+        """Set cookies for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['cookies'].update(cookies)
+                self.sessions[session_id]['last_used'] = time.time()
+    
+    def get_session_headers(self, session_id: str) -> dict:
+        """Get custom headers for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['last_used'] = time.time()
+                return self.sessions[session_id]['headers'].copy()
+            return {}
+    
+    def set_session_headers(self, session_id: str, headers: dict):
+        """Set custom headers for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['headers'].update(headers)
+                self.sessions[session_id]['last_used'] = time.time()
+    
+    def get_session_state(self, session_id: str, key: str = None):
+        """Get state value for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['last_used'] = time.time()
+                if key:
+                    return self.sessions[session_id]['state'].get(key)
+                return self.sessions[session_id]['state'].copy()
+            return None
+    
+    def set_session_state(self, session_id: str, key: str, value: any):
+        """Set state value for a specific session."""
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]['state'][key] = value
+                self.sessions[session_id]['last_used'] = time.time()
+    
+    def update_session_from_response(self, session_id: str, response):
+        """Update session state from HTTP response (cookies, etc.)."""
+        if not response:
+            return
+        
+        with self.lock:
+            if session_id in self.sessions:
+                # Extract cookies from response if available
+                if hasattr(response, 'cookies'):
+                    self.sessions[session_id]['cookies'].update(dict(response.cookies))
+                
+                # Extract any session-related headers
+                if hasattr(response, 'headers'):
+                    for header in ['set-cookie', 'x-session-id', 'x-auth-token']:
+                        if header in response.headers:
+                            self.sessions[session_id]['headers'][header] = response.headers[header]
+                
+                self.sessions[session_id]['last_used'] = time.time()
+    
+    def destroy_session(self, session_id: str):
+        """Destroy a session and clean up resources."""
+        with self.lock:
+            if session_id in self.sessions:
+                logging.debug(f"Destroying session: {session_id}")
+                del self.sessions[session_id]
+    
+    def cleanup_expired_sessions(self, max_age_seconds: int = 3600):
+        """Clean up sessions that haven't been used recently."""
+        with self.lock:
+            current_time = time.time()
+            expired_sessions = [
+                session_id for session_id, session_data in self.sessions.items()
+                if current_time - session_data['last_used'] > max_age_seconds
+            ]
+            for session_id in expired_sessions:
+                logging.debug(f"Cleaning up expired session: {session_id}")
+                del self.sessions[session_id]
+            return len(expired_sessions)
+    
+    def get_session_count(self) -> int:
+        """Get the number of active sessions."""
+        with self.lock:
+            return len(self.sessions)
 
 class TrafficShaper:
     """
@@ -3841,6 +4471,8 @@ class JSRenderDriver:
         self.lock = threading.Lock()
         self.spa_routes_clicked = set()
         self.human_like_behavior = human_like_behavior  # Enable/disable human-like simulation
+        self.websocket_messages = deque(maxlen=500)  # Store WebSocket messages
+        self.websocket_monitoring_enabled = False  # WebSocket monitoring flag
     def __enter__(self):
         self.create()
         return self
@@ -3902,10 +4534,15 @@ class JSRenderDriver:
         try:
             self.driver = webdriver.Chrome(options=opts)
             self.driver.set_page_load_timeout(15)
-            self.driver.execute_cdp_cmd("Network.enable", {})
+            
+            # Enable CDP (Chrome DevTools Protocol) for advanced monitoring
             try:
                 self.driver.execute_cdp_cmd("Network.enable", {})
                 logging.info("CDP network monitoring enabled")
+                
+                # Enable WebSocket monitoring
+                self._enable_websocket_monitoring()
+                
             except Exception as cdp_error:
                 logging.warning(f"CDP network monitoring unavailable: {cdp_error}")
             return True
@@ -4267,6 +4904,204 @@ class JSRenderDriver:
         except Exception as e:
             logging.warning(f"Human-like typing error: {e}")
             return False
+    
+    def _enable_websocket_monitoring(self):
+        """Enable WebSocket monitoring using CDP"""
+        try:
+            # Enable Network domain
+            self.driver.execute_cdp_cmd("Network.enable", {})
+            
+            # Set up WebSocket monitoring
+            self.driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+            
+            # Add listener for WebSocket messages
+            self.driver.execute_cdp_cmd("Page.enable", {})
+            
+            logging.info("WebSocket monitoring enabled via CDP")
+            self.websocket_monitoring_enabled = True
+            
+        except Exception as e:
+            logging.warning(f"WebSocket monitoring setup failed: {e}")
+            self.websocket_monitoring_enabled = False
+    
+    def monitor_websocket_traffic(self, timeout=10):
+        """Monitor WebSocket traffic for a specified timeout period"""
+        if not self.driver or not self.websocket_monitoring_enabled:
+            return []
+        
+        websocket_data = []
+        start_time = time.time()
+        
+        try:
+            while time.time() - start_time < timeout:
+                # Get network logs using CDP
+                try:
+                    logs = self.driver.get_log('performance')
+                    
+                    for entry in logs:
+                        message = json.loads(entry['message'])
+                        message_data = message.get('message', {})
+                        
+                        # Check for WebSocket messages
+                        if message_data.get('method') == 'Network.webSocketFrameReceived':
+                            frame_data = message_data.get('params', {})
+                            websocket_data.append({
+                                'type': 'received',
+                                'timestamp': frame_data.get('timestamp'),
+                                'data': frame_data.get('response', {}).get('payloadData', '')
+                            })
+                        elif message_data.get('method') == 'Network.webSocketFrameSent':
+                            frame_data = message_data.get('params', {})
+                            websocket_data.append({
+                                'type': 'sent',
+                                'timestamp': frame_data.get('timestamp'),
+                                'data': frame_data.get('response', {}).get('payloadData', '')
+                            })
+                
+                except Exception as log_error:
+                    logging.debug(f"Error getting performance logs: {log_error}")
+                
+                time.sleep(0.5)
+            
+            # Store captured WebSocket messages
+            with self.lock:
+                self.websocket_messages.extend(websocket_data)
+            
+            logging.info(f"Captured {len(websocket_data)} WebSocket messages")
+            return websocket_data
+            
+        except Exception as e:
+            logging.warning(f"WebSocket monitoring error: {e}")
+            return []
+    
+    def get_websocket_messages(self):
+        """Get captured WebSocket messages"""
+        with self.lock:
+            return list(self.websocket_messages)
+    
+    def clear_websocket_messages(self):
+        """Clear captured WebSocket messages"""
+        with self.lock:
+            self.websocket_messages.clear()
+    
+    def set_local_storage_item(self, key, value):
+        """Set a localStorage item"""
+        if not self.driver:
+            return False
+        
+        try:
+            script = f"""
+            window.localStorage.setItem('{key}', '{value}');
+            return true;
+            """
+            result = self.driver.execute_script(script)
+            logging.debug(f"Set localStorage[{key}] = {value}")
+            return result
+        except Exception as e:
+            logging.warning(f"Error setting localStorage item: {e}")
+            return False
+    
+    def get_local_storage_item(self, key):
+        """Get a localStorage item"""
+        if not self.driver:
+            return None
+        
+        try:
+            script = f"""
+            return window.localStorage.getItem('{key}');
+            """
+            result = self.driver.execute_script(script)
+            logging.debug(f"Got localStorage[{key}] = {result}")
+            return result
+        except Exception as e:
+            logging.warning(f"Error getting localStorage item: {e}")
+            return None
+    
+    def set_session_storage_item(self, key, value):
+        """Set a sessionStorage item"""
+        if not self.driver:
+            return False
+        
+        try:
+            script = f"""
+            window.sessionStorage.setItem('{key}', '{value}');
+            return true;
+            """
+            result = self.driver.execute_script(script)
+            logging.debug(f"Set sessionStorage[{key}] = {value}")
+            return result
+        except Exception as e:
+            logging.warning(f"Error setting sessionStorage item: {e}")
+            return False
+    
+    def get_session_storage_item(self, key):
+        """Get a sessionStorage item"""
+        if not self.driver:
+            return None
+        
+        try:
+            script = f"""
+            return window.sessionStorage.getItem('{key}');
+            """
+            result = self.driver.execute_script(script)
+            logging.debug(f"Got sessionStorage[{key}] = {result}")
+            return result
+        except Exception as e:
+            logging.warning(f"Error getting sessionStorage item: {e}")
+            return None
+    
+    def set_browser_fingerprint(self, fingerprint_data):
+        """Set browser fingerprinting data to mimic real browser"""
+        if not self.driver:
+            return False
+        
+        try:
+            # Set common fingerprinting properties
+            script = """
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            
+            window.chrome = {
+                runtime: {}
+            };
+            
+            return true;
+            """
+            result = self.driver.execute_script(script)
+            logging.debug("Set browser fingerprinting data")
+            return result
+        except Exception as e:
+            logging.warning(f"Error setting browser fingerprint: {e}")
+            return False
+    
+    def wait_for_websocket_message(self, pattern, timeout=10):
+        """Wait for a WebSocket message matching a pattern"""
+        if not self.driver or not self.websocket_monitoring_enabled:
+            return None
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            messages = self.get_websocket_messages()
+            
+            for msg in messages:
+                if pattern in msg.get('data', ''):
+                    logging.info(f"Found WebSocket message matching pattern: {pattern}")
+                    return msg
+            
+            time.sleep(0.5)
+        
+        logging.warning(f"No WebSocket message found matching pattern: {pattern}")
+        return None
 
 class FP_Database:
     def __init__(self, db_path="fp_learn.db"):
@@ -4303,7 +5138,7 @@ class FP_Database:
 class ProxyConfig:
     """Configuration for a single proxy with metadata"""
     def __init__(self, proxy_url, proxy_type="http", username=None, password=None, 
-                 country=None, region=None, is_residential=False, health_check_url=None):
+                 country=None, region=None, is_residential=False, health_check_url=None, target_url=None):
         self.proxy_url = proxy_url
         self.proxy_type = proxy_type.lower()  # http, https, socks5, socks4
         self.username = username
@@ -4311,7 +5146,13 @@ class ProxyConfig:
         self.country = country  # ISO country code (e.g., 'US', 'GB', 'DE')
         self.region = region  # e.g., 'us-east', 'eu-west'
         self.is_residential = is_residential
-        self.health_check_url = health_check_url or "https://api.ipify.org"
+        # Use target URL for health check if provided, otherwise fallback to external service
+        if health_check_url:
+            self.health_check_url = health_check_url
+        elif target_url:
+            self.health_check_url = target_url
+        else:
+            self.health_check_url = "https://api.ipify.org"
         
         # Performance metrics
         self.success_count = 0
@@ -4354,7 +5195,7 @@ class ProxyConfig:
 class ProxyPool:
     """Advanced proxy pool with health checking, rotation, and geo-diverse selection"""
     def __init__(self, proxy_configs=None, enable_rotation=True, rotation_interval=100,
-                 health_check_interval=300, prefer_geo_diverse=True, max_failure_rate=0.5):
+                 health_check_interval=300, prefer_geo_diverse=True, max_failure_rate=0.5, target_url=None):
         self.proxy_configs: Dict[str, ProxyConfig] = {}
         self.enable_rotation = enable_rotation
         self.rotation_interval = rotation_interval  # requests per rotation
@@ -4365,6 +5206,7 @@ class ProxyPool:
         self.lock = threading.Lock()
         self.current_proxy_key = None
         self.last_rotation = datetime.now()
+        self.target_url = target_url  # Store target URL for health checks
         
         # Initialize with provided configs
         if proxy_configs:
@@ -4377,13 +5219,29 @@ class ProxyPool:
     def add_proxy(self, proxy_config: ProxyConfig):
         """Add a proxy configuration to the pool"""
         with self.lock:
+            # If proxy config doesn't have a health_check_url set, use the pool's target_url
+            if not proxy_config.health_check_url or proxy_config.health_check_url == "https://api.ipify.org":
+                if self.target_url:
+                    proxy_config.health_check_url = self.target_url
             key = self._make_proxy_key(proxy_config)
             self.proxy_configs[key] = proxy_config
             logging.info(f"Added proxy to pool: {proxy_config.proxy_url} ({proxy_config.proxy_type})")
+    
+    def set_target_url(self, target_url):
+        """Set or update the target URL for health checks on all proxies"""
+        with self.lock:
+            self.target_url = target_url
+            for config in self.proxy_configs.values():
+                if not config.health_check_url or config.health_check_url == "https://api.ipify.org":
+                    config.health_check_url = target_url
+            logging.info(f"Updated target URL for proxy pool health checks: {target_url}")
             
     def add_proxy_url(self, proxy_url, proxy_type="http", username=None, password=None,
-                     country=None, region=None, is_residential=False):
+                     country=None, region=None, is_residential=False, target_url=None):
         """Convenience method to add a proxy by URL string"""
+        # Use ProxyPool's target_url if no specific target_url provided for this proxy
+        if target_url is None:
+            target_url = self.target_url
         config = ProxyConfig(
             proxy_url=proxy_url,
             proxy_type=proxy_type,
@@ -4391,7 +5249,8 @@ class ProxyPool:
             password=password,
             country=country,
             region=region,
-            is_residential=is_residential
+            is_residential=is_residential,
+            target_url=target_url
         )
         self.add_proxy(config)
         
@@ -5224,6 +6083,64 @@ class ValidationEngine:
 # ---------------------------------------------------------------------
 # DETECTION ENGINE
 # ---------------------------------------------------------------------
+
+def calculate_evidence_based_confidence(
+    evidence_strength: str,  # 'critical', 'high', 'medium', 'low'
+    baseline_excluded: bool = True,
+    multiple_confirmations: bool = False,
+    specificity: str = 'high',  # 'high', 'medium', 'low'
+    false_positive_resistance: str = 'high'  # 'high', 'medium', 'low'
+) -> int:
+    """
+    Calculate confidence score based on evidence quality and accuracy.
+    
+    Args:
+        evidence_strength: How strong is the evidence pattern (critical/high/medium/low)
+        baseline_excluded: Was the baseline properly excluded to avoid false positives
+        multiple_confirmations: Was the evidence confirmed through multiple methods
+        specificity: How specific is the evidence to the vulnerability
+        false_positive_resistance: How resistant is this evidence to false positives
+    
+    Returns:
+        Confidence score (0-100)
+    """
+    base_scores = {
+        'critical': 95,
+        'high': 85,
+        'medium': 70,
+        'low': 50
+    }
+    
+    confidence = base_scores.get(evidence_strength, 50)
+    
+    # Adjust for baseline exclusion (critical for accuracy)
+    if baseline_excluded:
+        confidence += 5
+    else:
+        confidence -= 15  # Significant penalty if baseline not excluded
+    
+    # Adjust for multiple confirmations
+    if multiple_confirmations:
+        confidence += 5
+    
+    # Adjust for specificity
+    specificity_bonus = {
+        'high': 5,
+        'medium': 0,
+        'low': -10
+    }
+    confidence += specificity_bonus.get(specificity, 0)
+    
+    # Adjust for false positive resistance
+    fp_resistance_bonus = {
+        'high': 5,
+        'medium': 0,
+        'low': -10
+    }
+    confidence += fp_resistance_bonus.get(false_positive_resistance, 0)
+    
+    return min(100, max(0, confidence))
+
 class Detector:
     @staticmethod
     def xss(html, payload, baseline_html=None):
@@ -5247,7 +6164,20 @@ class Detector:
         except Exception as e:
             logging.warning(f"HTML parsing error: {e}")
             context = 'html'
-        confidence = 90 if context in ('html','event','href','src') else 80
+        
+        # Evidence-based confidence calculation
+        evidence_strength = 'high' if context in ('html','event','href','src') else 'medium'
+        baseline_excluded = baseline_html is not None and payload not in baseline_html
+        specificity = 'high' if context in ('script','event') else 'medium'
+        
+        confidence = calculate_evidence_based_confidence(
+            evidence_strength=evidence_strength,
+            baseline_excluded=baseline_excluded,
+            multiple_confirmations=False,
+            specificity=specificity,
+            false_positive_resistance='medium'
+        )
+        
         return {"type":"XSS","confidence":confidence,"evidence":Detector._extract(html,payload)}
     @staticmethod
     async def dom_xss(url, driver, oob_marker, oob_url):
@@ -5264,23 +6194,198 @@ class Detector:
         with oob_results_lock:
             for res in oob_results:
                 if oob_marker in res['path']:
-                    return {"type":"DOM XSS","confidence":95,"evidence":"OOB callback confirmed"}
+                    # OOB callback is critical evidence - very high confidence
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"DOM XSS","confidence":confidence,"evidence":"OOB callback confirmed"}
         return None
     @staticmethod
     def blind_xss(oob_results, marker):
         with oob_results_lock:
             for res in oob_results:
                 if marker in res['path']:
-                    return {"type":"Blind XSS","confidence":95,"evidence":f"OOB callback: {res['path']}"}
+                    # OOB callback is critical evidence - very high confidence
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"Blind XSS","confidence":confidence,"evidence":f"OOB callback: {res['path']}"}
         return None
     @staticmethod
-    def sqli(html: str, baseline_html: Optional[str], resp_time: Optional[float] = None, baseline_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    def sqli(html: str, baseline_html: Optional[str], resp_time: Optional[float] = None, baseline_time: Optional[float] = None, time_samples: Optional[List[float]] = None) -> Optional[Dict[str, Any]]:
         if detect_sqli_error_ast(html):
             if baseline_html and detect_sqli_error_ast(baseline_html):
-                return {"type":"SQLi (Error)","confidence":40,"evidence":"SQL error detected via AST analysis"}
-            return {"type":"SQLi (Error)","confidence":85,"evidence":"SQL error detected via AST analysis"}
-        if resp_time and baseline_time and resp_time > baseline_time * 1.5:
-            return {"type":"SQLi (Time-based)","confidence":75,"evidence":f"Response {resp_time:.1f}s vs baseline {baseline_time:.1f}s"}
+                # Error in baseline too - likely false positive, low confidence
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='low',
+                    baseline_excluded=False,
+                    multiple_confirmations=False,
+                    specificity='low',
+                    false_positive_resistance='low'
+                )
+                return {"type":"SQLi (Error)","confidence":confidence,"evidence":"SQL error detected via AST analysis"}
+            # Error only in injection response - high confidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"SQLi (Error)","confidence":confidence,"evidence":"SQL error detected via AST analysis"}
+        
+        # Enhanced time-based detection with statistical analysis
+        if resp_time and baseline_time:
+            # Basic threshold check (backward compatibility)
+            if resp_time > baseline_time * 1.5:
+                # Enhanced statistical analysis if multiple samples available
+                if time_samples and len(time_samples) >= 3:
+                    result = Detector._statistical_time_based_analysis(resp_time, time_samples)
+                    if result:
+                        return result
+                
+                # Fallback to original logic with improved confidence calculation
+                time_ratio = resp_time / baseline_time if baseline_time > 0 else 1.5
+                
+                # Adaptive threshold based on response time magnitude
+                # For very slow responses (>5s baseline), use stricter threshold
+                if baseline_time > 5.0:
+                    adjusted_threshold = 2.0  # Stricter for slow baselines
+                elif baseline_time > 2.0:
+                    adjusted_threshold = 1.8  # Moderate for medium baselines
+                else:
+                    adjusted_threshold = 1.5  # Original threshold for fast baselines
+                
+                if time_ratio >= adjusted_threshold:
+                    evidence_strength = 'high' if time_ratio > 2.5 else 'medium'
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength=evidence_strength,
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='medium',
+                        false_positive_resistance='medium'
+                    )
+                    return {
+                        "type":"SQLi (Time-based)",
+                        "confidence":confidence,
+                        "evidence":f"Response {resp_time:.3f}s vs baseline {baseline_time:.3f}s (ratio: {time_ratio:.2f}x, threshold: {adjusted_threshold}x)"
+                    }
+        return None
+    
+    @staticmethod
+    def _statistical_time_based_analysis(resp_time: float, baseline_samples: List[float]) -> Optional[Dict[str, Any]]:
+        """
+        Perform statistical analysis on time-based SQLi detection.
+        
+        Uses multiple statistical methods to reduce false positives from network jitter:
+        - Z-score analysis
+        - Median Absolute Deviation (MAD)
+        - Interquartile Range (IQR)
+        """
+        if len(baseline_samples) < 3:
+            return None
+        
+        try:
+            import statistics
+            
+            # Calculate baseline statistics
+            baseline_mean = statistics.mean(baseline_samples)
+            baseline_median = statistics.median(baseline_samples)
+            baseline_stdev = statistics.stdev(baseline_samples) if len(baseline_samples) > 1 else 0
+            
+            # Z-score analysis
+            if baseline_stdev > 0:
+                z_score = (resp_time - baseline_mean) / baseline_stdev
+                # Z-score > 3 is statistically significant (99.7% confidence)
+                if z_score > 3.0:
+                    evidence_strength = 'critical' if z_score > 5.0 else 'high'
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength=evidence_strength,
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {
+                        "type":"SQLi (Time-based - Statistical)",
+                        "confidence":confidence,
+                        "evidence":f"Z-score: {z_score:.2f} (response: {resp_time:.3f}s, baseline mean: {baseline_mean:.3f}s, stdev: {baseline_stdev:.3f}s)"
+                    }
+            
+            # Median Absolute Deviation (MAD) - more robust to outliers
+            mad = statistics.median([abs(x - baseline_median) for x in baseline_samples])
+            if mad > 0:
+                mad_score = abs(resp_time - baseline_median) / mad
+                # MAD score > 3 is significant
+                if mad_score > 3.0:
+                    evidence_strength = 'high' if mad_score > 5.0 else 'medium'
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength=evidence_strength,
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {
+                        "type":"SQLi (Time-based - MAD)",
+                        "confidence":confidence,
+                        "evidence":f"MAD score: {mad_score:.2f} (response: {resp_time:.3f}s, baseline median: {baseline_median:.3f}s, MAD: {mad:.3f}s)"
+                    }
+            
+            # Interquartile Range (IQR) analysis
+            if len(baseline_samples) >= 4:
+                sorted_samples = sorted(baseline_samples)
+                q1 = statistics.median(sorted_samples[:len(sorted_samples)//2])
+                q3 = statistics.median(sorted_samples[len(sorted_samples)//2:])
+                iqr = q3 - q1
+                
+                if iqr > 0:
+                    # Response time above Q3 + 3*IQR is considered outlier
+                    upper_bound = q3 + 3 * iqr
+                    if resp_time > upper_bound:
+                        evidence_strength = 'high'
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength=evidence_strength,
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
+                        return {
+                            "type":"SQLi (Time-based - IQR)",
+                            "confidence":confidence,
+                            "evidence":f"IQR outlier: response {resp_time:.3f}s > upper bound {upper_bound:.3f}s (Q1: {q1:.3f}s, Q3: {q3:.3f}s, IQR: {iqr:.3f}s)"
+                        }
+            
+            # Check for consistent delay pattern (response time is consistently higher)
+            # If response time is > 2 standard deviations above mean AND > 50% above median
+            if (baseline_stdev > 0 and z_score > 2.0 and 
+                resp_time > baseline_median * 1.5):
+                evidence_strength = 'medium'
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength=evidence_strength,
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                return {
+                    "type":"SQLi (Time-based - Pattern)",
+                    "confidence":confidence,
+                    "evidence":f"Consistent delay: response {resp_time:.3f}s vs baseline median {baseline_median:.3f}s (ratio: {resp_time/baseline_median:.2f}x)"
+                }
+            
+        except Exception as e:
+            logging.debug(f"Statistical analysis error: {e}")
+        
         return None
     @staticmethod
     def sqli_union(html: str, order_test_results: List[Tuple[int, int]], unique_marker: str) -> Optional[Dict[str, Any]]:
@@ -5288,12 +6393,28 @@ class Detector:
             if diff > 0:
                 nulls = ','.join(['NULL']*(num-1))
                 payload = f"' UNION SELECT {nulls},'{unique_marker}'-- -"
-                return {"type":"SQLi (Union)","confidence":85,"evidence":f"Column count {num}, marker reflected","payload":payload}
+                # Union-based with marker reflection is strong evidence
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"SQLi (Union)","confidence":confidence,"evidence":f"Column count {num}, marker reflected","payload":payload}
         return None
     @staticmethod
     def sqli_boolean(resp_true: Any, resp_false: Any) -> Optional[Dict[str, Any]]:
         if resp_true.status_code != resp_false.status_code or len(resp_true.text) != len(resp_false.text):
-            return {"type":"SQLi (Boolean)","confidence":85,"evidence":"Different TRUE/FALSE responses"}
+            # Boolean-based is strong evidence when responses differ
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=True,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
+            return {"type":"SQLi (Boolean)","confidence":confidence,"evidence":"Different TRUE/FALSE responses"}
         return None
     @staticmethod
     def baseline_shotgun_sqli(resp_legit: Optional[Any], resp_false: Optional[Any], resp_true: Optional[Any]) -> Optional[Dict[str, Any]]:
@@ -5305,18 +6426,34 @@ class Detector:
         true_time = getattr(resp_true, 'elapsed_time', 0) if resp_true else 0
         if false_len != true_len or resp_false.status_code != resp_true.status_code:
             evidence = f"False len: {false_len}, True len: {true_len}, Baseline: {baseline_len}"
+            # Baseline comparison is very strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=True,
+                specificity='high',
+                false_positive_resistance='high'
+            )
             return {
                 "type":"SQLi (Boolean Baseline)",
-                "confidence":90,
+                "confidence":confidence,
                 "evidence":evidence,
                 "baseline_length":baseline_len,
                 "false_condition_length":false_len,
                 "true_condition_length":true_len
             }
         if abs(false_time - true_time) > 0.5:
+            # Time-based baseline is less reliable
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
             return {
                 "type":"SQLi (Time-based Baseline)",
-                "confidence":75,
+                "confidence":confidence,
                 "evidence":f"False time: {false_time:.2f}s, True time: {true_time:.2f}s"
             }
         return None
@@ -5327,31 +6464,59 @@ class Detector:
         regex_len = len(resp_regex.text) if resp_regex else 0
         vulns = []
         if gt_len > baseline_len * 1.1:
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
             vulns.append({
                 "type":"NoSQL Injection ($gt operator)",
-                "confidence":85,
+                "confidence":confidence,
                 "evidence":f"Response length increased from {baseline_len} to {gt_len}",
                 "baseline_length":baseline_len,
                 "injection_length":gt_len
             })
         if regex_len > baseline_len * 1.1:
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
             vulns.append({
                 "type":"NoSQL Injection ($regex operator)",
-                "confidence":85,
+                "confidence":confidence,
                 "evidence":f"Response length increased from {baseline_len} to {regex_len}",
                 "baseline_length":baseline_len,
                 "injection_length":regex_len
             })
         if resp_gt and resp_gt.status_code != (resp_baseline.status_code if resp_baseline else 200):
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='low',
+                false_positive_resistance='low'
+            )
             vulns.append({
                 "type":"NoSQL Injection ($gt status)",
-                "confidence":75,
+                "confidence":confidence,
                 "evidence":f"Status code changed from {resp_baseline.status_code if resp_baseline else 200} to {resp_gt.status_code}"
             })
         if resp_regex and resp_regex.status_code != (resp_baseline.status_code if resp_baseline else 200):
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='low',
+                false_positive_resistance='low'
+            )
             vulns.append({
                 "type":"NoSQL Injection ($regex status)",
-                "confidence":75,
+                "confidence":confidence,
                 "evidence":f"Status code changed from {resp_baseline.status_code if resp_baseline else 200} to {resp_regex.status_code}"
             })
         return vulns if vulns else None
@@ -5427,9 +6592,17 @@ class Detector:
             if matches1 != matches2:
                 differences.append(f"Boolean flag pattern changed: {pattern} - {matches1} -> {matches2}")
         if differences:
+            # Small differences are medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='low'
+            )
             return {
                 "type":"Small Difference Detected",
-                "confidence":70,
+                "confidence":confidence,
                 "evidence":f"Found {len(differences)} differences: {'; '.join(differences[:3])}",
                 "differences":differences,
                 "context":context
@@ -5439,75 +6612,187 @@ class Detector:
     def path_traversal(html: str, baseline_html: Optional[str]) -> Optional[Dict[str, Any]]:
         if PASSWD_PATTERN.search(html):
             if baseline_html and PASSWD_PATTERN.search(baseline_html): return None
-            return {"type":"PathTraversal","confidence":92,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            # Password file pattern is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"PathTraversal","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
         return None
     @staticmethod
     def command_injection(html, baseline_html):
         if COMMAND_PATTERN.search(html):
             if baseline_html and COMMAND_PATTERN.search(baseline_html): return None
-            return {"type":"CommandInjection","confidence":88,"evidence":Detector._extract(html,COMMAND_PATTERN)}
+            # Command pattern is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"CommandInjection","confidence":confidence,"evidence":Detector._extract(html,COMMAND_PATTERN)}
         return None
     @staticmethod
     def open_redirect(resp, baseline_resp):
         loc = resp.headers.get("Location")
         if loc and "evil.com" in loc:
             if baseline_resp and baseline_resp.headers.get("Location")==loc: return None
-            return {"type":"OpenRedirect","confidence":95,"evidence":f"Location: {loc}"}
+            # Direct Location header redirect is critical evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='critical',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"OpenRedirect","confidence":confidence,"evidence":f"Location: {loc}"}
         if '<meta http-equiv="refresh"' in resp.text.lower() and "evil.com" in resp.text:
             if baseline_resp and "evil.com" in baseline_resp.text: return None
-            return {"type":"OpenRedirect","confidence":80,"evidence":"Meta refresh"}
+            # Meta refresh is medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
+            return {"type":"OpenRedirect","confidence":confidence,"evidence":"Meta refresh"}
         return None
     @staticmethod
     def ssti(html: str, payload: str, baseline_html: Optional[str]) -> Optional[Dict[str, Any]]:
         if "49" in html and "7*7" in payload:
             if baseline_html and "49" in baseline_html: return None
-            return {"type":"SSTI","confidence":90,"evidence":"49 (7*7)"}
+            # Arithmetic evaluation is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"SSTI","confidence":confidence,"evidence":"49 (7*7)"}
         return None
     @staticmethod
     def xxe(html, baseline_html):
         if PASSWD_PATTERN.search(html):
             if baseline_html and PASSWD_PATTERN.search(baseline_html): return None
-            return {"type":"XXE","confidence":90,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            # Password file pattern via XXE is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"XXE","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
         return None
     @staticmethod
     def crlf(resp: Any, baseline_resp: Optional[Any]) -> Optional[Dict[str, Any]]:
         if 'X-Custom' in resp.headers or 'crlf' in resp.text.lower():
             if baseline_resp and ('X-Custom' in baseline_resp.headers or 'crlf' in baseline_resp.text.lower()): return None
-            return {"type":"CRLF","confidence":70,"evidence":"Header injection"}
+            # CRLF injection is medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
+            return {"type":"CRLF","confidence":confidence,"evidence":"Header injection"}
         return None
     @staticmethod
     def ssrf(html: str, baseline_html: Optional[str], payload: str, oob_results: List[Dict[str, Any]], sent_marker: str) -> Optional[Dict[str, Any]]:
         if AWS_META_PATTERN.search(html):
             if baseline_html and AWS_META_PATTERN.search(baseline_html): return None
-            return {"type":"SSRF (AWS)","confidence":90,"evidence":Detector._extract(html,AWS_META_PATTERN)}
+            # AWS metadata pattern is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"SSRF (AWS)","confidence":confidence,"evidence":Detector._extract(html,AWS_META_PATTERN)}
         if "root:x:0:0" in html and "file://" in payload:
             if baseline_html and "root:x:0:0" in baseline_html: return None
-            return {"type":"SSRF (File)","confidence":85,"evidence":Detector._extract(html,"root:x:0:0")}
+            # File-based SSRF is strong evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='high',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='high'
+            )
+            return {"type":"SSRF (File)","confidence":confidence,"evidence":Detector._extract(html,"root:x:0:0")}
         with oob_results_lock:
             for res in oob_results:
                 if sent_marker in res['path']:
-                    return {"type":"Blind SSRF","confidence":95,"evidence":f"OOB callback: {res['path']}"}
+                    # OOB callback is critical evidence
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"Blind SSRF","confidence":confidence,"evidence":f"OOB callback: {res['path']}"}
         return None
     @staticmethod
     def nosqli(html, baseline_html, payload):
         if "true" in html.lower() and "return true" in payload.lower():
             if baseline_html and "true" in baseline_html.lower(): return None
-            return {"type":"NoSQLi","confidence":70,"evidence":"Boolean true"}
+            # Boolean true is medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='low'
+            )
+            return {"type":"NoSQLi","confidence":confidence,"evidence":"Boolean true"}
         return None
     @staticmethod
     def ldapi(html: str, baseline_html: Optional[str], payload: str) -> Optional[Dict[str, Any]]:
         if "uid=" in html.lower() and "*" in payload:
             if baseline_html and "uid=" in baseline_html.lower(): return None
-            return {"type":"LDAPi","confidence":70,"evidence":"Filter bypass"}
+            # LDAP filter bypass is medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='low'
+            )
+            return {"type":"LDAPi","confidence":confidence,"evidence":"Filter bypass"}
         return None
     @staticmethod
     def deserialization(html, baseline_html, payload):
         if "rO0" in payload and ("java.io" in html or "Reflection" in html):
             if baseline_html and ("java.io" in baseline_html or "Reflection" in baseline_html): return None
-            return {"type":"InsecureDeserialization (Java)","confidence":50,"evidence":"Java error"}
+            # Java deserialization is low-medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='low',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='low',
+                false_positive_resistance='low'
+            )
+            return {"type":"InsecureDeserialization (Java)","confidence":confidence,"evidence":"Java error"}
         if payload.startswith("O:") and ("unserialize" in html.lower() or "PHP" in html):
             if baseline_html and ("unserialize" in baseline_html.lower() or "PHP" in baseline_html): return None
-            return {"type":"InsecureDeserialization (PHP)","confidence":50,"evidence":"PHP error"}
+            # PHP deserialization is low-medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='low',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='low',
+                false_positive_resistance='low'
+            )
+            return {"type":"InsecureDeserialization (PHP)","confidence":confidence,"evidence":"PHP error"}
         return None
     @staticmethod
     def cors_misconfig(url: str, session: Any, selenium_available: bool = False) -> Optional[Dict[str, Any]]:
@@ -5517,7 +6802,15 @@ class Detector:
             resp = session.options(url, headers=headers, timeout=5)
             acao = resp.headers.get("Access-Control-Allow-Origin","")
             if acao == '*' or acao == test_origin:
-                return {"type":"CORS Misconfiguration","url":url,"evidence":f"ACAO: {acao}","severity":"Medium","confidence":80}
+                # CORS misconfiguration is medium-high strength evidence
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='high',
+                    false_positive_resistance='medium'
+                )
+                return {"type":"CORS Misconfiguration","url":url,"evidence":f"ACAO: {acao}","severity":"Medium","confidence":confidence}
             if not selenium_available:
                 cred_headers = {
                     "Origin": test_origin,
@@ -5529,7 +6822,15 @@ class Detector:
                     acao_cred = cred_resp.headers.get("Access-Control-Allow-Origin","")
                     acac = cred_resp.headers.get("Access-Control-Allow-Credentials","")
                     if acao_cred == test_origin and acac == "true":
-                        return {"type":"CORS Credentialed Misconfiguration","url":url,"evidence":f"ACAO: {acao_cred}, ACAC: {acac}","severity":"High","confidence":85}
+                        # Credentialed CORS misconfiguration is high strength evidence
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='high',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
+                        return {"type":"CORS Credentialed Misconfiguration","url":url,"evidence":f"ACAO: {acao_cred}, ACAC: {acac}","severity":"High","confidence":confidence}
                 except Exception as e:
                     logging.warning(f"CORS credentialed test error: {e}")
         except Exception as e:
@@ -5545,7 +6846,14 @@ class Detector:
                 if header.get('alg') != 'none':
                     try:
                         pyjwt.encode(decoded, key='', algorithm='none')
-                        vulns.append({"type":"JWT None Algorithm","confidence":95,"evidence":"Token accepted with alg=none"})
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='critical',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
+                        vulns.append({"type":"JWT None Algorithm","confidence":confidence,"evidence":"Token accepted with alg=none"})
                     except Exception as e:
                         logging.debug(f"JWT none algorithm test failed: {e}")
                 if 'kid' in header:
@@ -5565,7 +6873,14 @@ class Detector:
                             test_header = header.copy()
                             test_header['kid'] = kid_payload
                             test_token = pyjwt.encode(decoded, key='', algorithm='HS256', headers=test_header)
-                            vulns.append({"type":"JWT kid Injection","confidence":85,"evidence":f"kid accepts path traversal: {kid_payload}"})
+                            confidence = calculate_evidence_based_confidence(
+                                evidence_strength='high',
+                                baseline_excluded=True,
+                                multiple_confirmations=False,
+                                specificity='high',
+                                false_positive_resistance='medium'
+                            )
+                            vulns.append({"type":"JWT kid Injection","confidence":confidence,"evidence":f"kid accepts path traversal: {kid_payload}"})
                             break
                         except Exception as e:
                             logging.debug(f"JWT kid injection test failed: {e}")
@@ -5584,7 +6899,14 @@ class Detector:
                         test_header = header.copy()
                         test_header['jku'] = jku_payload
                         test_token = pyjwt.encode(decoded, key='', algorithm='HS256', headers=test_header)
-                        vulns.append({"type":"JWT jku Injection","confidence":85,"evidence":f"jku accepts arbitrary URL: {jku_payload}"})
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='high',
+                            baseline_excluded=True,
+                            multiple_confirmations=False,
+                            specificity='high',
+                            false_positive_resistance='medium'
+                        )
+                        vulns.append({"type":"JWT jku Injection","confidence":confidence,"evidence":f"jku accepts arbitrary URL: {jku_payload}"})
                         break
                     except Exception as e:
                         logging.debug(f"JWT jku injection test failed: {e}")
@@ -5594,7 +6916,14 @@ class Detector:
         for sec in weak_secrets:
             try:
                 pyjwt.decode(token, sec, algorithms=['HS256'])
-                vulns.append({"type":"JWT Weak Secret","confidence":90,"evidence":f"HMAC secret: {sec}"})
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                vulns.append({"type":"JWT Weak Secret","confidence":confidence,"evidence":f"HMAC secret: {sec}"})
                 break
             except Exception as e:
                 logging.debug(f"JWT weak secret test failed for {sec}: {e}")
@@ -5603,7 +6932,14 @@ class Detector:
                 payload = pyjwt.decode(token, public_key, algorithms=['RS256'])
                 forged = pyjwt.encode(payload, public_key, algorithm='HS256')
                 if forged != token:
-                    vulns.append({"type":"JWT Algorithm Confusion","confidence":90,"evidence":"RS256 to HS256 possible"})
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    vulns.append({"type":"JWT Algorithm Confusion","confidence":confidence,"evidence":"RS256 to HS256 possible"})
             except Exception as e:
                 logging.debug(f"JWT algorithm confusion test failed: {e}")
         return vulns
@@ -5612,13 +6948,29 @@ class Detector:
         with oob_results_lock:
             for res in oob_results:
                 if marker in res['path']:
-                    return {"type":"Log4j (JNDI)","confidence":95,"evidence":f"OOB callback: {res['path']}"}
+                    # OOB callback for Log4j is critical evidence
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"Log4j (JNDI)","confidence":confidence,"evidence":f"OOB callback: {res['path']}"}
         return None
     @staticmethod
     def log_injection(html: str, baseline_html: Optional[str], payload: str) -> Optional[Dict[str, Any]]:
         if "INJECTED" in html and "%0d%0a" in payload:
             if baseline_html and "INJECTED" in baseline_html: return None
-            return {"type":"LogInjection","confidence":80,"evidence":"Log entry reflected"}
+            # Log injection is medium strength evidence
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
+            return {"type":"LogInjection","confidence":confidence,"evidence":"Log entry reflected"}
         return None
     # ---------------------------------------------------------------------
     # HTTP METHOD VULNERABILITY DETECTION
@@ -5628,20 +6980,55 @@ class Detector:
         if resp.status == 201 or resp.status == 200:
             if 'created' in resp.text.lower() or 'uploaded' in resp.text.lower() or 'success' in resp.text.lower():
                 if any(ext in payload.lower() for ext in ['.php', '.jsp', '.asp', '.jspx', '.php5', '.phtml']):
-                    return {"type":"PUT Webshell Upload","confidence":90,"evidence":"Executable file upload accepted","severity":"Critical"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"PUT Webshell Upload","confidence":confidence,"evidence":"Executable file upload accepted","severity":"Critical"}
                 if any(pattern in payload.lower() for pattern in ['config', '.env', '.ini', '.conf', 'password', 'key']):
-                    return {"type":"PUT Sensitive File Upload","confidence":85,"evidence":"Sensitive configuration file upload accepted","severity":"High"}
-                return {"type":"PUT File Upload","confidence":75,"evidence":"File upload accepted without validation","severity":"Medium"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"PUT Sensitive File Upload","confidence":confidence,"evidence":"Sensitive configuration file upload accepted","severity":"High"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='medium',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                return {"type":"PUT File Upload","confidence":confidence,"evidence":"File upload accepted without validation","severity":"Medium"}
         sensitive_paths = ['/admin', '/config', '/api', '/users', '/auth', '/upload']
         if any(path in url.lower() for path in sensitive_paths):
             if resp.status not in [401, 403, 405]:
-                return {"type":"PUT to Sensitive Endpoint","confidence":80,"evidence":f"PUT allowed on {url} without auth","severity":"High"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                return {"type":"PUT to Sensitive Endpoint","confidence":confidence,"evidence":f"PUT allowed on {url} without auth","severity":"High"}
         return None
     @staticmethod
     def put_resource_overwrite(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         if resp.status == 200 or resp.status == 204:
             if baseline_resp and baseline_resp.status != resp.status:
-                return {"type":"PUT Resource Overwrite","confidence":85,"evidence":"Resource overwritten without authorization","severity":"High"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"PUT Resource Overwrite","confidence":confidence,"evidence":"Resource overwritten without authorization","severity":"High"}
         return None
     @staticmethod
     def patch_mass_assignment(resp, baseline_resp, payload):
@@ -5651,11 +7038,25 @@ class Detector:
             escalation_keywords = ['admin', 'role', 'permission', 'access', 'privilege', 'is_admin', 'is_superuser']
             if any(keyword in payload.lower() for keyword in escalation_keywords):
                 if any(keyword in resp_text.lower() for keyword in ['success', 'updated', 'granted', 'admin']):
-                    return {"type":"PATCH Privilege Escalation","confidence":90,"evidence":"Mass assignment via PATCH allowed","severity":"Critical"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"PATCH Privilege Escalation","confidence":confidence,"evidence":"Mass assignment via PATCH allowed","severity":"Critical"}
             if baseline_resp:
                 resp_diff = len(resp_text) - len(baseline_text)
                 if abs(resp_diff) > 100:
-                    return {"type":"PATCH Mass Assignment","confidence":75,"evidence":"Unexpected field update accepted","severity":"Medium"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='medium',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='medium',
+                        false_positive_resistance='low'
+                    )
+                    return {"type":"PATCH Mass Assignment","confidence":confidence,"evidence":"Unexpected field update accepted","severity":"Medium"}
         return None
     @staticmethod
     def patch_validation_bypass(resp: Any, baseline_resp: Optional[Any], payload: str) -> Optional[Dict[str, Any]]:
@@ -5663,9 +7064,23 @@ class Detector:
         if resp.status == 200:
             if 'email' in payload.lower() and '@' not in payload:
                 if 'updated' in resp_text.lower() or 'success' in resp_text.lower():
-                    return {"type":"PATCH Validation Bypass","confidence":85,"evidence":"Invalid email accepted via PATCH","severity":"High"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"PATCH Validation Bypass","confidence":confidence,"evidence":"Invalid email accepted via PATCH","severity":"High"}
             if "'" in payload and ('error' in resp_text.lower() or 'sql' in resp_text.lower()):
-                return {"type":"PATCH SQLi","confidence":80,"evidence":"SQL error in PATCH response","severity":"High"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"PATCH SQLi","confidence":confidence,"evidence":"SQL error in PATCH response","severity":"High"}
         return None
     @staticmethod
     def post_stored_xss(resp: Any, baseline_resp: Optional[Any], payload: str, oob_results: List[Dict[str, Any]], marker: str) -> Optional[Dict[str, Any]]:
@@ -5676,9 +7091,23 @@ class Detector:
                 with oob_results_lock:
                     for res in oob_results:
                         if marker in res['path']:
-                            return {"type":"POST Stored XSS (OOB)","confidence":95,"evidence":f"OOB callback: {res['path']}","severity":"High"}
+                            confidence = calculate_evidence_based_confidence(
+                                evidence_strength='critical',
+                                baseline_excluded=True,
+                                multiple_confirmations=True,
+                                specificity='high',
+                                false_positive_resistance='high'
+                            )
+                            return {"type":"POST Stored XSS (OOB)","confidence":confidence,"evidence":f"OOB callback: {res['path']}","severity":"High"}
                 if payload in resp_text:
-                    return {"type":"POST Reflected XSS","confidence":85,"evidence":"XSS payload reflected in response","severity":"High"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='high',
+                        false_positive_resistance='medium'
+                    )
+                    return {"type":"POST Reflected XSS","confidence":confidence,"evidence":"XSS payload reflected in response","severity":"High"}
         return None
     @staticmethod
     def post_auth_bypass(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
@@ -5688,7 +7117,14 @@ class Detector:
             if resp.status == 200 or resp.status == 302:
                 if isinstance(resp_text, str):
                     if 'token' in resp_text.lower() or 'session' in resp_text.lower() or 'welcome' in resp_text.lower():
-                        return {"type":"POST Auth Bypass","confidence":90,"evidence":"Authentication bypass via POST","severity":"Critical"}
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='critical',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
+                        return {"type":"POST Auth Bypass","confidence":confidence,"evidence":"Authentication bypass via POST","severity":"Critical"}
         return None
     @staticmethod
     def post_command_injection(resp: Any, baseline_resp: Optional[Any], payload: str) -> Optional[Dict[str, Any]]:
@@ -5698,7 +7134,14 @@ class Detector:
         if any(pattern in payload for pattern in command_patterns):
             if isinstance(resp_text, str) and COMMAND_PATTERN.search(resp_text):
                 if baseline_resp and isinstance(baseline_text, str) and not COMMAND_PATTERN.search(baseline_text):
-                    return {"type":"POST Command Injection","confidence":92,"evidence":"Command execution detected","severity":"Critical"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {"type":"POST Command Injection","confidence":confidence,"evidence":"Command execution detected","severity":"Critical"}
         return None
     @staticmethod
     def get_idor(resp, baseline_resp, url, test_id):
@@ -5709,7 +7152,14 @@ class Detector:
                 if resp_text != baseline_text and len(resp_text) > 100:
                     user_patterns = ['user', 'profile', 'account', 'email', 'name', 'id']
                     if any(pattern in resp_text.lower() for pattern in user_patterns):
-                        return {"type":"GET IDOR","confidence":85,"evidence":f"Access to ID {test_id} returned different data","severity":"High"}
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='high',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='medium'
+                        )
+                        return {"type":"GET IDOR","confidence":confidence,"evidence":f"Access to ID {test_id} returned different data","severity":"High"}
         return None
     @staticmethod
     def get_parameter_pollution(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
@@ -5718,36 +7168,78 @@ class Detector:
         for param_name, values in params.items():
             if len(values) > 1:
                 if resp.status == 200:
-                    return {"type":"GET Parameter Pollution","confidence":75,"evidence":f"Duplicate parameter: {param_name}","severity":"Medium"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='medium',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='medium',
+                        false_positive_resistance='low'
+                    )
+                    return {"type":"GET Parameter Pollution","confidence":confidence,"evidence":f"Duplicate parameter: {param_name}","severity":"Medium"}
         return None
     @staticmethod
     def get_cache_poisoning(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         cache_headers = ['X-Cache', 'X-Cache-Hit', 'X-Cache-Lookup', 'Age', 'CF-Cache-Status']
         if any(header in resp.headers for header in cache_headers):
             if 'X-Cache: HIT' in resp.headers.get('X-Cache', ''):
-                return {"type":"GET Cache Poisoning Potential","confidence":70,"evidence":"Cacheable endpoint detected","severity":"Low"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='low',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='low',
+                    false_positive_resistance='low'
+                )
+                return {"type":"GET Cache Poisoning Potential","confidence":confidence,"evidence":"Cacheable endpoint detected","severity":"Low"}
         return None
     @staticmethod
     def delete_unauthorized(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         if resp.status == 200 or resp.status == 204:
             if 'deleted' in resp.text.lower() or 'removed' in resp.text.lower() or 'success' in resp.text.lower():
-                return {"type":"DELETE Unauthorized","confidence":90,"evidence":"Deletion succeeded without authorization","severity":"Critical"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='critical',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"DELETE Unauthorized","confidence":confidence,"evidence":"Deletion succeeded without authorization","severity":"Critical"}
             if any(path in url.lower() for path in ['/admin', '/user', '/account', '/data']):
                 if resp.status not in [401, 403, 405]:
-                    return {"type":"DELETE on Sensitive Endpoint","confidence":85,"evidence":"DELETE allowed on sensitive path","severity":"High"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='medium',
+                        false_positive_resistance='medium'
+                    )
+                    return {"type":"DELETE on Sensitive Endpoint","confidence":confidence,"evidence":"DELETE allowed on sensitive path","severity":"High"}
         return None
     @staticmethod
     def delete_idor(resp, baseline_resp, url, test_id):
         if resp.status == 200 or resp.status == 204:
             if baseline_resp and baseline_resp.status != resp.status:
-                return {"type":"DELETE IDOR","confidence":88,"evidence":f"Deletion of ID {test_id} succeeded","severity":"Critical"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='critical',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"DELETE IDOR","confidence":confidence,"evidence":f"Deletion of ID {test_id} succeeded","severity":"Critical"}
         return None
     @staticmethod
     def delete_cascading(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
         if resp.status == 200:
             cascade_keywords = ['cascade', 'related', 'dependent', 'children', 'foreign']
             if any(keyword in resp.text.lower() for keyword in cascade_keywords):
-                return {"type":"DELETE Cascading","confidence":80,"evidence":"Cascading deletion possible","severity":"High"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='medium',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                return {"type":"DELETE Cascading","confidence":confidence,"evidence":"Cascading deletion possible","severity":"High"}
         return None
     @staticmethod
     def options_info_disclosure(resp: Any, baseline_resp: Optional[Any], url: str) -> Optional[Dict[str, Any]]:
@@ -5756,18 +7248,46 @@ class Detector:
             dangerous_methods = ['PUT', 'DELETE', 'PATCH', 'TRACE', 'CONNECT']
             exposed_dangerous = [method for method in dangerous_methods if method in allow_header]
             if exposed_dangerous:
-                return {"type":"OPTIONS Info Disclosure","confidence":85,"evidence":f"Exposed methods: {', '.join(exposed_dangerous)}","severity":"Medium"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='high',
+                    false_positive_resistance='medium'
+                )
+                return {"type":"OPTIONS Info Disclosure","confidence":confidence,"evidence":f"Exposed methods: {', '.join(exposed_dangerous)}","severity":"Medium"}
         acao = resp.headers.get('Access-Control-Allow-Origin', '')
         if acao == '*' or acao == 'null':
-            return {"type":"OPTIONS CORS Misconfig","confidence":80,"evidence":f"ACAO: {acao}","severity":"Medium"}
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='medium'
+            )
+            return {"type":"OPTIONS CORS Misconfig","confidence":confidence,"evidence":f"ACAO: {acao}","severity":"Medium"}
         return None
     @staticmethod
     def options_method_tampering(resp, baseline_resp, url):
         allow_header = resp.headers.get('Allow', '')
         if 'TRACE' in allow_header:
-            return {"type":"OPTIONS TRACE Enabled","confidence":75,"evidence":"TRACE method allowed (XST vulnerability)","severity":"Medium"}
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='high',
+                false_positive_resistance='medium'
+            )
+            return {"type":"OPTIONS TRACE Enabled","confidence":confidence,"evidence":"TRACE method allowed (XST vulnerability)","severity":"Medium"}
         if allow_header and len(allow_header.split(',')) > 6:
-            return {"type":"OPTIONS Overly Permissive","confidence":70,"evidence":f"Too many methods allowed: {allow_header}","severity":"Low"}
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='low',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='low',
+                false_positive_resistance='low'
+            )
+            return {"type":"OPTIONS Overly Permissive","confidence":confidence,"evidence":f"Too many methods allowed: {allow_header}","severity":"Low"}
         return None
     @staticmethod
     def _extract(text: str, pattern: Union[str, Pattern], window: int = 120) -> str:
@@ -5959,7 +7479,8 @@ class SessionManager:
                 rotation_interval=proxy_config.get('rotation_interval', 100),
                 health_check_interval=proxy_config.get('health_check_interval', 300),
                 prefer_geo_diverse=proxy_config.get('prefer_geo_diverse', True),
-                max_failure_rate=proxy_config.get('max_failure_rate', 0.5)
+                max_failure_rate=proxy_config.get('max_failure_rate', 0.5),
+                target_url=self.target
             )
             
             # Add proxies from configuration
@@ -5967,7 +7488,7 @@ class SessionManager:
             for proxy in proxies:
                 if isinstance(proxy, str):
                     # Simple proxy string (legacy format)
-                    self.proxy_pool.add_proxy_url(proxy)
+                    self.proxy_pool.add_proxy_url(proxy, target_url=self.target)
                 elif isinstance(proxy, dict):
                     # Detailed proxy configuration
                     self.proxy_pool.add_proxy(ProxyConfig(
@@ -5978,7 +7499,8 @@ class SessionManager:
                         country=proxy.get('country'),
                         region=proxy.get('region'),
                         is_residential=proxy.get('is_residential', False),
-                        health_check_url=proxy.get('health_check_url')
+                        health_check_url=proxy.get('health_check_url'),
+                        target_url=self.target
                     ))
             
             # Keep legacy proxy_rotator for backward compatibility
@@ -6593,10 +8115,17 @@ class InjectionEngine:
                     headers=metadata_headers
                 )
                 if metadata_resp and metadata_resp.status == 200:
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
                     await self._add_vulnerability({
                         "type":"SSRF (IMDSv2)","url":target_url,"parameter":"*",
                         "evidence":"IMDSv2 token retrieval successful - metadata accessible",
-                        "severity":"Critical","confidence":95,"cwe":CWE_MAP["SSRF"]
+                        "severity":"Critical","confidence":confidence,"cwe":CWE_MAP["SSRF"]
                     })
         except Exception as e:
             logging.warning(f"IMDSv2 test error: {e}")
@@ -6641,10 +8170,17 @@ class InjectionEngine:
                             evidence.append(f"time diff: {elapsed - baseline_time:.2f}s")
                         if port_detected:
                             evidence.append(f"port {port} indicators found")
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='high',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='medium'
+                        )
                         await self._add_vulnerability({
                             "type":"SSRF (Internal Port Scan)","url":param_url,"parameter":param_name,
                             "evidence":f"Port {port} appears open: {', '.join(evidence)}",
-                            "severity":"High","confidence":80,"cwe":CWE_MAP["SSRF"]
+                            "severity":"High","confidence":confidence,"cwe":CWE_MAP["SSRF"]
                         })
                         break
     async def _send_and_detect(self, param, vuln_type, payload):
@@ -6676,10 +8212,17 @@ class InjectionEngine:
             if union_result:
                 resp = await self._send_injection(param, union_result['payload'])
                 if resp and union_marker in resp._body:
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
                     await self._add_vulnerability({
                         "type":"SQLi (Union)","url":url,"parameter":pname,"method":method,
                         "evidence":f"Union injection confirmed with marker {union_marker}",
-                        "severity":"High","confidence":90,"cwe":CWE_MAP["SQLi"]
+                        "severity":"High","confidence":confidence,"cwe":CWE_MAP["SQLi"]
                     })
             return
         if vuln_type == "SQLi" and "SLEEP" in payload.upper():
@@ -6687,9 +8230,30 @@ class InjectionEngine:
             resp = await self._send_injection(param, payload)
             elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
             if resp and baseline_time:
-                if elapsed > baseline_time * 1.5:
-                    result = {"type":"SQLi (Time-based)","confidence":75,"evidence":f"Response {elapsed:.1f}s vs baseline {baseline_time:.1f}s"}
+                # Collect baseline time samples for statistical analysis
+                time_samples = getattr(self, '_baseline_time_samples', [])
+                if not time_samples:
+                    # Initialize with current baseline
+                    self._baseline_time_samples = [baseline_time] * 5 if baseline_time > 0 else [0.5] * 5
+                    time_samples = self._baseline_time_samples
+                
+                # Use enhanced statistical analysis
+                result = Detector.sqli(html, baseline_html, elapsed, baseline_time, time_samples)
+                if result:
                     await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["SQLi"]})
+                
+                # Update baseline samples with legitimate response times
+                # Collect a few baseline samples for better statistical analysis
+                if len(time_samples) < 10:
+                    legit_start = time.perf_counter_ns()
+                    legit_resp = await self._send_injection(param, "1")
+                    legit_elapsed = (time.perf_counter_ns() - legit_start) / 1_000_000_000
+                    if legit_resp and legit_elapsed > 0:
+                        time_samples.append(legit_elapsed)
+                        # Keep only last 10 samples
+                        if len(time_samples) > 10:
+                            time_samples.pop(0)
+                        self._baseline_time_samples = time_samples
             await asyncio.sleep(0.5)
             return
         resp = await self._send_injection(param, payload)
@@ -6706,7 +8270,9 @@ class InjectionEngine:
                 if dom_result:
                     await self._add_vulnerability({**dom_result, "url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["XSS"]})
         elif vuln_type == "SQLi":
-            result = Detector.sqli(html, baseline_html)
+            # Get time samples for statistical analysis if available
+            time_samples = getattr(self, '_baseline_time_samples', None)
+            result = Detector.sqli(html, baseline_html, None, None, time_samples)
             if not result:
                 legit_p = payload if not any(x in payload.upper() for x in ['AND', 'OR', 'UNION', 'SELECT']) else "1"
                 resp_legit = await self._send_injection(param, legit_p)
@@ -6725,20 +8291,34 @@ class InjectionEngine:
                     result = Detector.sqli_boolean(resp_t, resp_f)
             if not result and self.oob_dns_ip and "LOAD_FILE" in payload:
                 if await check_dns_callback(marker, self.oob_dns_domain, self.oob_dns_ip):
-                    result = {"type":"SQLi (OOB DNS)","confidence":95,"evidence":f"DNS callback for {marker}"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    result = {"type":"SQLi (OOB DNS)","confidence":confidence,"evidence":f"DNS callback for {marker}"}
         elif vuln_type == "PathTraversal":
             result = Detector.path_traversal(html, baseline_html)
         elif vuln_type == "CommandInjection":
             result = Detector.command_injection(html, baseline_html)
             if not result and ("ping" in payload or "nslookup" in payload or "curl" in payload or "wget" in payload):
                 if self.oob_dns_ip and await check_dns_callback(marker, self.oob_dns_domain, self.oob_dns_ip):
-                    result = {"type":"CommandInjection (OOB DNS)","confidence":95,"evidence":f"DNS callback for {marker}"}
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='critical',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    result = {"type":"CommandInjection (OOB DNS)","confidence":confidence,"evidence":f"DNS callback for {marker}"}
                 else:
                     await asyncio.sleep(1)
                     result = Detector.blind_xss(oob_results, marker)
                     if result:
                         result["type"] = "CommandInjection (OOB HTTP)"
-                        result["confidence"] = 95
+                        # blind_xss already calculates confidence
         elif vuln_type == "OpenRedirect":
             result = Detector.open_redirect(resp, baseline)
         elif vuln_type == "SSTI":
@@ -6750,7 +8330,7 @@ class InjectionEngine:
                 result = Detector.blind_xss(oob_results, marker)
                 if result:
                     result["type"] = "XXE (OOB)"
-                    result["confidence"] = 95
+                    # blind_xss already calculates confidence
         elif vuln_type == "CRLF":
             result = Detector.crlf(resp, baseline)
         elif vuln_type == "SSRF":
@@ -6784,27 +8364,56 @@ class InjectionEngine:
                 with https_oob_lock:
                     for res in https_oob_results:
                         if marker in res['path']:
-                            result = {"type":"Log4j (HTTPS OOB)","confidence":95,"evidence":f"HTTPS callback for {marker}"}
+                            confidence = calculate_evidence_based_confidence(
+                                evidence_strength='critical',
+                                baseline_excluded=True,
+                                multiple_confirmations=True,
+                                specificity='high',
+                                false_positive_resistance='high'
+                            )
+                            result = {"type":"Log4j (HTTPS OOB)","confidence":confidence,"evidence":f"HTTPS callback for {marker}"}
                             break
         elif vuln_type == "Polyglot":
             xss_result = Detector.xss(html, payload, baseline_html)
-            sqli_result = Detector.sqli(html, baseline_html)
+            # Polyglot doesn't typically use time-based, so pass None for time parameters
+            sqli_result = Detector.sqli(html, baseline_html, None, None, None)
             if xss_result:
                 result = {"type":"Polyglot XSS","confidence":xss_result.get('confidence',70),"evidence":xss_result.get('evidence','')}
             elif sqli_result:
                 result = {"type":"Polyglot SQLi","confidence":sqli_result.get('confidence',70),"evidence":sqli_result.get('evidence','')}
         elif vuln_type == "Spring4Shell":
             if any(keyword in html.lower() for keyword in ['tomcatwar', 'class.module', 'classloader']):
-                result = {"type":"Spring4Shell","confidence":85,"evidence":"Spring4Shell-related response detected"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                result = {"type":"Spring4Shell","confidence":confidence,"evidence":"Spring4Shell-related response detected"}
         elif vuln_type == "Text4Shell":
             if any(keyword in html.lower() for keyword in ['script:javascript', 'env:', 'dns:']):
-                result = {"type":"Text4Shell","confidence":80,"evidence":"Text4Shell pattern detected"}
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='medium',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='medium'
+                )
+                result = {"type":"Text4Shell","confidence":confidence,"evidence":"Text4Shell pattern detected"}
             if not result and self.enable_advanced_oob:
                 await asyncio.sleep(1)
                 with oob_results_lock:
                     for res in oob_results:
                         if marker in res['path']:
-                            result = {"type":"Text4Shell (OOB)","confidence":90,"evidence":f"OOB callback for {marker}"}
+                            confidence = calculate_evidence_based_confidence(
+                                evidence_strength='critical',
+                                baseline_excluded=True,
+                                multiple_confirmations=True,
+                                specificity='high',
+                                false_positive_resistance='high'
+                            )
+                            result = {"type":"Text4Shell (OOB)","confidence":confidence,"evidence":f"OOB callback for {marker}"}
                             break
         if result and result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
             evidence = getattr(resp, '_evidence', None)
@@ -6830,6 +8439,10 @@ class InjectionEngine:
         self.log("Second-order injection tests...")
         stored_xss_payload = f"<img src=http://{self.public_ip}:{self.oob_port}/DAST_STORED_XSS_{self.oob_marker_base}>"
         stored_sqli_payload = f"' UNION SELECT 'DAST_STORED_SQL_{self.oob_marker_base}'--"
+        
+        # Track injection points for later verification
+        injection_points = []
+        
         for page in self.crawler_engine.crawled_pages:
             page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
             if not page_data:
@@ -6849,32 +8462,140 @@ class InjectionEngine:
                         else:
                             data[name] = 'test'
                     await self._async_fetch(action, method='POST', data=data)
+                    injection_points.append(action)
                     self.log(f"Stored payload submitted to {action}")
-        await asyncio.sleep(2)
-        for url in list(self.crawler_engine.visited_urls):
-            resp = await self._async_fetch(url)
-            if resp:
-                html = resp._body
-                if stored_sqli_payload in html:
-                    await self._add_vulnerability({
-                        "type":"Second-order SQLi","url":url,"parameter":"*",
-                        "evidence":f"Marker found: {stored_sqli_payload}",
-                        "severity":"Critical","confidence":95,"cwe":CWE_MAP["SQLi"]
-                    })
-        timeout = 30.0
-        check_interval = 1.0
+        
+        if not injection_points:
+            self.log("No suitable injection points found for second-order testing")
+            return
+        
+        self.log(f"Submitted payloads to {len(injection_points)} injection points")
+        
+        # Enhanced delayed verification with multiple intervals
+        verification_intervals = [5, 15, 30, 60, 120]  # Progressive delays
+        max_total_timeout = 300  # 5 minutes total
+        
+        # Discover high-priority targets (admin, dashboard, profile pages)
+        high_priority_urls = self._discover_high_priority_targets()
+        self.log(f"Found {len(high_priority_urls)} high-priority targets for delayed verification")
+        
         start_time = time.time()
-        while time.time() - start_time < timeout:
+        last_verification = 0
+        
+        while time.time() - start_time < max_total_timeout:
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            # Determine if we should verify at this interval
+            should_verify = False
+            for interval in verification_intervals:
+                if elapsed >= interval and last_verification < interval:
+                    should_verify = True
+                    last_verification = interval
+                    break
+            
+            if should_verify:
+                self.log(f"Performing delayed verification at {elapsed:.0f}s...")
+                
+                # Check high-priority URLs first
+                await self._verify_second_order_injection(high_priority_urls, stored_sqli_payload)
+                
+                # Then check all crawled URLs
+                await self._verify_second_order_injection(list(self.crawler_engine.visited_urls), stored_sqli_payload)
+                
+                # Re-crawl to discover new pages that might contain injected content
+                if elapsed >= 30:  # Re-crawl after 30 seconds
+                    self.log("Re-crawling to discover potential delayed trigger pages...")
+                    await self._delayed_recrawl()
+            
+            # Check for OOB callbacks (more frequent)
             with oob_results_lock:
                 for res in oob_results:
                     if "DAST_STORED_XSS" in res['path']:
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='critical',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
                         await self._add_vulnerability({
                             "type":"Second-order XSS","url":res['path'],"parameter":"*",
-                            "evidence":"OOB callback from stored XSS",
-                            "severity":"High","confidence":95,"cwe":CWE_MAP["XSS"]
+                            "evidence":f"OOB callback from stored XSS (injected at {len(injection_points)} points)",
+                            "severity":"High","confidence":confidence,"cwe":CWE_MAP["XSS"]
                         })
+                        self.log(f"Second-order XSS confirmed via OOB callback after {elapsed:.0f}s")
                         return
-            await asyncio.sleep(check_interval)
+            
+            # Adaptive sleep based on elapsed time
+            if elapsed < 30:
+                await asyncio.sleep(2)  # Check frequently early
+            elif elapsed < 120:
+                await asyncio.sleep(5)  # Moderate frequency
+            else:
+                await asyncio.sleep(10)  # Less frequent later
+        
+        self.log(f"Second-order injection testing completed after {max_total_timeout}s with no OOB callbacks")
+    
+    def _discover_high_priority_targets(self):
+        """Discover high-priority URLs likely to trigger second-order vulnerabilities."""
+        high_priority = set()
+        admin_keywords = ['admin', 'dashboard', 'panel', 'manage', 'moderator', 'review']
+        user_keywords = ['profile', 'account', 'settings', 'user', 'my']
+        
+        for url in self.crawler_engine.visited_urls:
+            url_lower = url.lower()
+            if any(kw in url_lower for kw in admin_keywords + user_keywords):
+                high_priority.add(url)
+        
+        # Also check for common admin paths
+        base_urls = set()
+        for url in self.crawler_engine.visited_urls:
+            parsed = urlparse(url)
+            base = f"{parsed.scheme}://{parsed.netloc}"
+            base_urls.add(base)
+        
+        for base in base_urls:
+            for path in ['/admin', '/dashboard', '/admin/', '/dashboard/', '/panel', '/manage']:
+                high_priority.add(f"{base}{path}")
+        
+        return list(high_priority)
+    
+    async def _verify_second_order_injection(self, urls, sqli_payload):
+        """Verify if second-order SQLi payload appears in given URLs."""
+        for url in urls:
+            try:
+                resp = await self._async_fetch(url)
+                if resp:
+                    html = resp._body
+                    if sqli_payload in html:
+                        confidence = calculate_evidence_based_confidence(
+                            evidence_strength='critical',
+                            baseline_excluded=True,
+                            multiple_confirmations=True,
+                            specificity='high',
+                            false_positive_resistance='high'
+                        )
+                        await self._add_vulnerability({
+                            "type":"Second-order SQLi","url":url,"parameter":"*",
+                            "evidence":f"Marker found: {sqli_payload}",
+                            "severity":"Critical","confidence":confidence,"cwe":CWE_MAP["SQLi"]
+                        })
+                        self.log(f"Second-order SQLi confirmed at {url}")
+            except Exception as e:
+                logging.debug(f"Verification error for {url}: {e}")
+    
+    async def _delayed_recrawl(self):
+        """Re-crawl the application to discover pages that might contain injected content."""
+        if not self.crawler_engine:
+            return
+        
+        # Re-crawl starting from known entry points with a shallow depth
+        for page in self.crawler_engine.crawled_pages[:5]:  # Limit to first 5 pages
+            try:
+                await self.crawler_engine.crawl(page['url'], max_depth=2)
+            except Exception as e:
+                logging.debug(f"Re-crawl error for {page['url']}: {e}")
     async def race_condition_tests(self):
         target_urls = set()
         for page in self.crawler_engine.crawled_pages:
@@ -6904,6 +8625,9 @@ class InjectionEngine:
     
     async def _run_advanced_race_condition_tests(self):
         try:
+            # Initialize session manager for advanced tests
+            session_manager = SessionStateManager()
+            
             # Discover specific endpoints for advanced race condition tests
             forgot_password_urls = set()
             change_email_urls = set()
@@ -6942,7 +8666,13 @@ class InjectionEngine:
             # Run advanced tests on discovered endpoints
             for forgot_url in forgot_password_urls:
                 for change_url in change_email_urls:
-                    await self.test_token_validation_window(forgot_url, change_url, "test@example.com")
+                    session_id = session_manager.create_session()
+                    try:
+                        await self.test_token_validation_window(forgot_url, change_url, "test@example.com", session_manager, session_id)
+                    except TypeError:
+                        await self.test_token_validation_window(forgot_url, change_url, "test@example.com")
+                    finally:
+                        session_manager.destroy_session(session_id)
             
             for trans_url in transaction_urls:
                 # Try multiple patterns for confirm URL
@@ -6955,37 +8685,69 @@ class InjectionEngine:
                 ]
                 for confirm_url in possible_confirm_urls:
                     if confirm_url != trans_url:
-                        await self.test_two_phase_transaction(trans_url, confirm_url)
+                        session_id = session_manager.create_session()
+                        try:
+                            await self.test_two_phase_transaction(trans_url, confirm_url, session_manager, session_id)
+                        except TypeError:
+                            await self.test_two_phase_transaction(trans_url, confirm_url)
+                        finally:
+                            session_manager.destroy_session(session_id)
                         break
             
             for purchase_url in purchase_urls:
-                await self.test_inventory_oversell(purchase_url, "product_123", 1)
+                session_id = session_manager.create_session()
+                try:
+                    await self.test_inventory_oversell(purchase_url, "product_123", 1, session_manager, session_id)
+                except TypeError:
+                    await self.test_inventory_oversell(purchase_url, "product_123", 1)
+                finally:
+                    session_manager.destroy_session(session_id)
             
         except Exception as e:
             logging.warning(f"Advanced race condition tests error: {e}")
     
-    async def _test_basic_race_condition(self, url):
+    async def _test_basic_race_condition(self, url, session_manager: SessionStateManager = None, session_id: str = None):
         try:
-            # Basic concurrent request test
-            tasks = [self._async_fetch(url, method='POST', data={"test":"race"}) for _ in range(10)]
+            # Basic concurrent request test with optional session management
+            if session_manager and session_id:
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                tasks = [self._async_fetch(url, method='POST', data={"test":"race"}, 
+                                         cookies=session_cookies, headers=session_headers) for _ in range(10)]
+            else:
+                tasks = [self._async_fetch(url, method='POST', data={"test":"race"}) for _ in range(10)]
+            
             done, pending = await safe_async_wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
             if pending:
                 for task in pending:
                     task.cancel()
                 logging.warning(f"{len(pending)} race condition test tasks timed out")
             responses = [task.result() for task in done if not task.cancelled()]
+            
+            # Update session from responses if session manager provided
+            if session_manager and session_id:
+                for resp in responses:
+                    session_manager.update_session_from_response(session_id, resp)
+            
             if all(resp and resp.status == 200 for resp in responses):
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='low',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='low',
+                    false_positive_resistance='low'
+                )
                 await self._add_vulnerability({
                     "type":"Potential Race Condition","url":url,"parameter":"*",
                     "evidence":"Multiple concurrent requests all succeeded",
-                    "severity":"Medium","confidence":60,"cwe":CWE_MAP["RaceCondition"]
+                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"]
                 })
         except Exception as e:
             logging.warning(f"Basic race condition test error: {e}")
     
-    async def _test_parallel_resource_allocation(self, url):
+    async def _test_parallel_resource_allocation(self, url, session_manager: SessionStateManager = None, session_id: str = None):
         try:
-            logging.info(f"[RACE CONDITION] Testing parallel resource allocation at {url}")
+            logging.info(f"[RACE CONDITION] Testing parallel resource allocation at {url} with session {session_id}")
             
             # Test parallel resource allocation (like account creation, booking, etc.)
             resource_data = {
@@ -6998,7 +8760,16 @@ class InjectionEngine:
                 test_data = resource_data.copy()
                 test_data['request_id'] = request_id
                 start_time = time.time()
-                resp = await self._async_fetch(url, method='POST', data=test_data)
+                
+                if session_manager and session_id:
+                    session_cookies = session_manager.get_session_cookies(session_id)
+                    session_headers = session_manager.get_session_headers(session_id)
+                    resp = await self._async_fetch(url, method='POST', data=test_data,
+                                                 cookies=session_cookies, headers=session_headers)
+                    session_manager.update_session_from_response(session_id, resp)
+                else:
+                    resp = await self._async_fetch(url, method='POST', data=test_data)
+                
                 end_time = time.time()
                 return {
                     'request_id': request_id,
@@ -7022,13 +8793,20 @@ class InjectionEngine:
             
             # If more than expected allocations succeed, race condition exists
             if len(successful) > 1:
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='critical',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
                 await self._add_vulnerability({
                     "type": "Parallel Resource Allocation Race Condition",
                     "url": url,
                     "parameter": "resource_id,user_id",
                     "evidence": f"{len(successful)} exclusive resource allocations succeeded concurrently",
                     "severity": "Critical",
-                    "confidence": 90,
+                    "confidence": confidence,
                     "cwe": CWE_MAP["RaceCondition"]
                 })
                 logging.warning(f"[RACE CONDITION] CRITICAL: {len(successful)} exclusive allocations succeeded")
@@ -7074,13 +8852,20 @@ class InjectionEngine:
             # If multiple conflicting state transitions succeed, race condition exists
             if len(successful) > 1:
                 successful_states = [r['target_state'] for r in successful]
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
                 await self._add_vulnerability({
                     "type": "Concurrent State Transition Race Condition",
                     "url": url,
                     "parameter": "target_state",
                     "evidence": f"Multiple conflicting state transitions succeeded: {successful_states}",
                     "severity": "High",
-                    "confidence": 85,
+                    "confidence": confidence,
                     "cwe": CWE_MAP["RaceCondition"]
                 })
             
@@ -7123,13 +8908,20 @@ class InjectionEngine:
                 unique_responses = set(responses)
                 
                 if len(unique_responses) > 1:
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='medium',
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='medium'
+                    )
                     await self._add_vulnerability({
                         "type": "Idempotency Violation Race Condition",
                         "url": url,
                         "parameter": "*",
                         "evidence": f"Identical requests produced {len(unique_responses)} different responses",
                         "severity": "Medium",
-                        "confidence": 75,
+                        "confidence": confidence,
                         "cwe": CWE_MAP["RaceCondition"]
                     })
             
@@ -7155,10 +8947,17 @@ class InjectionEngine:
             timing_variance = statistics.variance(timings) if len(timings) > 1 else 0
             timing_std = statistics.stdev(timings) if len(timings) > 1 else 0
             if timing_std < 0.001 and timing_variance < 0.000001:
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='medium',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='low'
+                )
                 await self._add_vulnerability({
                     "type":"Race Condition (Timing)","url":url,"parameter":"*",
                     "evidence":f"Low timing variance detected: std={timing_std:.6f}s, variance={timing_variance:.9f}s²",
-                    "severity":"Medium","confidence":70,"cwe":CWE_MAP["RaceCondition"]
+                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"]
                 })
             sorted_times = sorted(timings)
             clusters = []
@@ -7284,9 +9083,9 @@ class InjectionEngine:
             return results
         except Exception as e:
             logging.warning(f"Two-phase transaction test error: {e}")
-    async def test_inventory_oversell(self, purchase_url, product_id, quantity=1):
+    async def test_inventory_oversell(self, purchase_url, product_id, quantity=1, session_manager: SessionStateManager = None, session_id: str = None):
         try:
-            logging.info(f"[INVENTORY OVERSELL] Testing double-spend on {purchase_url} with 50 concurrent requests")
+            logging.info(f"[INVENTORY OVERSELL] Testing double-spend on {purchase_url} with 50 concurrent requests with session {session_id}")
             async def single_purchase(request_id):
                 start_time = time.time()
                 purchase_data = {
@@ -7294,7 +9093,16 @@ class InjectionEngine:
                     "quantity": quantity,
                     "request_id": request_id
                 }
-                resp = await self._async_fetch(purchase_url, method='POST', data=purchase_data)
+                
+                if session_manager and session_id:
+                    session_cookies = session_manager.get_session_cookies(session_id)
+                    session_headers = session_manager.get_session_headers(session_id)
+                    resp = await self._async_fetch(purchase_url, method='POST', data=purchase_data,
+                                                 cookies=session_cookies, headers=session_headers)
+                    session_manager.update_session_from_response(session_id, resp)
+                else:
+                    resp = await self._async_fetch(purchase_url, method='POST', data=purchase_data)
+                
                 end_time = time.time()
                 return {
                     "request_id": request_id,
@@ -7621,6 +9429,9 @@ class InjectionEngine:
         self.log("Testing complex purchase sequence automation...")
         purchase_endpoints = set()
         
+        # Initialize session state manager for multi-step flows
+        session_manager = SessionStateManager()
+        
         # Discover purchase-related endpoints
         for page in self.crawler_engine.crawled_pages:
             page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
@@ -7646,24 +9457,39 @@ class InjectionEngine:
         # Store discovered purchase endpoints for interconnection with other tests
         self.discovered_purchase_endpoints = purchase_endpoints
         
-        # Test complex purchase sequences
+        # Test complex purchase sequences with proper session management
         for purchase_url in purchase_endpoints:
-            await self._test_multi_step_purchase_race(purchase_url)
-            await self._test_cart_manipulation_sequence(purchase_url)
-            await self._test_price_tampering_sequence(purchase_url)
-            await self._test_coupon_stacking_sequence(purchase_url)
-            await self._test_payment_bypass_sequence(purchase_url)
+            # Create a fresh session for each purchase flow
+            session_id = session_manager.create_session()
+            
+            await self._test_multi_step_purchase_race(purchase_url, session_manager, session_id)
+            await self._test_cart_manipulation_sequence(purchase_url, session_manager, session_id)
+            await self._test_price_tampering_sequence(purchase_url, session_manager, session_id)
+            await self._test_coupon_stacking_sequence(purchase_url, session_manager, session_id)
+            await self._test_payment_bypass_sequence(purchase_url, session_manager, session_id)
             
             # Interconnect with inventory oversell test
-            await self.test_inventory_oversell(purchase_url, "product_123", 1)
+            try:
+                await self.test_inventory_oversell(purchase_url, "product_123", 1, session_manager, session_id)
+            except TypeError:
+                # Fallback for old signature if session management not fully integrated
+                await self.test_inventory_oversell(purchase_url, "product_123", 1)
             
             # Interconnect with race condition tests on purchase endpoints
-            await self._test_basic_race_condition(purchase_url)
-            await self._test_parallel_resource_allocation(purchase_url)
+            try:
+                await self._test_basic_race_condition(purchase_url, session_manager, session_id)
+                await self._test_parallel_resource_allocation(purchase_url, session_manager, session_id)
+            except TypeError:
+                # Fallback for old signature if session management not fully integrated
+                await self._test_basic_race_condition(purchase_url)
+                await self._test_parallel_resource_allocation(purchase_url)
+            
+            # Clean up session
+            session_manager.destroy_session(session_id)
     
-    async def _test_multi_step_purchase_race(self, checkout_url):
+    async def _test_multi_step_purchase_race(self, checkout_url, session_manager: SessionStateManager, session_id: str):
         try:
-            logging.info(f"[PURCHASE SEQUENCE] Testing multi-step purchase race at {checkout_url}")
+            logging.info(f"[PURCHASE SEQUENCE] Testing multi-step purchase race at {checkout_url} with session {session_id}")
             
             # Simulate a multi-step checkout process with race conditions
             cart_data = {
@@ -7671,23 +9497,48 @@ class InjectionEngine:
                 'quantity': 1
             }
             
-            # Step 1: Add to cart
+            # Step 1: Add to cart with session management
             cart_url = checkout_url.replace('/checkout', '/cart/add')
-            cart_resp = await self._async_fetch(cart_url, method='POST', data=cart_data)
+            session_cookies = session_manager.get_session_cookies(session_id)
+            session_headers = session_manager.get_session_headers(session_id)
+            
+            cart_resp = await self._async_fetch(cart_url, method='POST', data=cart_data, 
+                                               cookies=session_cookies, headers=session_headers)
+            
+            # Update session from response
+            session_manager.update_session_from_response(session_id, cart_resp)
             
             if not cart_resp or cart_resp.status != 200:
                 return
             
+            # Store cart_id from response if available
+            if hasattr(cart_resp, '_body'):
+                import re
+                cart_id_match = re.search(r'cart[_-]?id["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_-]+)', cart_resp._body)
+                if cart_id_match:
+                    session_manager.set_session_state(session_id, 'cart_id', cart_id_match.group(1))
+                    logging.debug(f"Stored cart_id in session: {cart_id_match.group(1)}")
+            
             # Step 2: Initiate checkout with concurrent shipping method selection
+            cart_id = session_manager.get_session_state(session_id, 'cart_id') or 'test_cart_123'
             checkout_data = {
-                'cart_id': 'test_cart_123',
+                'cart_id': cart_id,
                 'shipping_method': 'standard'
             }
             
             async def initiate_checkout_with_race(shipping_method):
+                # Get fresh session data for each concurrent request
+                test_cookies = session_manager.get_session_cookies(session_id)
+                test_headers = session_manager.get_session_headers(session_id)
+                
                 test_data = checkout_data.copy()
                 test_data['shipping_method'] = shipping_method
-                resp = await self._async_fetch(checkout_url, method='POST', data=test_data)
+                resp = await self._async_fetch(checkout_url, method='POST', data=test_data,
+                                             cookies=test_cookies, headers=test_headers)
+                
+                # Update session from each response
+                session_manager.update_session_from_response(session_id, resp)
+                
                 return {
                     'shipping_method': shipping_method,
                     'success': resp and resp.status == 200,
@@ -7711,7 +9562,7 @@ class InjectionEngine:
                     "type": "Multi-Step Purchase Race Condition",
                     "url": checkout_url,
                     "parameter": "shipping_method",
-                    "evidence": f"{len(successful)} shipping methods accepted simultaneously",
+                    "evidence": f"{len(successful)} shipping methods accepted simultaneously with proper session management",
                     "severity": "High",
                     "confidence": 85,
                     "cwe": CWE_MAP["MultiStepPurchase"]
@@ -7720,15 +9571,19 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Multi-step purchase race test error: {e}")
     
-    async def _test_cart_manipulation_sequence(self, cart_url):
+    async def _test_cart_manipulation_sequence(self, cart_url, session_manager: SessionStateManager, session_id: str):
         try:
-            logging.info(f"[CART SEQUENCE] Testing cart manipulation at {cart_url}")
+            logging.info(f"[CART SEQUENCE] Testing cart manipulation at {cart_url} with session {session_id}")
             
             # Test cart manipulation sequence
             product_id = 'prod_456'
             
             # Sequence: Add items, modify quantities, remove items concurrently
             async def cart_operation(operation, quantity=None):
+                # Get fresh session data for each operation
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                
                 if operation == 'add':
                     data = {'product_id': product_id, 'quantity': quantity or 1}
                 elif operation == 'update':
@@ -7738,7 +9593,12 @@ class InjectionEngine:
                 else:
                     return None
                 
-                resp = await self._async_fetch(cart_url, method='POST', data=data)
+                resp = await self._async_fetch(cart_url, method='POST', data=data,
+                                             cookies=session_cookies, headers=session_headers)
+                
+                # Update session from response
+                session_manager.update_session_from_response(session_id, resp)
+                
                 return {
                     'operation': operation,
                     'success': resp and resp.status == 200,
@@ -7779,22 +9639,30 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Cart manipulation sequence test error: {e}")
     
-    async def _test_price_tampering_sequence(self, checkout_url):
+    async def _test_price_tampering_sequence(self, checkout_url, session_manager: SessionStateManager, session_id: str):
         try:
-            logging.info(f"[PRICE TAMPERING] Testing price manipulation sequence at {checkout_url}")
+            logging.info(f"[PRICE TAMPERING] Testing price manipulation sequence at {checkout_url} with session {session_id}")
             
             # Test price tampering during checkout sequence
             original_price = 100.00
             tampered_prices = [0.01, 1.00, 10.00, -100.00, 999999.00]
             
             for tampered_price in tampered_prices:
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                
                 checkout_data = {
                     'product_id': 'prod_789',
                     'quantity': 1,
                     'price': tampered_price
                 }
                 
-                resp = await self._async_fetch(checkout_url, method='POST', data=checkout_data)
+                resp = await self._async_fetch(checkout_url, method='POST', data=checkout_data,
+                                             cookies=session_cookies, headers=session_headers)
+                
+                # Update session from response
+                session_manager.update_session_from_response(session_id, resp)
+                
                 if resp and resp.status == 200:
                     response_text = resp.text.lower()
                     if 'order confirmed' in response_text or 'payment processed' in response_text:
@@ -7802,7 +9670,7 @@ class InjectionEngine:
                             "type": "Price Tampering Vulnerability",
                             "url": checkout_url,
                             "parameter": "price",
-                            "evidence": f"Checkout accepted tampered price: {tampered_price}",
+                            "evidence": f"Checkout accepted tampered price: {tampered_price} with session management",
                             "severity": "Critical",
                             "confidence": 90,
                             "cwe": CWE_MAP["PriceTampering"]
@@ -7812,20 +9680,28 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Price tampering sequence test error: {e}")
     
-    async def _test_coupon_stacking_sequence(self, checkout_url):
+    async def _test_coupon_stacking_sequence(self, checkout_url, session_manager: SessionStateManager, session_id: str):
         try:
-            logging.info(f"[COUPON STACKING] Testing coupon stacking at {checkout_url}")
+            logging.info(f"[COUPON STACKING] Testing coupon stacking at {checkout_url} with session {session_id}")
             
             # Test multiple coupon application sequence
             coupons = ['SAVE10', 'SAVE20', 'SAVE30', 'FREESHIP', 'WELCOME']
             
             async def apply_coupon(coupon_code):
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                
                 coupon_data = {
                     'coupon_code': coupon_code,
                     'product_id': 'prod_999',
                     'quantity': 1
                 }
-                resp = await self._async_fetch(checkout_url, method='POST', data=coupon_data)
+                resp = await self._async_fetch(checkout_url, method='POST', data=coupon_data,
+                                             cookies=session_cookies, headers=session_headers)
+                
+                # Update session from response
+                session_manager.update_session_from_response(session_id, resp)
+                
                 return {
                     'coupon': coupon_code,
                     'success': resp and resp.status == 200,
@@ -7849,7 +9725,7 @@ class InjectionEngine:
                     "type": "Coupon Stacking Vulnerability",
                     "url": checkout_url,
                     "parameter": "coupon_code",
-                    "evidence": f"{len(successful)} coupons applied simultaneously",
+                    "evidence": f"{len(successful)} coupons applied simultaneously with session management",
                     "severity": "High",
                     "confidence": 85,
                     "cwe": CWE_MAP["CouponStacking"]
@@ -7858,14 +9734,17 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Coupon stacking sequence test error: {e}")
     
-    async def _test_payment_bypass_sequence(self, payment_url):
+    async def _test_payment_bypass_sequence(self, payment_url, session_manager: SessionStateManager, session_id: str):
         try:
-            logging.info(f"[PAYMENT BYPASS] Testing payment bypass sequence at {payment_url}")
+            logging.info(f"[PAYMENT BYPASS] Testing payment bypass sequence at {payment_url} with session {session_id}")
             
             # Test payment bypass during checkout sequence
             payment_methods = ['credit_card', 'paypal', 'bank_transfer', 'crypto']
             
             for payment_method in payment_methods:
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                
                 # Test with invalid payment data
                 payment_data = {
                     'payment_method': payment_method,
@@ -7884,7 +9763,12 @@ class InjectionEngine:
                 negative_payment_data['amount'] = -100.00
                 
                 for test_data in [payment_data, zero_payment_data, negative_payment_data]:
-                    resp = await self._async_fetch(payment_url, method='POST', data=test_data)
+                    resp = await self._async_fetch(payment_url, method='POST', data=test_data,
+                                                 cookies=session_cookies, headers=session_headers)
+                    
+                    # Update session from response
+                    session_manager.update_session_from_response(session_id, resp)
+                    
                     if resp and resp.status == 200:
                         response_text = resp.text.lower()
                         if 'payment successful' in response_text or 'order confirmed' in response_text:
@@ -7892,7 +9776,7 @@ class InjectionEngine:
                                 "type": "Payment Bypass Vulnerability",
                                 "url": payment_url,
                                 "parameter": "amount,payment_method",
-                                "evidence": f"Payment bypassed with amount: {test_data['amount']}",
+                                "evidence": f"Payment bypassed with amount: {test_data['amount']} with session management",
                                 "severity": "Critical",
                                 "confidence": 95,
                                 "cwe": CWE_MAP["PaymentBypass"]
@@ -12848,6 +14732,9 @@ class OmegaDAST:
             else:
                 # Server rejected the batch, which is good
                 break
+
+    async def test_jwts(self):
+        """Test for JWT security vulnerabilities."""
         self.log("Starting JWT security tests...")
         public_key_pem = None
         jwks_endpoints = [
@@ -13506,10 +15393,13 @@ class ProxyTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
         self.setLayout(layout)
         
         # Create tabbed interface for different proxy functions
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
         layout.addWidget(self.tabs)
         
         # MITM Proxy Tab
@@ -13538,63 +15428,105 @@ class ProxyTab(QWidget):
         
     def setup_mitm_tab(self):
         layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
         self.mitm_tab.setLayout(layout)
+        
+        # Control Group
+        control_group = QGroupBox("MITM Proxy Control")
+        control_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
         control_layout = QHBoxLayout()
+        control_layout.setSpacing(8)
+        
+        port_label = QLabel("Port:")
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1024, 65535)
         self.port_spin.setValue(8080)
+        self.port_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        
         self.start_proxy_btn = QPushButton("Start Proxy")
         self.start_proxy_btn.clicked.connect(self.toggle_proxy)
+        self.start_proxy_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #45a049; }")
+        
         self.clear_btn = QPushButton("Clear Captured")
         self.clear_btn.clicked.connect(self.clear_captured)
-        control_layout.addWidget(QLabel("Port:"))
+        self.clear_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #da190b; }")
+        
+        control_layout.addWidget(port_label)
         control_layout.addWidget(self.port_spin)
         control_layout.addWidget(self.start_proxy_btn)
         control_layout.addWidget(self.clear_btn)
-        layout.addLayout(control_layout)
+        control_layout.addStretch()
+        
+        control_group.setLayout(control_layout)
+        layout.addWidget(control_group)
+        
+        # Status
         self.status_label = QLabel("Proxy stopped")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #f0f0f0; border-radius: 4px; }")
         layout.addWidget(self.status_label)
+        
+        # Captured Requests Table
+        requests_label = QLabel("Captured Requests")
+        requests_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(requests_label)
+        
         self.captured_table = QTableWidget()
         self.captured_table.setColumnCount(4)
         self.captured_table.setHorizontalHeaderLabels(["Method", "URL", "Status", "Body Size"])
         self.captured_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(QLabel("Captured Requests:"))
+        self.captured_table.setStyleSheet("QTableWidget { border: 1px solid #ccc; border-radius: 4px; } QTableWidget::item { padding: 4px; } QHeaderView::section { background-color: #f0f0f0; padding: 6px; border: 1px solid #ccc; font-weight: bold; }")
         layout.addWidget(self.captured_table)
+        
+        # Request Details
+        details_label = QLabel("Request Details")
+        details_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(details_label)
+        
         self.details_area = QPlainTextEdit()
         self.details_area.setReadOnly(True)
-        layout.addWidget(QLabel("Request Details:"))
+        self.details_area.setStyleSheet("QPlainTextEdit { padding: 8px; border: 1px solid #ccc; border-radius: 4px; background-color: #f8f8f8; font-family: Consolas; }")
+        self.details_area.setMaximumHeight(150)
         layout.addWidget(self.details_area)
+        
         self.captured_table.cellDoubleClicked.connect(self.show_details)
         
     def setup_proxy_pool_tab(self):
         layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
         self.pool_tab.setLayout(layout)
         
-        # Proxy Pool Configuration
-        config_group = QFormLayout()
+        # Proxy Pool Configuration Group
+        config_group = QGroupBox("Proxy Pool Configuration")
+        config_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        config_form = QFormLayout()
+        config_form.setSpacing(8)
         
         # Rotation settings
         self.enable_rotation_cb = QCheckBox("Enable Rotation")
         self.enable_rotation_cb.setChecked(True)
-        config_group.addRow("Rotation:", self.enable_rotation_cb)
+        config_form.addRow("Rotation:", self.enable_rotation_cb)
         
         self.rotation_interval_spin = QSpinBox()
         self.rotation_interval_spin.setRange(1, 10000)
         self.rotation_interval_spin.setValue(100)
         self.rotation_interval_spin.setToolTip("Number of requests before rotating to next proxy")
-        config_group.addRow("Rotation Interval:", self.rotation_interval_spin)
+        self.rotation_interval_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        config_form.addRow("Rotation Interval:", self.rotation_interval_spin)
         
         # Health check settings
         self.health_check_interval_spin = QSpinBox()
         self.health_check_interval_spin.setRange(60, 3600)
         self.health_check_interval_spin.setValue(300)
         self.health_check_interval_spin.setToolTip("Health check interval in seconds")
-        config_group.addRow("Health Check Interval:", self.health_check_interval_spin)
+        self.health_check_interval_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        config_form.addRow("Health Check Interval:", self.health_check_interval_spin)
         
         # Geo-diverse settings
         self.geo_diverse_cb = QCheckBox("Prefer Geo-Diverse")
         self.geo_diverse_cb.setChecked(True)
-        config_group.addRow("Geo-Diverse:", self.geo_diverse_cb)
+        config_form.addRow("Geo-Diverse:", self.geo_diverse_cb)
         
         # Failure rate threshold
         self.max_failure_rate_spin = QDoubleSpinBox()
@@ -13602,79 +15534,108 @@ class ProxyTab(QWidget):
         self.max_failure_rate_spin.setSingleStep(0.1)
         self.max_failure_rate_spin.setValue(0.5)
         self.max_failure_rate_spin.setToolTip("Maximum failure rate before proxy is marked unhealthy")
-        config_group.addRow("Max Failure Rate:", self.max_failure_rate_spin)
+        self.max_failure_rate_spin.setStyleSheet("QDoubleSpinBox { padding: 4px; }")
+        config_form.addRow("Max Failure Rate:", self.max_failure_rate_spin)
         
-        layout.addLayout(config_group)
+        config_group.setLayout(config_form)
+        layout.addWidget(config_group)
         
-        # Add Proxy Section
-        add_proxy_group = QFormLayout()
+        # Add Proxy Group
+        add_proxy_group = QGroupBox("Add New Proxy")
+        add_proxy_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        add_proxy_form = QFormLayout()
+        add_proxy_form.setSpacing(8)
         
         self.proxy_url_edit = QLineEdit()
         self.proxy_url_edit.setPlaceholderText("proxy.example.com:8080")
-        add_proxy_group.addRow("Proxy URL:", self.proxy_url_edit)
+        self.proxy_url_edit.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Proxy URL:", self.proxy_url_edit)
         
         self.proxy_type_combo = QComboBox()
         self.proxy_type_combo.addItems(["http", "https", "socks5", "socks4"])
-        add_proxy_group.addRow("Type:", self.proxy_type_combo)
+        self.proxy_type_combo.setStyleSheet("QComboBox { padding: 4px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Type:", self.proxy_type_combo)
         
         self.proxy_username_edit = QLineEdit()
         self.proxy_username_edit.setPlaceholderText("(optional)")
-        add_proxy_group.addRow("Username:", self.proxy_username_edit)
+        self.proxy_username_edit.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Username:", self.proxy_username_edit)
         
         self.proxy_password_edit = QLineEdit()
         self.proxy_password_edit.setPlaceholderText("(optional)")
         self.proxy_password_edit.setEchoMode(QLineEdit.Password)
-        add_proxy_group.addRow("Password:", self.proxy_password_edit)
+        self.proxy_password_edit.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Password:", self.proxy_password_edit)
         
         self.proxy_country_edit = QLineEdit()
         self.proxy_country_edit.setPlaceholderText("US (optional)")
-        add_proxy_group.addRow("Country:", self.proxy_country_edit)
+        self.proxy_country_edit.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Country:", self.proxy_country_edit)
         
         self.proxy_region_edit = QLineEdit()
         self.proxy_region_edit.setPlaceholderText("us-east (optional)")
-        add_proxy_group.addRow("Region:", self.proxy_region_edit)
+        self.proxy_region_edit.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        add_proxy_form.addRow("Region:", self.proxy_region_edit)
         
         self.residential_cb = QCheckBox("Residential Proxy")
-        add_proxy_group.addRow("", self.residential_cb)
+        add_proxy_form.addRow("", self.residential_cb)
         
         add_btn_layout = QHBoxLayout()
+        add_btn_layout.setSpacing(8)
+        
         self.add_proxy_btn = QPushButton("Add Proxy")
         self.add_proxy_btn.clicked.connect(self.add_proxy)
+        self.add_proxy_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #45a049; }")
         add_btn_layout.addWidget(self.add_proxy_btn)
         
         self.import_proxies_btn = QPushButton("Import from File")
         self.import_proxies_btn.clicked.connect(self.import_proxies)
+        self.import_proxies_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #2196F3; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #0b7dda; }")
         add_btn_layout.addWidget(self.import_proxies_btn)
         
-        add_proxy_group.addRow("", add_btn_layout)
-        layout.addLayout(add_proxy_group)
+        add_btn_layout.addStretch()
+        add_proxy_form.addRow("", add_btn_layout)
+        
+        add_proxy_group.setLayout(add_proxy_form)
+        layout.addWidget(add_proxy_group)
         
         # Proxy List
-        layout.addWidget(QLabel("Configured Proxies:"))
+        proxies_label = QLabel("Configured Proxies")
+        proxies_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(proxies_label)
+        
         self.proxy_table = QTableWidget()
         self.proxy_table.setColumnCount(7)
         self.proxy_table.setHorizontalHeaderLabels(["URL", "Type", "Country", "Region", "Residential", "Status", "Actions"])
         self.proxy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.proxy_table.setStyleSheet("QTableWidget { border: 1px solid #ccc; border-radius: 4px; } QTableWidget::item { padding: 4px; } QHeaderView::section { background-color: #f0f0f0; padding: 6px; border: 1px solid #ccc; font-weight: bold; }")
         layout.addWidget(self.proxy_table)
         
         # Proxy Statistics
         self.stats_label = QLabel("Proxies: 0 total, 0 healthy")
+        self.stats_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #f0f0f0; border-radius: 4px; }")
         layout.addWidget(self.stats_label)
         
         # Pool Actions
         pool_actions_layout = QHBoxLayout()
+        pool_actions_layout.setSpacing(8)
+        
         self.health_check_btn = QPushButton("Run Health Check")
         self.health_check_btn.clicked.connect(self.run_health_check)
+        self.health_check_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #2196F3; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #0b7dda; }")
         pool_actions_layout.addWidget(self.health_check_btn)
         
         self.reset_failed_btn = QPushButton("Reset Failed Proxies")
         self.reset_failed_btn.clicked.connect(self.reset_failed_proxies)
+        self.reset_failed_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #ff9800; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #e68900; }")
         pool_actions_layout.addWidget(self.reset_failed_btn)
         
         self.clear_pool_btn = QPushButton("Clear Pool")
         self.clear_pool_btn.clicked.connect(self.clear_proxy_pool)
+        self.clear_pool_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #da190b; }")
         pool_actions_layout.addWidget(self.clear_pool_btn)
         
+        pool_actions_layout.addStretch()
         layout.addLayout(pool_actions_layout)
     def toggle_proxy(self):
         if not self.proxy_running:
@@ -14223,33 +16184,79 @@ class RepeaterTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
         self.setLayout(layout)
-        form = QFormLayout()
+        
+        # Request Configuration Group
+        request_group = QGroupBox("Request Configuration")
+        request_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        request_form = QFormLayout()
+        request_form.setSpacing(8)
+        
         self.method_combo = QComboBox()
         self.method_combo.addItems(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+        self.method_combo.setStyleSheet("QComboBox { padding: 4px; border: 1px solid #ccc; border-radius: 4px; }")
+        request_form.addRow("Method:", self.method_combo)
+        
         self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://example.com/api/endpoint")
+        self.url_input.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        request_form.addRow("URL:", self.url_input)
+        
         self.headers_input = QPlainTextEdit()
-        self.headers_input.setPlaceholderText("Headers (JSON format)")
+        self.headers_input.setPlaceholderText('{"Content-Type": "application/json", "Authorization": "Bearer token"}')
         self.headers_input.setMaximumHeight(80)
+        self.headers_input.setStyleSheet("QPlainTextEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; background-color: #f8f8f8; font-family: Consolas; }")
+        request_form.addRow("Headers:", self.headers_input)
+        
         self.body_input = QPlainTextEdit()
-        self.body_input.setPlaceholderText("Request body (JSON or form data)")
+        self.body_input.setPlaceholderText('{"key": "value"} or form data')
         self.body_input.setMaximumHeight(100)
-        form.addRow("Method:", self.method_combo)
-        form.addRow("URL:", self.url_input)
-        form.addRow("Headers:", self.headers_input)
-        form.addRow("Body:", self.body_input)
-        layout.addLayout(form)
+        self.body_input.setStyleSheet("QPlainTextEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; background-color: #f8f8f8; font-family: Consolas; }")
+        request_form.addRow("Body:", self.body_input)
+        
+        request_group.setLayout(request_form)
+        layout.addWidget(request_group)
+        
+        # Control Buttons
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        
         self.send_btn = QPushButton("Send Request")
         self.send_btn.clicked.connect(self.send_request)
+        self.send_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #45a049; }")
         btn_layout.addWidget(self.send_btn)
+        
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear_form)
+        self.clear_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #da190b; }")
+        btn_layout.addWidget(self.clear_btn)
+        
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        layout.addWidget(QLabel("Response:"))
+        
+        # Status
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #f0f0f0; border-radius: 4px; }")
+        layout.addWidget(self.status_label)
+        
+        # Response Area
+        response_label = QLabel("Response")
+        response_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(response_label)
+        
         self.response_area = QPlainTextEdit()
         self.response_area.setReadOnly(True)
+        self.response_area.setStyleSheet("QPlainTextEdit { padding: 8px; border: 1px solid #ccc; border-radius: 4px; background-color: #f8f8f8; font-family: Consolas; }")
         layout.addWidget(self.response_area)
-        self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label)
+    
+    def clear_form(self):
+        self.url_input.clear()
+        self.headers_input.clear()
+        self.body_input.clear()
+        self.response_area.clear()
+        self.status_label.setText("Ready")
     def send_request(self):
         method = self.method_combo.currentText()
         url = self.url_input.text().strip()
@@ -14257,14 +16264,17 @@ class RepeaterTab(QWidget):
         body_text = self.body_input.toPlainText().strip()
         if not url:
             self.status_label.setText("Error: URL required")
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #ffebee; border-radius: 4px; color: #c62828; }")
             return
         try:
             headers = json.loads(headers_text) if headers_text else {}
             body = json.loads(body_text) if body_text else None
         except json.JSONDecodeError as e:
             self.status_label.setText(f"Error: Invalid JSON - {e}")
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #ffebee; border-radius: 4px; color: #c62828; }")
             return
         self.status_label.setText("Sending...")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #e3f2fd; border-radius: 4px; color: #1565c0; }")
         def send_in_thread():
             try:
                 import aiohttp
@@ -14320,105 +16330,219 @@ class RepeaterTab(QWidget):
                 response_text += f"Body:\n{text}"
                 self.response_area.setPlainText(response_text)
                 self.status_label.setText(f"Completed - {status}")
+                self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #e8f5e9; border-radius: 4px; color: #2e7d32; }")
             except Exception as e:
                 self.response_area.setPlainText(f"Error: {str(e)}")
                 self.status_label.setText("Error")
+                self.status_label.setStyleSheet("QLabel { font-weight: bold; padding: 8px; background-color: #ffebee; border-radius: 4px; color: #c62828; }")
         threading.Thread(target=send_in_thread, daemon=True).start()
 
 class ScanTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
         self.setLayout(layout)
-        form = QFormLayout()
+        
+        # Create scroll area for configuration
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        
+        config_widget = QWidget()
+        config_layout = QVBoxLayout()
+        config_layout.setSpacing(12)
+        config_widget.setLayout(config_layout)
+        
+        # Basic Configuration Group
+        basic_group = QGroupBox("Basic Configuration")
+        basic_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        basic_form = QFormLayout()
+        basic_form.setSpacing(8)
+        
         self.url_input = QLineEdit("http://testphp.vulnweb.com/")
-        self.depth_spin = QSpinBox(); self.depth_spin.setRange(1,10); self.depth_spin.setValue(3)
-        self.threads_spin = QSpinBox(); self.threads_spin.setRange(1,200); self.threads_spin.setValue(5)
-        self.delay_spin = QDoubleSpinBox(); self.delay_spin.setRange(0.0,5.0); self.delay_spin.setValue(0.2)
-        self.conf_spin = QSpinBox(); self.conf_spin.setRange(0,100); self.conf_spin.setValue(75)
-        self.js_check = QCheckBox("JS Rendering"); self.js_check.setChecked(True)
+        self.url_input.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
+        
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setRange(1,10)
+        self.depth_spin.setValue(3)
+        self.depth_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1,200)
+        self.threads_spin.setValue(5)
+        self.threads_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        
+        self.delay_spin = QDoubleSpinBox()
+        self.delay_spin.setRange(0.0,5.0)
+        self.delay_spin.setValue(0.2)
+        self.delay_spin.setSingleStep(0.1)
+        self.delay_spin.setStyleSheet("QDoubleSpinBox { padding: 4px; }")
+        
+        self.conf_spin = QSpinBox()
+        self.conf_spin.setRange(0,100)
+        self.conf_spin.setValue(75)
+        self.conf_spin.setStyleSheet("QSpinBox { padding: 4px; }")
+        
+        self.js_check = QCheckBox("Enable JavaScript Rendering")
+        self.js_check.setChecked(True)
+        
         self.user_agent_input = QLineEdit()
         self.user_agent_input.setPlaceholderText("Leave empty for random user agent")
+        self.user_agent_input.setStyleSheet("QLineEdit { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }")
         
-        # Traffic shaping options
-        self.traffic_shaping_enabled = QCheckBox("Enable Traffic Shaping"); self.traffic_shaping_enabled.setChecked(True)
-        self.randomize_interval = QCheckBox("Randomize Intervals"); self.randomize_interval.setChecked(True)
-        self.randomize_headers = QCheckBox("Randomize Headers"); self.randomize_headers.setChecked(True)
-        self.randomize_case = QCheckBox("Randomize Header Case"); self.randomize_case.setChecked(True)
-        self.browser_simulation = QCheckBox("Browser Simulation"); self.browser_simulation.setChecked(True)
-        self.human_like_behavior = QCheckBox("Human-like Interaction"); self.human_like_behavior.setChecked(True)
+        basic_form.addRow("Target URL:", self.url_input)
+        basic_form.addRow("Scan Depth:", self.depth_spin)
+        basic_form.addRow("Thread Count:", self.threads_spin)
+        basic_form.addRow("Request Delay (s):", self.delay_spin)
+        basic_form.addRow("Confidence Threshold (%):", self.conf_spin)
+        basic_form.addRow("", self.js_check)
+        basic_form.addRow("Custom User-Agent:", self.user_agent_input)
         
-        # Taint tracking options
-        self.taint_tracking_enabled = QCheckBox("Enable Taint Tracking"); self.taint_tracking_enabled.setChecked(True)
-        self.symbolic_execution_enabled = QCheckBox("Enable Symbolic Execution"); self.symbolic_execution_enabled.setChecked(True)
+        basic_group.setLayout(basic_form)
+        config_layout.addWidget(basic_group)
         
-        # Dynamic payload options
-        self.dynamic_payloads_enabled = QCheckBox("Enable Dynamic Payloads"); self.dynamic_payloads_enabled.setChecked(True)
-        self.environment_detection_enabled = QCheckBox("Enable Environment Detection"); self.environment_detection_enabled.setChecked(True)
-        self.use_encrypted_payloads = QCheckBox("Use Encrypted Payloads"); self.use_encrypted_payloads.setChecked(False)
-        self.use_staged_payloads = QCheckBox("Use Staged Payloads"); self.use_staged_payloads.setChecked(False)
+        # Traffic Shaping Group
+        traffic_group = QGroupBox("Intelligent Traffic Shaping")
+        traffic_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        traffic_layout = QVBoxLayout()
+        traffic_layout.setSpacing(6)
         
-        form.addRow("URL:", self.url_input)
-        form.addRow("Depth:", self.depth_spin)
-        form.addRow("Threads:", self.threads_spin)
-        form.addRow("Delay:", self.delay_spin)
-        form.addRow("Confidence:", self.conf_spin)
-        form.addRow("User-Agent:", self.user_agent_input)
-        form.addRow(self.js_check)
+        self.traffic_shaping_enabled = QCheckBox("Enable Traffic Shaping")
+        self.traffic_shaping_enabled.setChecked(True)
         
-        # Add traffic shaping section
-        form.addRow(QLabel("<b>Intelligent Traffic Shaping:</b>"))
-        form.addRow("", self.traffic_shaping_enabled)
-        form.addRow("", self.randomize_interval)
-        form.addRow("", self.randomize_headers)
-        form.addRow("", self.randomize_case)
-        form.addRow("", self.browser_simulation)
-        form.addRow("", self.human_like_behavior)
+        self.randomize_interval = QCheckBox("Randomize Request Intervals")
+        self.randomize_interval.setChecked(True)
         
-        # Add taint tracking section
-        form.addRow(QLabel("<b>Taint Tracking & Symbolic Execution:</b>"))
-        form.addRow("", self.taint_tracking_enabled)
-        form.addRow("", self.symbolic_execution_enabled)
+        self.randomize_headers = QCheckBox("Randomize HTTP Headers")
+        self.randomize_headers.setChecked(True)
         
-        # Add dynamic payload section
-        form.addRow(QLabel("<b>Dynamic Payload System:</b>"))
-        form.addRow("", self.dynamic_payloads_enabled)
-        form.addRow("", self.environment_detection_enabled)
-        form.addRow("", self.use_encrypted_payloads)
-        form.addRow("", self.use_staged_payloads)
+        self.randomize_case = QCheckBox("Randomize Header Case")
+        self.randomize_case.setChecked(True)
         
-        layout.addLayout(form)
+        self.browser_simulation = QCheckBox("Browser Simulation")
+        self.browser_simulation.setChecked(True)
+        
+        self.human_like_behavior = QCheckBox("Human-like Interaction Patterns")
+        self.human_like_behavior.setChecked(True)
+        
+        traffic_layout.addWidget(self.traffic_shaping_enabled)
+        traffic_layout.addWidget(self.randomize_interval)
+        traffic_layout.addWidget(self.randomize_headers)
+        traffic_layout.addWidget(self.randomize_case)
+        traffic_layout.addWidget(self.browser_simulation)
+        traffic_layout.addWidget(self.human_like_behavior)
+        
+        traffic_group.setLayout(traffic_layout)
+        config_layout.addWidget(traffic_group)
+        
+        # Advanced Analysis Group
+        advanced_group = QGroupBox("Advanced Analysis")
+        advanced_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setSpacing(6)
+        
+        self.taint_tracking_enabled = QCheckBox("Enable Taint Tracking")
+        self.taint_tracking_enabled.setChecked(True)
+        
+        self.symbolic_execution_enabled = QCheckBox("Enable Symbolic Execution")
+        self.symbolic_execution_enabled.setChecked(True)
+        
+        self.dynamic_payloads_enabled = QCheckBox("Enable Dynamic Payloads")
+        self.dynamic_payloads_enabled.setChecked(True)
+        
+        self.environment_detection_enabled = QCheckBox("Enable Environment Detection")
+        self.environment_detection_enabled.setChecked(True)
+        
+        self.use_encrypted_payloads = QCheckBox("Use Encrypted Payloads")
+        self.use_encrypted_payloads.setChecked(False)
+        
+        self.use_staged_payloads = QCheckBox("Use Staged Payloads")
+        self.use_staged_payloads.setChecked(False)
+        
+        advanced_layout.addWidget(self.taint_tracking_enabled)
+        advanced_layout.addWidget(self.symbolic_execution_enabled)
+        advanced_layout.addWidget(self.dynamic_payloads_enabled)
+        advanced_layout.addWidget(self.environment_detection_enabled)
+        advanced_layout.addWidget(self.use_encrypted_payloads)
+        advanced_layout.addWidget(self.use_staged_payloads)
+        
+        advanced_group.setLayout(advanced_layout)
+        config_layout.addWidget(advanced_group)
+        
+        scroll.setWidget(config_widget)
+        layout.addWidget(scroll, 1)
+        
+        # Control Buttons
         btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start"); self.start_btn.clicked.connect(self.start_scan)
-        self.stop_btn = QPushButton("Stop"); self.stop_btn.clicked.connect(self.stop_scan)
-        self.pause_btn = QPushButton("Pause"); self.pause_btn.clicked.connect(self.pause_scan)
-        self.resume_btn = QPushButton("Resume"); self.resume_btn.clicked.connect(self.resume_scan)
+        btn_layout.setSpacing(8)
+        
+        self.start_btn = QPushButton("Start Scan")
+        self.start_btn.clicked.connect(self.start_scan)
+        self.start_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #45a049; } QPushButton:pressed { background-color: #3d8b40; }")
+        
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_scan)
+        self.stop_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #da190b; } QPushButton:pressed { background-color: #c41807; }")
         self.stop_btn.setEnabled(False)
+        
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.clicked.connect(self.pause_scan)
+        self.pause_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #ff9800; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #e68900; } QPushButton:pressed { background-color: #cc7a00; }")
         self.pause_btn.setEnabled(False)
+        
+        self.resume_btn = QPushButton("Resume")
+        self.resume_btn.clicked.connect(self.resume_scan)
+        self.resume_btn.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #2196F3; color: white; border: none; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #0b7dda; } QPushButton:pressed { background-color: #0a6ec2; }")
         self.resume_btn.setEnabled(False)
+        
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.stop_btn)
         btn_layout.addWidget(self.pause_btn)
         btn_layout.addWidget(self.resume_btn)
+        btn_layout.addStretch()
+        
         layout.addLayout(btn_layout)
+        
+        # Progress Bar
         progress_layout = QHBoxLayout()
+        progress_layout.setSpacing(8)
         self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("QProgressBar { border: 1px solid #ccc; border-radius: 4px; text-align: center; } QProgressBar::chunk { background-color: #4CAF50; }")
         self.progress_label = QLabel("Ready")
+        self.progress_label.setStyleSheet("QLabel { font-weight: bold; }")
         progress_layout.addWidget(self.progress_label)
         progress_layout.addWidget(self.progress_bar)
         layout.addLayout(progress_layout)
-        self.log_area = QTextEdit(); self.log_area.setReadOnly(True); self.log_area.setFont(QFont("Courier New",9))
+        
+        # Log Area
+        log_label = QLabel("Scan Log")
+        log_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(log_label)
+        
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setFont(QFont("Consolas", 9))
+        self.log_area.setStyleSheet("QTextEdit { padding: 8px; border: 1px solid #ccc; border-radius: 4px; background-color: #f8f8f8; }")
+        self.log_area.setMaximumHeight(150)
+        layout.addWidget(self.log_area)
+        
+        # Findings Table
+        findings_label = QLabel("Security Findings")
+        findings_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12px; }")
+        layout.addWidget(findings_label)
+        
         self.findings_table = QTableWidget()
         self.findings_table.setColumnCount(6)
         self.findings_table.setHorizontalHeaderLabels(["Type","URL","Parameter","Confidence","Severity","CWE"])
         self.findings_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.findings_table.setStyleSheet("QTableWidget { border: 1px solid #ccc; border-radius: 4px; } QTableWidget::item { padding: 4px; } QHeaderView::section { background-color: #f0f0f0; padding: 6px; border: 1px solid #ccc; font-weight: bold; }")
         self.findings_table.cellDoubleClicked.connect(self.show_evidence)
         self.findings_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.findings_table.customContextMenuRequested.connect(self.show_context_menu)
-        layout.addWidget(QLabel("Log:"))
-        layout.addWidget(self.log_area)
-        layout.addWidget(QLabel("Findings:"))
         layout.addWidget(self.findings_table)
+        
         self.worker = None
         self.fp_db = FP_Database()
         self.total_tasks = 0
@@ -14560,22 +16684,105 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("UltraDAST v12.0 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v12.7 – Unstoppable Pentester")
         self.resize(1400, 900)
+        
+        # Apply modern styling
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #e0e0e0;
+                color: #333;
+                padding: 8px 16px;
+                border: 1px solid #ddd;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                color: #1976D2;
+                font-weight: bold;
+                border-bottom: 2px solid #1976D2;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #d0d0d0;
+            }
+            QMenuBar {
+                background-color: #f0f0f0;
+                border-bottom: 1px solid #ddd;
+                padding: 2px;
+            }
+            QMenuBar::item {
+                background-color: transparent;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }
+            QMenuBar::item:selected {
+                background-color: #e0e0e0;
+            }
+            QMenu {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 24px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #1976D2;
+                color: white;
+            }
+            QToolBar {
+                background-color: #f0f0f0;
+                border: none;
+                spacing: 4px;
+                padding: 4px;
+            }
+            QToolBar::separator {
+                background-color: #ccc;
+                width: 1px;
+                margin: 4px 8px;
+            }
+            QStatusBar {
+                background-color: #f0f0f0;
+                border-top: 1px solid #ddd;
+                color: #333;
+            }
+        """)
+        
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
         self.setCentralWidget(self.tabs)
         self.add_new_scan_tab()
         self.add_repeater_tab()
         self.add_proxy_tab()
         self.dark_mode = False
         self.create_menu_bar()
+        
         toolbar = self.addToolBar("Tools")
+        toolbar.setStyleSheet("QToolBar { spacing: 6px; }")
+        
         add_action = QAction("New Scan Tab", self)
         add_action.triggered.connect(self.add_new_scan_tab)
         toolbar.addAction(add_action)
+        
+        toolbar.addSeparator()
+        
         dark_mode_action = QAction("Toggle Dark Mode", self)
         dark_mode_action.triggered.connect(self.toggle_dark_mode)
         toolbar.addAction(dark_mode_action)
+        
         self.jira_webhook_url = ''
         self.slack_webhook_url = ''
         self.statusBar().showMessage("Ready")
@@ -14628,19 +16835,211 @@ class MainWindow(QMainWindow):
         self.dark_mode = not self.dark_mode
         if self.dark_mode:
             self.setStyleSheet("""
-                QMainWindow { background-color: #2b2b2b; color: #ffffff; }
-                QWidget { background-color: #2b2b2b; color: #ffffff; }
-                QTextEdit, QPlainTextEdit { background-color: #1e1e1e; color: #ffffff; }
-                QLineEdit { background-color: #1e1e1e; color: #ffffff; }
-                QTableWidget { background-color: #1e1e1e; color: #ffffff; }
-                QTabWidget::pane { border: 1px solid #444; }
-                QTabBar::tab { background-color: #3b3b3b; color: #ffffff; }
-                QTabBar::tab:selected { background-color: #4b4b4b; }
-                QPushButton { background-color: #4b4b4b; color: #ffffff; }
-                QPushButton:hover { background-color: #5b5b5b; }
+                QMainWindow {
+                    background-color: #1e1e1e;
+                }
+                QWidget {
+                    background-color: #1e1e1e;
+                    color: #e0e0e0;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                    background-color: #252525;
+                }
+                QTabBar::tab {
+                    background-color: #2d2d2d;
+                    color: #e0e0e0;
+                    padding: 8px 16px;
+                    border: 1px solid #444;
+                    border-bottom: none;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    margin-right: 2px;
+                }
+                QTabBar::tab:selected {
+                    background-color: #252525;
+                    color: #64B5F6;
+                    font-weight: bold;
+                    border-bottom: 2px solid #64B5F6;
+                }
+                QTabBar::tab:hover:!selected {
+                    background-color: #3d3d3d;
+                }
+                QMenuBar {
+                    background-color: #252525;
+                    border-bottom: 1px solid #444;
+                    padding: 2px;
+                    color: #e0e0e0;
+                }
+                QMenuBar::item {
+                    background-color: transparent;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    color: #e0e0e0;
+                }
+                QMenuBar::item:selected {
+                    background-color: #3d3d3d;
+                }
+                QMenu {
+                    background-color: #2d2d2d;
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                    padding: 4px;
+                    color: #e0e0e0;
+                }
+                QMenu::item {
+                    padding: 6px 24px;
+                    border-radius: 4px;
+                    color: #e0e0e0;
+                }
+                QMenu::item:selected {
+                    background-color: #1976D2;
+                    color: white;
+                }
+                QToolBar {
+                    background-color: #252525;
+                    border: none;
+                    spacing: 4px;
+                    padding: 4px;
+                }
+                QToolBar::separator {
+                    background-color: #555;
+                    width: 1px;
+                    margin: 4px 8px;
+                }
+                QStatusBar {
+                    background-color: #252525;
+                    border-top: 1px solid #444;
+                    color: #e0e0e0;
+                }
+                QTextEdit, QPlainTextEdit {
+                    background-color: #1a1a1a;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                }
+                QLineEdit {
+                    background-color: #1a1a1a;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                }
+                QTableWidget {
+                    background-color: #1a1a1a;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                }
+                QTableWidget::item {
+                    color: #e0e0e0;
+                }
+                QHeaderView::section {
+                    background-color: #2d2d2d;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                    padding: 6px;
+                }
+                QGroupBox {
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                    border-radius: 6px;
+                    margin-top: 12px;
+                    padding-top: 12px;
+                }
+                QGroupBox::title {
+                    color: #e0e0e0;
+                    subcontrol-origin: margin;
+                    left: 12px;
+                    padding: 0 6px;
+                }
+                QLabel {
+                    color: #e0e0e0;
+                }
+                QCheckBox {
+                    color: #e0e0e0;
+                }
+                QSpinBox, QDoubleSpinBox {
+                    background-color: #1a1a1a;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                }
+                QComboBox {
+                    background-color: #1a1a1a;
+                    color: #e0e0e0;
+                    border: 1px solid #444;
+                }
             """)
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #f5f5f5;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    background-color: white;
+                }
+                QTabBar::tab {
+                    background-color: #e0e0e0;
+                    color: #333;
+                    padding: 8px 16px;
+                    border: 1px solid #ddd;
+                    border-bottom: none;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    margin-right: 2px;
+                }
+                QTabBar::tab:selected {
+                    background-color: white;
+                    color: #1976D2;
+                    font-weight: bold;
+                    border-bottom: 2px solid #1976D2;
+                }
+                QTabBar::tab:hover:!selected {
+                    background-color: #d0d0d0;
+                }
+                QMenuBar {
+                    background-color: #f0f0f0;
+                    border-bottom: 1px solid #ddd;
+                    padding: 2px;
+                }
+                QMenuBar::item {
+                    background-color: transparent;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                }
+                QMenuBar::item:selected {
+                    background-color: #e0e0e0;
+                }
+                QMenu {
+                    background-color: white;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    padding: 6px 24px;
+                    border-radius: 4px;
+                }
+                QMenu::item:selected {
+                    background-color: #1976D2;
+                    color: white;
+                }
+                QToolBar {
+                    background-color: #f0f0f0;
+                    border: none;
+                    spacing: 4px;
+                    padding: 4px;
+                }
+                QToolBar::separator {
+                    background-color: #ccc;
+                    width: 1px;
+                    margin: 4px 8px;
+                }
+                QStatusBar {
+                    background-color: #f0f0f0;
+                    border-top: 1px solid #ddd;
+                    color: #333;
+                }
+            """)
     def export_config(self):
         current_tab = self.tabs.currentWidget()
         if isinstance(current_tab, ScanTab):
@@ -14874,7 +17273,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v12.0']
+                        ['Tool Version', 'UltraDAST v12.7']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -14985,7 +17384,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v12.0",
+                            "tool": "UltraDAST v12.7",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -16524,6 +18923,15 @@ class TaintIntegratedSessionManager:
         self.instrumentor = HTTPResponseInstrumentor(self.taint_tracker)
         self.taint_results = []
         
+    async def fetch(self, url: str, method: str = 'GET', data: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = False) -> Optional[Any]:
+        """Fetch method to match SessionManager interface"""
+        kwargs = {'allow_redirects': allow_redirects}
+        if headers: kwargs['headers'] = headers
+        if data: kwargs['data'] = data
+        if json_data: kwargs['json'] = json_data
+        
+        return await self.request(method, url, **kwargs)
+    
     async def request(self, method, url, **kwargs):
         """Override request method to add taint tracking"""
         # Prepare request data for instrumentation
@@ -16539,7 +18947,14 @@ class TaintIntegratedSessionManager:
             )
         
         # Make the actual request
-        response = await self.session_manager.request(method, url, **kwargs)
+        response = await self.session_manager.fetch(
+            url, 
+            method, 
+            data=kwargs.get('data'),
+            json_data=kwargs.get('json'),
+            headers=headers,
+            allow_redirects=kwargs.get('allow_redirects', False)
+        )
         
         # Instrument the response
         taint_analysis = {}
