@@ -73,7 +73,7 @@ The tool runs via a multi-tabbed **PyQt5** desktop interface:
 
 ### Setup
 # Clone or download the script
-git clone https://github.com/your-repo/ultra-dast.git
+git clone https://github.com/LeonardoParchao/UltraDAST.git
 cd ultra-dast
 
 # Install dependencies
@@ -125,7 +125,7 @@ cryptography
 
 ---
 
-## 🧩 Advanced Configuration Examples
+##  Advanced Configuration Examples
 
 ### Proxy Pool Configuration
 Configure rotating proxies with geo-diversity and health checks directly in the GUI's **Proxy Pool** tab, or pass a JSON configuration:
@@ -193,7 +193,7 @@ asyncio.run(scanner.scan())
 
 ---
 
-## 🛠️ Architecture Overview
+##  Architecture Overview
 
 - **Crawler Engine**: Asynchronously discovers URLs, extracts parameters, and stores page hashes for deduplication.
 - **Injection Engine**: Manages baseline caching, payload delivery, and detection via a pluggable `Detector` class.
