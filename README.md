@@ -6,7 +6,7 @@
 
 **ULTRA-DAST** is an enterprise-grade, all-in-one Dynamic Application Security Testing (DAST) framework. Built for professional penetration testers and red teams, it combines high-speed asynchronous scanning with advanced evasion techniques, business logic testing (race conditions, OAuth flows), API fuzzing (GraphQL/gRPC), genetic fuzzing, and local privilege escalation checks—all wrapped in a feature-rich PyQt5 GUI.
 
-> **LEGAL WARNING:** Unauthorized scanning of networks or applications you do not own is **illegal** and constitutes a federal crime. This tool is intended for **authorized security testing**, bug bounty programs, and educational research only. The authors assume no liability for misuse.
+> **LEGAL WARNING:** Unauthorized scanning of networks or applications you do not own is **illegal** and constitutes a federal crime. This tool is intended for **authorized security testing**, bug bounty programs, and educational research only. The author assume no liability for misuse.
 
 ---
 
@@ -233,7 +233,7 @@ We welcome contributions from the security community! To contribute:
 
 ## License
 
-This project is proprietary and **All Rights Reserved**. Unauthorized copying, distribution, or modification of this software is strictly prohibited without prior written consent from the authors.
+This project is proprietary and **All Rights Reserved**. Unauthorized copying, distribution, or modification of this software is strictly prohibited without prior written consent from the author.
 
 ---
 
