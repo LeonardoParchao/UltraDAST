@@ -13,7 +13,7 @@
 
 UltraDAST v14.0 is a fully-featured web application security scanner that combines the evasion capabilities of a red-team toolkit, the precision of enterprise DAST, and the workflow of Burp Suite—all in a single, free platform.
 
-I built this because I got tired of paying for Burp Suite and dealing with the limitations of free tools. It started as a personal project and grew into something that can actually compete with the commercial heavyweights.
+I built this because I got tired of not being able to use the paid version of Burp Suite and dealing with the limitations of free tools. It started as a personal project and grew into something that can actually compete with the commercial heavyweights.
 
 **Why I built this:**
 
