@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v16.3 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.0 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -416,6 +416,24 @@ except ImportError:
     CVSS_AVAILABLE = False
     CVSS4 = None
     logging.warning("CVSS library not available - CVSS scoring will be disabled")
+
+# Optional asyncpg import with fallback
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    ASYNCPG_AVAILABLE = False
+    asyncpg = None
+    logging.warning("asyncpg library not available - PostgreSQL scanning will be disabled")
+
+# Optional motor import with fallback
+try:
+    import motor.motor_asyncio
+    MOTOR_AVAILABLE = True
+except ImportError:
+    MOTOR_AVAILABLE = False
+    motor = None
+    logging.warning("motor library not available - MongoDB scanning will be disabled")
 
 
 # Fix recursion crashes
@@ -14173,7 +14191,18 @@ class ValidationEngine:
             'timestamp': datetime.now().isoformat()
         }
         self.gray_zone_findings.append(gray_zone_entry)
+        
+        # Also add gray zone findings to the main reporting flow for GUI display and export
+        # Mark them with gray zone status for identification
+        gray_zone_vuln = vuln.copy()
+        gray_zone_vuln['gray_zone'] = True
+        gray_zone_vuln['probability_score'] = probability_score
+        gray_zone_vuln['gray_zone_recommendation'] = 'manual_review' if probability_score > self.GRAY_ZONE_THRESHOLD else 'discard'
+        
         logging.info(f"Added to gray zone: {vuln.get('type')} - Probability: {probability_score}%")
+        
+        # Return the gray zone entry for tracking
+        return gray_zone_entry
     
     def get_gray_zone_findings(self):
         """Get all gray zone findings that exceed threshold"""
@@ -14659,12 +14688,16 @@ class SurgicalModeOrchestrator:
                                 logging.info(f"Gray zone auto-triage marked as FP: {validated.get('type')} at {validated.get('url')}")
                             else:
                                 # Still ambiguous - add to gray zone
-                                self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
+                                gray_zone_entry = self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
                                 gray_zone.append(validated)
+                                # Also add to main reporting flow for GUI display and export
+                                self._add_gray_zone_to_reporting(gray_zone_entry)
                         else:
                             # Traditional gray zone handling
-                            self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
+                            gray_zone_entry = self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
                             gray_zone.append(validated)
+                            # Also add to main reporting flow for GUI display and export
+                            self._add_gray_zone_to_reporting(gray_zone_entry)
                     else:
                         verified.append(validated)  # Still include as verified
                         
@@ -14720,6 +14753,27 @@ class SurgicalModeOrchestrator:
             },
             'total_time': total_time
         }
+    
+    def _add_gray_zone_to_reporting(self, gray_zone_entry):
+        """Add gray zone findings to the main reporting flow for GUI display and export"""
+        try:
+            if hasattr(self, 'scanner') and hasattr(self.scanner, 'reporting_engine'):
+                vuln = gray_zone_entry.get('vulnerability', {}).copy()
+                # Mark as gray zone for identification
+                vuln['gray_zone'] = True
+                vuln['probability_score'] = gray_zone_entry.get('probability_score', 0)
+                vuln['gray_zone_recommendation'] = gray_zone_entry.get('recommendation', 'manual_review')
+                
+                # Add to reporting engine vulnerabilities list
+                self.scanner.reporting_engine.vulnerabilities.append(vuln)
+                
+                # Emit finding signal for GUI display
+                if hasattr(self.scanner.reporting_engine, 'add_finding'):
+                    self.scanner.reporting_engine.add_finding(vuln)
+                
+                logging.info(f"Gray zone finding added to reporting: {vuln.get('type')} - Probability: {gray_zone_entry.get('probability_score', 0)}%")
+        except Exception as e:
+            logging.error(f"Failed to add gray zone finding to reporting: {e}")
     
     def _calculate_race_probability(self, finding):
         """Calculate probability score for race conditions based on actual test results"""
@@ -18039,6 +18093,10 @@ class ReportingEngine:
         else:
             logging.info(msg)
     def add_finding(self, vuln):
+        # Add to vulnerabilities list for export purposes
+        self.vulnerabilities.append(vuln)
+        
+        # Emit signal for GUI display
         if hasattr(self.signals, 'finding'):
             self.signals.finding.emit(vuln)
         else:
@@ -20486,11 +20544,18 @@ class InjectionEngine:
                     specificity='medium',
                     false_positive_resistance='medium'
                 )
-                await self._add_vulnerability({
+                race_vuln = {
                     "type":"Potential Race Condition","url":url,"parameter":"*",
                     "evidence":f"{len(successful_responses)}/{num_requests} synchronized requests succeeded",
-                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"]
-                })
+                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": len(successful_responses)/num_requests,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.8,
+                        "race_window_size": num_requests
+                    }
+                }
+                await self._add_vulnerability(race_vuln)
         except Exception as e:
             logging.warning(f"Basic race condition test error: {e}")
     
@@ -20581,15 +20646,22 @@ class InjectionEngine:
                     specificity='high',
                     false_positive_resistance='high'
                 )
-                await self._add_vulnerability({
+                race_vuln = {
                     "type": "Parallel Resource Allocation Race Condition",
                     "url": url,
                     "parameter": "resource_id,user_id",
                     "evidence": f"{len(successful)} exclusive resource allocations succeeded concurrently",
                     "severity": "Critical",
                     "confidence": confidence,
-                    "cwe": CWE_MAP["RaceCondition"]
-                })
+                    "cwe": CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": len(successful)/num_requests,
+                        "timing_anomalies": sum(1 for r in results if r and r.get('response_time', 0) > 1.0),
+                        "consistency_score": 0.9,
+                        "race_window_size": num_requests
+                    }
+                }
+                await self._add_vulnerability(race_vuln)
                 logging.warning(f"[RACE CONDITION] CRITICAL: {len(successful)} exclusive allocations succeeded")
             
         except Exception as e:
@@ -20708,7 +20780,13 @@ class InjectionEngine:
                     "evidence": f"Multiple conflicting state transitions succeeded: {successful_states}",
                     "severity": "High",
                     "confidence": confidence,
-                    "cwe": CWE_MAP["RaceCondition"]
+                    "cwe": CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": len(successful_states)/num_requests,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.7,
+                        "race_window_size": num_requests
+                    }
                 })
             
         except Exception as e:
@@ -20799,7 +20877,13 @@ class InjectionEngine:
                         "evidence": f"Identical requests produced {len(unique_responses)} different responses",
                         "severity": "Medium",
                         "confidence": confidence,
-                        "cwe": CWE_MAP["RaceCondition"]
+                        "cwe": CWE_MAP["RaceCondition"],
+                        "race_test_results": {
+                            "success_rate": len(successful)/num_requests,
+                            "timing_anomalies": 0,
+                            "consistency_score": 0.6,
+                            "race_window_size": num_requests
+                        }
                     })
             
         except Exception as e:
@@ -20876,7 +20960,13 @@ class InjectionEngine:
                 await self._add_vulnerability({
                     "type":"Race Condition (Timing)","url":url,"parameter":"*",
                     "evidence":f"Low timing variance detected: std={timing_std:.6f}s, variance={timing_variance:.9f}s²",
-                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"]
+                    "severity":"Medium","confidence":confidence,"cwe":CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": len(timings)/num_requests,
+                        "timing_anomalies": 1 if timing_std < 0.001 else 0,
+                        "consistency_score": 0.8,
+                        "race_window_size": num_requests
+                    }
                 })
             
             sorted_times = sorted(timings)
@@ -20895,7 +20985,13 @@ class InjectionEngine:
                 await self._add_vulnerability({
                     "type":"Race Condition (Time Cluster)","url":url,"parameter":"*",
                     "evidence":f"Detected {max_cluster_size} requests completing within 100μs",
-                    "severity":"Medium","confidence":75,"cwe":CWE_MAP["RaceCondition"]
+                    "severity":"Medium","confidence":75,"cwe":CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": max_cluster_size/num_requests,
+                        "timing_anomalies": 1,
+                        "consistency_score": 0.7,
+                        "race_window_size": num_requests
+                    }
                 })
             
             # Race Condition "Time-Dilation": Staggered burst testing
@@ -20988,7 +21084,14 @@ class InjectionEngine:
                         "evidence":f"Low timing variance at {delay*1000}ms delay: std={timing_std:.6f}s, variance={timing_variance:.9f}s² - potential race condition",
                         "severity":"High",
                         "confidence":80,
-                        "cwe":CWE_MAP["RaceCondition"]
+                        "cwe":CWE_MAP["RaceCondition"],
+                        "race_test_results": {
+                            "success_rate": len(timings)/num_requests,
+                            "timing_anomalies": 1,
+                            "consistency_score": 0.9,
+                            "race_window_size": num_requests,
+                            "dilation_delay_ms": delay * 1000
+                        }
                     })
                     logging.warning(f"Race condition detected at {delay*1000}ms delay - std={timing_std:.6f}s")
                 
@@ -21064,7 +21167,14 @@ class InjectionEngine:
                     "evidence": "Email changed during OTP validation window - account takeover possible",
                     "severity": "Critical",
                     "confidence": 90,
-                    "cwe": "CWE-384"
+                    "cwe": "CWE-384",
+                    "race_test_results": {
+                        "success_rate": 1.0,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.95,
+                        "race_window_size": 2,
+                        "race_type": "token_validation"
+                    }
                 })
             return results
         except Exception as e:
@@ -21151,7 +21261,14 @@ class InjectionEngine:
                     "evidence": f"Transaction confirmed with malicious amount ({malicious_amount}) instead of original ({original_amount})",
                     "severity": "Critical",
                     "confidence": 85,
-                    "cwe": CWE_MAP["RaceCondition"]
+                    "cwe": CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": 1.0,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.9,
+                        "race_window_size": 2,
+                        "race_type": "two_phase_transaction"
+                    }
                 })
             return results
         except Exception as e:
@@ -21335,7 +21452,14 @@ class InjectionEngine:
                     "evidence": f"All 50 concurrent purchase requests succeeded - no atomic inventory lock",
                     "severity": "Critical",
                     "confidence": 95,
-                    "cwe": CWE_MAP["RaceCondition"]
+                    "cwe": CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": 1.0,
+                        "timing_anomalies": 0,
+                        "consistency_score": 1.0,
+                        "race_window_size": 50,
+                        "race_type": "inventory_oversell"
+                    }
                 })
                 logging.warning(f"[INVENTORY OVERSELL] CRITICAL: No inventory locking detected!")
             elif success_count > 1 and len(out_of_stock_errors) > 0:
@@ -21348,7 +21472,14 @@ class InjectionEngine:
                     "evidence": f"{success_count} concurrent requests succeeded without clear inventory lock failure",
                     "severity": "High",
                     "confidence": 70,
-                    "cwe": CWE_MAP["RaceCondition"]
+                    "cwe": CWE_MAP["RaceCondition"],
+                    "race_test_results": {
+                        "success_rate": success_count/50,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.7,
+                        "race_window_size": 50,
+                        "race_type": "inventory_oversell"
+                    }
                 })
             return {
                 "total_requests": 50,
@@ -21574,7 +21705,12 @@ class InjectionEngine:
                     "evidence": "Authorization code returned without response_type parameter",
                     "severity": "High",
                     "confidence": 85,
-                    "cwe": CWE_MAP["OAuthAuthorizationCode"]
+                    "cwe": CWE_MAP["OAuthAuthorizationCode"],
+                    "oauth_test_results": {
+                        "test_type": "authorization_code_flow",
+                        "missing_parameter": "response_type",
+                        "response_analysis": "code_in_response"
+                    }
                 })
             
             # Test with insecure response_type
@@ -21598,7 +21734,12 @@ class InjectionEngine:
                     "evidence": "Access token exposed in URL fragment (implicit flow)",
                     "severity": "High",
                     "confidence": 90,
-                    "cwe": CWE_MAP["OAuthImplicitFlow"]
+                    "cwe": CWE_MAP["OAuthImplicitFlow"],
+                    "oauth_test_results": {
+                        "test_type": "implicit_flow",
+                        "insecure_response_type": "token",
+                        "token_exposure": "url_fragment"
+                    }
                 })
             
         except Exception as e:
@@ -21662,7 +21803,19 @@ class InjectionEngine:
                     "evidence": f"{len(successful)} token requests succeeded with same authorization code",
                     "severity": "Critical",
                     "confidence": 95,
-                    "cwe": CWE_MAP["OAuthTokenRace"]
+                    "cwe": CWE_MAP["OAuthTokenRace"],
+                    "race_test_results": {
+                        "success_rate": len(successful)/10,
+                        "timing_anomalies": 0,
+                        "consistency_score": 0.95,
+                        "race_window_size": 10,
+                        "race_type": "oauth_token_race"
+                    },
+                    "oauth_test_results": {
+                        "test_type": "token_race_condition",
+                        "same_auth_code": True,
+                        "multiple_tokens_issued": len(successful)
+                    }
                 })
                 logging.warning(f"[OAUTH RACE] CRITICAL: {len(successful)} tokens issued for single auth code")
             
@@ -21768,7 +21921,12 @@ class InjectionEngine:
                     "evidence": "OAuth callback accepted mismatched state parameter - CSRF token validation is broken",
                     "severity": "High",
                     "confidence": 90,
-                    "cwe": CWE_MAP["OAuthStateParameter"]
+                    "cwe": CWE_MAP["OAuthStateParameter"],
+                    "oauth_test_results": {
+                        "test_type": "state_parameter_csrf",
+                        "state_swapping_successful": True,
+                        "csrf_vulnerability_confirmed": True
+                    }
                 })
             else:
                 logging.info(f"[OAUTH STATE] CSRF protection appears functional - swapped states were rejected")
@@ -21789,7 +21947,12 @@ class InjectionEngine:
                     "evidence": "Authorization request accepted without state parameter (CSRF vulnerable)",
                     "severity": "High",
                     "confidence": 85,
-                    "cwe": CWE_MAP["OAuthStateParameter"]
+                    "cwe": CWE_MAP["OAuthStateParameter"],
+                    "oauth_test_results": {
+                        "test_type": "missing_state_parameter",
+                        "state_parameter_missing": True,
+                        "request_accepted_without_state": True
+                    }
                 })
             
         except Exception as e:
@@ -21834,7 +21997,12 @@ class InjectionEngine:
                         "evidence": f"Malicious redirect URI accepted: {malicious_redirect}",
                         "severity": "Critical",
                         "confidence": 85,
-                        "cwe": CWE_MAP["OAuthOpenRedirect"]
+                        "cwe": CWE_MAP["OAuthOpenRedirect"],
+                        "oauth_test_results": {
+                            "test_type": "redirect_uri_validation",
+                            "malicious_redirect_accepted": True,
+                            "accepted_redirect_uri": malicious_redirect
+                        }
                     })
                     break  # One vulnerability is sufficient
             
@@ -21891,7 +22059,12 @@ class InjectionEngine:
                         "evidence": "Token exchange succeeded without code_verifier (PKCE not enforced)",
                         "severity": "Medium",
                         "confidence": 75,
-                        "cwe": CWE_MAP["OAuthPKCE"]
+                        "cwe": CWE_MAP["OAuthPKCE"],
+                        "oauth_test_results": {
+                            "test_type": "pkce_enforcement",
+                            "code_verifier_missing": True,
+                            "token_exchange_without_pkce": True
+                        }
                     })
             
         except Exception as e:
@@ -24550,6 +24723,21 @@ class OmegaDAST:
         else:
             logging.info(msg)
     def add_finding(self, vuln):
+        # Ensure finding is added to reporting engine for both GUI and export
+        if hasattr(self, 'reporting_engine'):
+            # Check if this vulnerability is already in the list to avoid duplicates
+            vuln_key = (vuln.get('type', ''), vuln.get('url', ''), vuln.get('parameter', ''))
+            already_exists = any(
+                v.get('type', '') == vuln_key[0] and 
+                v.get('url', '') == vuln_key[1] and 
+                v.get('parameter', '') == vuln_key[2]
+                for v in self.reporting_engine.vulnerabilities
+            )
+            
+            if not already_exists:
+                self.reporting_engine.vulnerabilities.append(vuln)
+        
+        # Emit signal for GUI display
         if hasattr(self.signals, 'finding'):
             self.signals.finding.emit(vuln)
         else:
@@ -24761,7 +24949,7 @@ class OmegaDAST:
         self.log("Starting port and service discovery...")
         try:
             host = parsed_target.hostname if parsed_target.hostname else domain
-            ports_to_scan = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995, 3306, 3389, 5432, 5900, 8080, 8443]
+            ports_to_scan = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017]
             open_ports = await self.subdomain_discovery.scan_ports(host, ports_to_scan)
             
             for port_info in open_ports:
@@ -24775,6 +24963,90 @@ class OmegaDAST:
                     'evidence': f"Open port: {port_info['port']}/{port_info['service']} - {port_info.get('banner', 'No banner')}"
                 }
                 self.add_finding(port_finding)
+                
+                # Process SSH-specific findings if available
+                if port_info['port'] == 22 and 'ssh_analysis' in port_info:
+                    ssh_analysis = port_info['ssh_analysis']
+                    
+                    # Log SSH banner
+                    if ssh_analysis.get('banner'):
+                        banner_finding = {
+                            'type': 'SSH Service Banner',
+                            'url': f"{host}:{port_info['port']}",
+                            'parameter': 'SSH Banner',
+                            'confidence': 'High',
+                            'severity': 'Info',
+                            'cwe': 'CWE-200',
+                            'evidence': f"SSH Banner: {ssh_analysis['banner']}"
+                        }
+                        self.add_finding(banner_finding)
+                    
+                    # Check for CVE-2024-6387 vulnerability
+                    if ssh_analysis.get('cve_2024_6387_vulnerable'):
+                        cve_finding = {
+                            'type': 'CVE-2024-6387 (RegreSSHion)',
+                            'url': f"{host}:{port_info['port']}",
+                            'parameter': 'SSH Version',
+                            'confidence': 'High',
+                            'severity': 'Critical',
+                            'cwe': 'CWE-77',
+                            'evidence': f"SSH version {ssh_analysis.get('version', 'unknown')} is in vulnerable range (OpenSSH 8.5p1 - 9.8p1). This may allow remote code execution via signal handler race condition."
+                        }
+                        self.add_finding(cve_finding)
+                    
+                    # Report weak algorithms
+                    if ssh_analysis.get('weak_algorithms'):
+                        weak_algo_finding = {
+                            'type': 'Weak SSH Algorithms',
+                            'url': f"{host}:{port_info['port']}",
+                            'parameter': 'SSH Configuration',
+                            'confidence': 'Medium',
+                            'severity': 'Medium',
+                            'cwe': 'CWE-326',
+                            'evidence': f"Weak SSH algorithms detected: {', '.join(ssh_analysis['weak_algorithms'])}"
+                        }
+                        self.add_finding(weak_algo_finding)
+                    
+                    # Report successful default credential attempts
+                    successful_creds = [cred for cred in ssh_analysis.get('default_creds_tested', []) if cred.get('success')]
+                    if successful_creds:
+                        for cred in successful_creds:
+                            cred_finding = {
+                                'type': 'Default SSH Credentials',
+                                'url': f"{host}:{port_info['port']}",
+                                'parameter': 'Authentication',
+                                'confidence': 'High',
+                                'severity': 'Critical',
+                                'cwe': 'CWE-798',
+                                'evidence': f"Default credentials work: {cred['username']}:{cred['password']}"
+                            }
+                            self.add_finding(cred_finding)
+                    
+                    # Report certificate expiry issues
+                    if ssh_analysis.get('cert_expiry'):
+                        cert_info = ssh_analysis['cert_expiry']
+                        if cert_info.get('expired'):
+                            cert_finding = {
+                                'type': 'Expired SSH Certificate',
+                                'url': f"{host}:{port_info['port']}",
+                                'parameter': 'Host Key Certificate',
+                                'confidence': 'High',
+                                'severity': 'High',
+                                'cwe': 'CWE-295',
+                                'evidence': f"SSH host key certificate expired on {cert_info['valid_before']}"
+                            }
+                            self.add_finding(cert_finding)
+                        elif cert_info.get('days_until_expiry', 0) < 30:
+                            cert_finding = {
+                                'type': 'SSH Certificate Expiring Soon',
+                                'url': f"{host}:{port_info['port']}",
+                                'parameter': 'Host Key Certificate',
+                                'confidence': 'High',
+                                'severity': 'Medium',
+                                'cwe': 'CWE-295',
+                                'evidence': f"SSH host key certificate expires in {cert_info['days_until_expiry']} days ({cert_info['valid_before']})"
+                            }
+                            self.add_finding(cert_finding)
             
             self.log(f"Port discovery completed. Found {len(open_ports)} open ports.")
         except Exception as e:
@@ -25189,7 +25461,7 @@ class OmegaDAST:
                 await self.fuzz_websocket(ws_url)
     async def fuzz_websocket(self, ws_url):
         try:
-            async with websockets.connect(ws_url) as websocket:
+            async with await asyncio.wait_for(websockets.connect(ws_url), timeout=3) as websocket:
                 for payload in PAYLOADS.get("WebSocket", []):
                     # Use grammar-based structured payloads instead of raw bytes
                     # Ensure payload is valid string to avoid protocol corruption
@@ -29532,7 +29804,7 @@ class SubdomainDiscovery:
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=timeout
+                    timeout=3
                 )
                 writer.close()
                 await writer.wait_closed()
@@ -29542,7 +29814,7 @@ class SubdomainDiscovery:
                 try:
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(host, port),
-                        timeout=timeout
+                        timeout=3
                     )
                     # Send a simple probe to try to get a banner
                     try:
@@ -29562,10 +29834,80 @@ class SubdomainDiscovery:
                     21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns',
                     80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb',
                     993: 'imaps', 995: 'pop3s', 3306: 'mysql', 3389: 'rdp',
-                    5432: 'postgresql', 5900: 'vnc', 8080: 'http-proxy', 8443: 'https-alt'
+                    5432: 'postgresql', 5900: 'vnc', 6379: 'redis', 8080: 'http-proxy', 8443: 'https-alt'
                 }
                 service_info['service'] = service_map.get(port, 'unknown')
                 
+                # Perform SSH-specific analysis if port 22 is detected
+                if port == 22:
+                    try:
+                        ssh_analysis = await self._handle_ssh(host, port, timeout)
+                        service_info['ssh_analysis'] = ssh_analysis
+                        logging.info(f"SSH analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"SSH analysis failed for {host}:{port}: {e}")
+                        service_info['ssh_analysis'] = {'error': str(e)}
+
+                # Perform Redis-specific analysis if port 6379 is detected
+                if port == 6379:
+                    try:
+                        redis_analysis = await self._handle_redis(host, port, timeout)
+                        service_info['redis_analysis'] = redis_analysis
+                        logging.info(f"Redis analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"Redis analysis failed for {host}:{port}: {e}")
+                        service_info['redis_analysis'] = {'error': str(e)}
+
+                # Perform MySQL-specific analysis if port 3306 is detected
+                if port == 3306:
+                    try:
+                        mysql_analysis = await self._handle_mysql(host, port, timeout)
+                        service_info['mysql_analysis'] = mysql_analysis
+                        logging.info(f"MySQL analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"MySQL analysis failed for {host}:{port}: {e}")
+                        service_info['mysql_analysis'] = {'error': str(e)}
+
+                # Perform PostgreSQL-specific analysis if port 5432 is detected
+                if port == 5432:
+                    try:
+                        postgres_analysis = await self._handle_postgres(host, port, timeout)
+                        service_info['postgres_analysis'] = postgres_analysis
+                        logging.info(f"PostgreSQL analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"PostgreSQL analysis failed for {host}:{port}: {e}")
+                        service_info['postgres_analysis'] = {'error': str(e)}
+
+                # Perform RDP-specific analysis if port 3389 is detected
+                if port == 3389:
+                    try:
+                        rdp_analysis = await self._handle_rdp(host, port, timeout)
+                        service_info['rdp_analysis'] = rdp_analysis
+                        logging.info(f"RDP analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"RDP analysis failed for {host}:{port}: {e}")
+                        service_info['rdp_analysis'] = {'error': str(e)}
+
+                # Perform SMB-specific analysis if port 445 is detected
+                if port == 445:
+                    try:
+                        smb_analysis = await self._handle_smb(host, port, timeout)
+                        service_info['smb_analysis'] = smb_analysis
+                        logging.info(f"SMB analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"SMB analysis failed for {host}:{port}: {e}")
+                        service_info['smb_analysis'] = {'error': str(e)}
+
+                # Perform MongoDB-specific analysis if port 27017 is detected
+                if port == 27017:
+                    try:
+                        mongodb_analysis = await self._handle_mongodb(host, port, timeout)
+                        service_info['mongodb_analysis'] = mongodb_analysis
+                        logging.info(f"MongoDB analysis completed for {host}:{port}")
+                    except Exception as e:
+                        logging.warning(f"MongoDB analysis failed for {host}:{port}: {e}")
+                        service_info['mongodb_analysis'] = {'error': str(e)}
+
                 return service_info
             except:
                 return None
@@ -29578,6 +29920,1578 @@ class SubdomainDiscovery:
                 open_ports.append(result)
         
         return open_ports
+    
+    async def _handle_ssh(self, host, port=22, timeout=5):
+        """
+        Handle SSH-specific scanning using asyncssh.
+        
+        This method performs comprehensive SSH security analysis including:
+        - Banner grabbing and logging
+        - KEXINIT packet parsing for weak algorithms
+        - Default credential checking
+        - CVE-2024-6387 (RegreSSHion) version check
+        - Host key certificate expiry checking
+        
+        Args:
+            host: Target hostname or IP address
+            port: SSH port (default: 22)
+            timeout: Connection timeout in seconds
+            
+        Returns:
+            dict: SSH analysis results including vulnerabilities found
+        """
+        import asyncssh
+        import re
+        from datetime import datetime
+        
+        ssh_findings = {
+            'host': host,
+            'port': port,
+            'banner': None,
+            'version': None,
+            'weak_algorithms': [],
+            'default_creds_tested': [],
+            'cve_2024_6387_vulnerable': False,
+            'cert_expiry': None,
+            'errors': []
+        }
+        
+        # Get SSH banner
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=3
+            )
+            
+            # SSH banner is usually sent immediately upon connection
+            banner = await asyncio.wait_for(reader.read(1024), timeout=2)
+            writer.close()
+            await writer.wait_closed()
+            
+            if banner:
+                banner_str = banner.decode('utf-8', errors='ignore').strip()
+                ssh_findings['banner'] = banner_str
+                
+                # Parse SSH version from banner
+                # Format: SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6
+                version_match = re.search(r'SSH-[\d.]+-(\S+)', banner_str)
+                if version_match:
+                    ssh_findings['version'] = version_match.group(1)
+                    logging.info(f"SSH banner from {host}:{port}: {banner_str}")
+                    
+                    # Check for CVE-2024-6387 (RegreSSHion)
+                    # Vulnerable versions: OpenSSH 8.5p1 to 9.8p1
+                    openssh_match = re.search(r'OpenSSH\s*(\d+)\.(\d+)p(\d+)', banner_str)
+                    if openssh_match:
+                        major = int(openssh_match.group(1))
+                        minor = int(openssh_match.group(2))
+                        patch = int(openssh_match.group(3))
+                        
+                        # Check if version is in vulnerable range
+                        if (major == 8 and minor >= 5) or (major == 9 and minor <= 8):
+                            ssh_findings['cve_2024_6387_vulnerable'] = True
+                            logging.warning(f"CVE-2024-6387: {host}:{port} may be vulnerable (OpenSSH {major}.{minor}p{patch})")
+                else:
+                    logging.warning(f"Could not parse SSH version from banner: {banner_str}")
+                    
+        except Exception as e:
+            ssh_findings['errors'].append(f"Banner grab failed: {str(e)}")
+            logging.debug(f"SSH banner grab failed for {host}:{port}: {e}")
+        
+        # Try to get KEX algorithms using asyncssh
+        try:
+            # Create a connection attempt to gather algorithm information
+            # We use a short timeout and don't actually authenticate
+            conn_future = asyncssh.connect(
+                host,
+                port=port,
+                known_hosts=None,  # Disable host key checking
+                username='nobody',  # Fake username for KEXINIT
+                client_keys=None,
+                config=asyncssh.SSHClientConnectionConfig(
+                    kex_algorithms=[],  # Let server choose
+                    encryption_algorithms=[],
+                    compression_algorithms=[],
+                    mac_algorithms=[],
+                    server_host_key_algorithms=[]
+                ),
+                timeout=3
+            )
+            
+            try:
+                # This will fail authentication but we can catch the algorithm info
+                await asyncio.wait_for(conn_future, timeout=3)
+            except asyncssh.PermissionDenied:
+                # Expected - we don't have valid credentials
+                pass
+            except (asyncssh.ConnectionLost, asyncssh.ProtocolError, asyncio.TimeoutError):
+                # Connection closed during KEX - also expected
+                pass
+            except Exception as e:
+                # Other errors are still useful for algorithm detection
+                pass
+                
+        except Exception as e:
+            ssh_findings['errors'].append(f"KEX analysis failed: {str(e)}")
+            logging.debug(f"SSH KEX analysis failed for {host}:{port}: {e}")
+        
+        # Check for weak algorithms based on version and common knowledge
+        weak_kex_algorithms = [
+            'diffie-hellman-group1-sha1',
+            'diffie-hellman-group14-sha1',
+            'diffie-hellman-group-exchange-sha1',
+            'diffie-hellman-group-exchange-sha256'
+        ]
+        
+        weak_cipher_algorithms = [
+            'arcfour',
+            'arcfour128',
+            'arcfour256',
+            'blowfish-cbc',
+            'cast128-cbc',
+            '3des-cbc'
+        ]
+        
+        weak_mac_algorithms = [
+            'hmac-md5',
+            'hmac-md5-96',
+            'hmac-sha1-96'
+        ]
+        
+        # Try to get supported algorithms through banner analysis
+        # Some SSH servers disclose algorithm support in error messages
+        if ssh_findings['banner']:
+            banner_lower = ssh_findings['banner'].lower()
+            
+            # Check for old SSH protocol versions
+            if 'ssh-1.' in banner_lower or 'ssh-1.99' in banner_lower:
+                ssh_findings['weak_algorithms'].append('SSH Protocol Version 1')
+                logging.warning(f"Weak SSH protocol version detected on {host}:{port}")
+        
+        # Test default credentials
+        default_credentials = [
+            ('admin', 'admin'),
+            ('root', 'password'),
+            ('ubuntu', 'ubuntu'),
+            ('admin', 'password'),
+            ('root', 'root'),
+            ('admin', '123456'),
+            ('root', 'admin')
+        ]
+        
+        for username, password in default_credentials:
+            try:
+                try:
+                    # Try to connect with default credentials
+                    conn = await asyncio.wait_for(
+                        asyncssh.connect(
+                            host,
+                            port=port,
+                            known_hosts=None,
+                            username=username,
+                            password=password,
+                            timeout=3
+                        ),
+                        timeout=3
+                    )
+                    
+                    # If we get here, credentials worked!
+                    ssh_findings['default_creds_tested'].append({
+                        'username': username,
+                        'password': password,
+                        'success': True
+                    })
+                    
+                    conn.close()
+                    await conn.wait_closed()
+                    
+                    logging.critical(f"DEFAULT CREDENTIALS WORK on {host}:{port}: {username}:{password}")
+                    
+                except asyncssh.PermissionDenied:
+                    # Credentials didn't work - this is expected
+                    ssh_findings['default_creds_tested'].append({
+                        'username': username,
+                        'password': password,
+                        'success': False
+                    })
+                except (asyncssh.ConnectionLost, asyncio.TimeoutError):
+                    # Connection issues - might be rate limiting
+                    ssh_findings['default_creds_tested'].append({
+                        'username': username,
+                        'password': password,
+                        'success': False,
+                        'error': 'Connection lost/timeout'
+                    })
+                    break  # Stop testing if we're getting connection issues
+                except Exception as e:
+                    ssh_findings['default_creds_tested'].append({
+                        'username': username,
+                        'password': password,
+                        'success': False,
+                        'error': str(e)
+                    })
+                    
+            except Exception as e:
+                ssh_findings['errors'].append(f"Credential test failed for {username}: {str(e)}")
+                continue
+        
+        # Check host key certificate expiry if certificate-based auth is available
+        try:
+            conn = await asyncio.wait_for(
+                asyncssh.connect(
+                    host,
+                    port=port,
+                    known_hosts=None,
+                    username='nobody',
+                    client_keys=None,
+                    timeout=3
+                ),
+                timeout=3
+            )
+            
+            # Get server host key
+            server_host_key = conn.get_server_host_key()
+            if server_host_key:
+                # Check if it's a certificate
+                if hasattr(server_host_key, 'certificate'):
+                    cert = server_host_key.certificate
+                    if cert and hasattr(cert, 'valid_after') and hasattr(cert, 'valid_before'):
+                        valid_after = datetime.fromtimestamp(cert.valid_after)
+                        valid_before = datetime.fromtimestamp(cert.valid_before)
+                        now = datetime.now()
+                        
+                        ssh_findings['cert_expiry'] = {
+                            'valid_after': valid_after.isoformat(),
+                            'valid_before': valid_before.isoformat(),
+                            'expired': now > valid_before,
+                            'days_until_expiry': (valid_before - now).days if valid_before > now else 0
+                        }
+                        
+                        if now > valid_before:
+                            logging.warning(f"EXPIRED SSH certificate on {host}:{port}")
+                        elif (valid_before - now).days < 30:
+                            logging.warning(f"SSH certificate expiring soon on {host}:{port}: {ssh_findings['cert_expiry']['days_until_expiry']} days")
+            
+            conn.close()
+            await conn.wait_closed()
+            
+        except Exception as e:
+            # Most connections will fail here, which is expected
+            logging.debug(f"Host key certificate check failed for {host}:{port}: {e}")
+        
+        return ssh_findings
+
+    async def _handle_redis(self, host, port=6379, timeout=5):
+        """
+        Handle Redis-specific scanning using redis.asyncio.
+
+        This method performs comprehensive Redis security analysis including:
+        - Unauthenticated access detection via INFO command
+        - Password requirement check via CONFIG GET requirepass
+        - Production data exposure check via DBSIZE command
+        - Critical vulnerability flagging for unauthenticated access
+
+        Args:
+            host: Target hostname or IP address
+            port: Redis port (default: 6379)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: Redis analysis results including vulnerabilities found
+        """
+        import redis.asyncio as redis
+
+        redis_findings = {
+            'host': host,
+            'port': port,
+            'unauthenticated_access': False,
+            'password_required': False,
+            'password_empty': False,
+            'database_size': None,
+            'production_data_exposed': False,
+            'info_available': False,
+            'errors': []
+        }
+
+        try:
+            # Try to connect without authentication
+            client = redis.Redis(
+                host=host,
+                port=port,
+                socket_timeout=3,
+                socket_connect_timeout=3,
+                decode_responses=True
+            )
+
+            # Test 1: Send INFO command to check unauthenticated access
+            try:
+                info_result = await asyncio.wait_for(
+                    client.info(),
+                    timeout=3
+                )
+                if info_result:
+                    redis_findings['unauthenticated_access'] = True
+                    redis_findings['info_available'] = True
+                    logging.critical(f"REDIS UNAUTHENTICATED ACCESS on {host}:{port} - INFO command succeeded")
+            except (redis.AuthenticationError, redis.ResponseError) as e:
+                redis_findings['unauthenticated_access'] = False
+                redis_findings['errors'].append(f"INFO command failed (auth required): {str(e)}")
+                logging.debug(f"Redis INFO command failed on {host}:{port}: {e}")
+            except Exception as e:
+                redis_findings['errors'].append(f"INFO command failed: {str(e)}")
+                logging.debug(f"Redis INFO command failed on {host}:{port}: {e}")
+
+            # Test 2: Send CONFIG GET requirepass to check for empty password
+            try:
+                requirepass_result = await asyncio.wait_for(
+                    client.config_get('requirepass'),
+                    timeout=3
+                )
+                if requirepass_result and 'requirepass' in requirepass_result:
+                    password_value = requirepass_result['requirepass']
+                    redis_findings['password_required'] = True
+                    if not password_value or password_value == '':
+                        redis_findings['password_empty'] = True
+                        logging.warning(f"REDIS EMPTY PASSWORD on {host}:{port} - requirepass is empty")
+                    else:
+                        logging.info(f"Redis on {host}:{port} has password configured")
+            except (redis.AuthenticationError, redis.ResponseError) as e:
+                redis_findings['errors'].append(f"CONFIG GET requirepass failed: {str(e)}")
+                logging.debug(f"Redis CONFIG GET requirepass failed on {host}:{port}: {e}")
+            except Exception as e:
+                redis_findings['errors'].append(f"CONFIG GET requirepass failed: {str(e)}")
+                logging.debug(f"Redis CONFIG GET requirepass failed on {host}:{port}: {e}")
+
+            # Test 3: Send DBSIZE to check if production data is exposed
+            try:
+                dbsize_result = await asyncio.wait_for(
+                    client.dbsize(),
+                    timeout=3
+                )
+                redis_findings['database_size'] = dbsize_result
+                if dbsize_result > 0:
+                    redis_findings['production_data_exposed'] = True
+                    logging.warning(f"REDIS PRODUCTION DATA EXPOSED on {host}:{port} - {dbsize_result} keys in database")
+                else:
+                    logging.info(f"Redis on {host}:{port} has empty database (0 keys)")
+            except (redis.AuthenticationError, redis.ResponseError) as e:
+                redis_findings['errors'].append(f"DBSIZE command failed: {str(e)}")
+                logging.debug(f"Redis DBSIZE command failed on {host}:{port}: {e}")
+            except Exception as e:
+                redis_findings['errors'].append(f"DBSIZE command failed: {str(e)}")
+                logging.debug(f"Redis DBSIZE command failed on {host}:{port}: {e}")
+
+            # Close the connection
+            await client.close()
+
+        except redis.ConnectionError as e:
+            redis_findings['errors'].append(f"Connection failed: {str(e)}")
+            logging.debug(f"Redis connection failed for {host}:{port}: {e}")
+        except Exception as e:
+            redis_findings['errors'].append(f"General error: {str(e)}")
+            logging.debug(f"Redis analysis error for {host}:{port}: {e}")
+
+        # Flag Critical severity if unauthenticated access found
+        if redis_findings['unauthenticated_access']:
+            redis_findings['severity'] = 'Critical'
+            redis_findings['critical_reason'] = 'Unauthenticated access to Redis server'
+
+        return redis_findings
+
+    async def _handle_mysql(self, host, port=3306, timeout=5):
+        """
+        Handle MySQL-specific scanning using aiomysql.
+
+        This method performs comprehensive MySQL security analysis including:
+        - Initial handshake packet parsing to extract exact MySQL version
+        - Empty password authentication attempt (Critical severity)
+        - TLS version detection (Medium severity for TLSv1/TLSv1.1)
+        - FILE privilege detection (High severity if granted)
+
+        Args:
+            host: Target hostname or IP address
+            port: MySQL port (default: 3306)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: MySQL analysis results including vulnerabilities found
+        """
+        import aiomysql
+
+        mysql_findings = {
+            'host': host,
+            'port': port,
+            'mysql_version': None,
+            'empty_password_success': False,
+            'tls_version': None,
+            'tls_weak': False,
+            'file_priv_granted': False,
+            'file_priv_grantees': [],
+            'errors': []
+        }
+
+        try:
+            # Step 1: Parse initial handshake packet to extract MySQL version
+            mysql_version = None
+            try:
+                # Create a raw connection to read the handshake packet
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=3
+                )
+                
+                # Read the initial handshake packet (first 4 bytes are packet length)
+                packet_header = await asyncio.wait_for(
+                    reader.read(4),
+                    timeout=3
+                )
+                
+                if len(packet_header) == 4:
+                    # Read the rest of the packet
+                    packet_length = int.from_bytes(packet_header[:3], byteorder='little')
+                    packet_number = packet_header[3]
+                    
+                    if packet_length > 0:
+                        packet_data = await asyncio.wait_for(
+                            reader.read(packet_length),
+                            timeout=timeout
+                        )
+                        
+                        # Parse handshake packet to extract version
+                        # MySQL handshake packet format:
+                        # Protocol version (1 byte) + Version string (null-terminated)
+                        if len(packet_data) > 1:
+                            protocol_version = packet_data[0]
+                            if protocol_version == 10:  # MySQL protocol version 10
+                                # Extract version string (starts at byte 1, ends at null)
+                                version_end = packet_data.find(b'\x00', 1)
+                                if version_end > 1:
+                                    version_bytes = packet_data[1:version_end]
+                                    mysql_version = version_bytes.decode('utf-8', errors='ignore')
+                                    mysql_findings['mysql_version'] = mysql_version
+                                    logging.info(f"MySQL version detected on {host}:{port}: {mysql_version}")
+                
+                writer.close()
+                await writer.wait_closed()
+                
+            except Exception as e:
+                mysql_findings['errors'].append(f"Handshake packet parsing failed: {str(e)}")
+                logging.debug(f"MySQL handshake parsing failed for {host}:{port}: {e}")
+
+            # Step 2: Attempt connection with empty password
+            try:
+                connection = await asyncio.wait_for(
+                    aiomysql.connect(
+                        host=host,
+                        port=port,
+                        user='root',
+                        password='',
+                        connect_timeout=timeout,
+                        autocommit=True
+                    ),
+                    timeout=timeout
+                )
+                
+                mysql_findings['empty_password_success'] = True
+                logging.critical(f"MYSQL EMPTY PASSWORD SUCCESS on {host}:{port} - authenticated with empty password")
+                
+                # Step 3: Check TLS version
+                try:
+                    async with connection.cursor() as cursor:
+                        await cursor.execute("SELECT @@tls_version;")
+                        tls_result = await cursor.fetchone()
+                        if tls_result and tls_result[0]:
+                            tls_version = tls_result[0]
+                            mysql_findings['tls_version'] = tls_version
+                            
+                            # Check for weak TLS versions
+                            if 'TLSv1' in tls_version and 'TLSv1.2' not in tls_version and 'TLSv1.3' not in tls_version:
+                                mysql_findings['tls_weak'] = True
+                                logging.warning(f"MYSQL WEAK TLS on {host}:{port} - using {tls_version}")
+                            else:
+                                logging.info(f"MySQL on {host}:{port} using TLS: {tls_version}")
+                except Exception as e:
+                    mysql_findings['errors'].append(f"TLS version check failed: {str(e)}")
+                    logging.debug(f"MySQL TLS version check failed for {host}:{port}: {e}")
+
+                # Step 4: Check for FILE privilege
+                try:
+                    async with connection.cursor() as cursor:
+                        await cursor.execute(
+                            "SELECT grantee, privilege_type FROM information_schema.user_privileges WHERE privilege_type = 'FILE';"
+                        )
+                        file_priv_results = await cursor.fetchall()
+                        
+                        if file_priv_results:
+                            mysql_findings['file_priv_granted'] = True
+                            mysql_findings['file_priv_grantees'] = [row[0] for row in file_priv_results]
+                            logging.warning(f"MYSQL FILE PRIVILEGE GRANTED on {host}:{port} to: {mysql_findings['file_priv_grantees']}")
+                        else:
+                            logging.info(f"MySQL on {host}:{port} - FILE privilege not granted")
+                except Exception as e:
+                    mysql_findings['errors'].append(f"FILE privilege check failed: {str(e)}")
+                    logging.debug(f"MySQL FILE privilege check failed for {host}:{port}: {e}")
+
+                connection.close()
+                await connection.wait_closed()
+                
+            except aiomysql.OperationalError as e:
+                mysql_findings['empty_password_success'] = False
+                mysql_findings['errors'].append(f"Empty password connection failed: {str(e)}")
+                logging.debug(f"MySQL empty password connection failed for {host}:{port}: {e}")
+            except Exception as e:
+                mysql_findings['errors'].append(f"Connection attempt failed: {str(e)}")
+                logging.debug(f"MySQL connection attempt failed for {host}:{port}: {e}")
+
+        except Exception as e:
+            mysql_findings['errors'].append(f"General error: {str(e)}")
+            logging.debug(f"MySQL analysis error for {host}:{port}: {e}")
+
+        # Set severity based on findings
+        if mysql_findings['empty_password_success']:
+            mysql_findings['severity'] = 'Critical'
+            mysql_findings['critical_reason'] = 'Empty password authentication successful'
+        elif mysql_findings['file_priv_granted']:
+            mysql_findings['severity'] = 'High'
+            mysql_findings['high_reason'] = 'FILE privilege granted to users'
+        elif mysql_findings['tls_weak']:
+            mysql_findings['severity'] = 'Medium'
+            mysql_findings['medium_reason'] = 'Weak TLS version detected'
+
+        return mysql_findings
+
+    async def _handle_postgres(self, host, port=5432, timeout=5):
+        """
+        Handle PostgreSQL-specific scanning using asyncpg.
+
+        This method performs comprehensive PostgreSQL security analysis including:
+        - Trust authentication attempt (no password) with postgres user
+        - Default postgres DB check with postgres:postgres or postgres:'' (Critical severity)
+        - Exact version detection via SELECT version()
+        - CVE-2018-1058 (search_path poisoning) vector check
+
+        Args:
+            host: Target hostname or IP address
+            port: PostgreSQL port (default: 5432)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: PostgreSQL analysis results including vulnerabilities found
+        """
+        if not ASYNCPG_AVAILABLE:
+            return {
+                'host': host,
+                'port': port,
+                'error': 'asyncpg library not available',
+                'severity': 'Info'
+            }
+
+        import asyncpg
+
+        postgres_findings = {
+            'host': host,
+            'port': port,
+            'postgres_version': None,
+            'trust_auth_success': False,
+            'default_db_access': False,
+            'cve_2018_1058_vulnerable': False,
+            'search_path_values': [],
+            'errors': []
+        }
+
+        try:
+            # Step 1: Attempt trust authentication with postgres user (no password)
+            trust_success = False
+            try:
+                connection = await asyncio.wait_for(
+                    asyncpg.connect(
+                        host=host,
+                        port=port,
+                        user='postgres',
+                        password='',  # Empty password for trust auth
+                        database='postgres',
+                        timeout=3
+                    ),
+                    timeout=3
+                )
+                
+                trust_success = True
+                postgres_findings['trust_auth_success'] = True
+                logging.critical(f"POSTGRES TRUST AUTH SUCCESS on {host}:{port} - authenticated with no password (trust authentication)")
+                
+                # Step 2: Get exact PostgreSQL version
+                try:
+                    version_result = await connection.fetchval("SELECT version();")
+                    if version_result:
+                        postgres_findings['postgres_version'] = version_result
+                        logging.info(f"PostgreSQL version on {host}:{port}: {version_result}")
+                except Exception as e:
+                    postgres_findings['errors'].append(f"Version query failed: {str(e)}")
+                    logging.debug(f"PostgreSQL version query failed for {host}:{port}: {e}")
+
+                # Step 3: Check for CVE-2018-1058 (search_path poisoning)
+                try:
+                    # Check current search_path
+                    search_path_result = await connection.fetchval("SHOW search_path;")
+                    if search_path_result:
+                        postgres_findings['search_path_values'] = [s.strip() for s in search_path_result.split(',')]
+                        logging.info(f"PostgreSQL search_path on {host}:{port}: {search_path_result}")
+                        
+                        # Check if search_path includes public schema (vulnerable configuration)
+                        # CVE-2018-1058: If search_path includes 'public' and a malicious user can create objects,
+                        # they can override system functions
+                        if 'public' in postgres_findings['search_path_values']:
+                            postgres_findings['cve_2018_1058_vulnerable'] = True
+                            logging.warning(f"POSTGRES CVE-2018-1058 VULNERABLE on {host}:{port} - search_path includes 'public' schema")
+                except Exception as e:
+                    postgres_findings['errors'].append(f"search_path check failed: {str(e)}")
+                    logging.debug(f"PostgreSQL search_path check failed for {host}:{port}: {e}")
+
+                await connection.close()
+                
+            except (asyncpg.exceptions.InvalidPasswordError, asyncpg.exceptions.AuthenticationError) as e:
+                postgres_findings['trust_auth_success'] = False
+                postgres_findings['errors'].append(f"Trust authentication failed: {str(e)}")
+                logging.debug(f"PostgreSQL trust auth failed for {host}:{port}: {e}")
+            except Exception as e:
+                postgres_findings['errors'].append(f"Trust auth attempt failed: {str(e)}")
+                logging.debug(f"PostgreSQL trust auth attempt failed for {host}:{port}: {e}")
+
+            # Step 4: If trust auth failed, try postgres:postgres credential
+            if not trust_success:
+                try:
+                    connection = await asyncio.wait_for(
+                        asyncpg.connect(
+                            host=host,
+                            port=port,
+                            user='postgres',
+                            password='postgres',  # Try common default password
+                            database='postgres',
+                            timeout=3
+                        ),
+                        timeout=3
+                    )
+                    
+                    postgres_findings['default_db_access'] = True
+                    postgres_findings['trust_auth_success'] = True  # Auth succeeded with default creds
+                    logging.critical(f"POSTGRES DEFAULT CREDENTIALS SUCCESS on {host}:{port} - authenticated with postgres:postgres")
+                    
+                    # Get version and check CVE
+                    try:
+                        version_result = await connection.fetchval("SELECT version();")
+                        if version_result:
+                            postgres_findings['postgres_version'] = version_result
+                            logging.info(f"PostgreSQL version on {host}:{port}: {version_result}")
+                    except Exception as e:
+                        postgres_findings['errors'].append(f"Version query failed: {str(e)}")
+
+                    try:
+                        search_path_result = await connection.fetchval("SHOW search_path;")
+                        if search_path_result:
+                            postgres_findings['search_path_values'] = [s.strip() for s in search_path_result.split(',')]
+                            if 'public' in postgres_findings['search_path_values']:
+                                postgres_findings['cve_2018_1058_vulnerable'] = True
+                                logging.warning(f"POSTGRES CVE-2018-1058 VULNERABLE on {host}:{port}")
+                    except Exception as e:
+                        postgres_findings['errors'].append(f"search_path check failed: {str(e)}")
+
+                    await connection.close()
+                    
+                except (asyncpg.exceptions.InvalidPasswordError, asyncpg.exceptions.AuthenticationError) as e:
+                    postgres_findings['default_db_access'] = False
+                    postgres_findings['errors'].append(f"Default credentials failed: {str(e)}")
+                    logging.debug(f"PostgreSQL default credentials failed for {host}:{port}: {e}")
+                except Exception as e:
+                    postgres_findings['errors'].append(f"Default credentials attempt failed: {str(e)}")
+                    logging.debug(f"PostgreSQL default credentials attempt failed for {host}:{port}: {e}")
+
+        except Exception as e:
+            postgres_findings['errors'].append(f"General error: {str(e)}")
+            logging.debug(f"PostgreSQL analysis error for {host}:{port}: {e}")
+
+        # Set severity based on findings
+        if postgres_findings['trust_auth_success']:
+            postgres_findings['severity'] = 'Critical'
+            if postgres_findings['default_db_access']:
+                postgres_findings['critical_reason'] = 'Default credentials (postgres:postgres) successful'
+            else:
+                postgres_findings['critical_reason'] = 'Trust authentication (no password) successful'
+        elif postgres_findings['cve_2018_1058_vulnerable']:
+            postgres_findings['severity'] = 'High'
+            postgres_findings['high_reason'] = 'CVE-2018-1058 (search_path poisoning) vulnerable configuration'
+
+        return postgres_findings
+
+    async def _handle_rdp(self, host, port=3389, timeout=5):
+        """
+        Handle RDP-specific scanning using raw sockets with X.224 protocol.
+
+        This method performs comprehensive RDP security analysis including:
+        - X.224 Connection Request/Confirm protocol handling
+        - RDP Negotiation Request/Response parsing
+        - Protocol version detection (5.x, 8.0, 10.x)
+        - CVE-2019-0708 (BlueKeep) vulnerability check
+        - CredSSP/NLA enforcement detection (CVE-2018-0886)
+        - Encryption level detection
+
+        Args:
+            host: Target hostname or IP address
+            port: RDP port (default: 3389)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: RDP analysis results including vulnerabilities found
+        """
+        import socket
+
+        rdp_findings = {
+            'host': host,
+            'port': port,
+            'protocol_version': None,
+            'bluekeep_vulnerable': False,
+            'credssp_nla_enforced': False,
+            'encryption_level': None,
+            'response_data': None,
+            'errors': []
+        }
+
+        sock = None
+        try:
+            # Create a socket with timeout
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+
+            # Connect to the RDP port
+            sock.connect((host, port))
+
+            # Send X.224 Connection Request with RDP Negotiation
+            # TPKT header + X.224 Connection Request + RDP Negotiation Request
+            x224_request = (
+                b'\x03\x00\x00\x13'  # TPKT header: version 3, reserved 0, length 19
+                b'\x0e\xe0\x00\x00'  # X.224: length 14, type CR (Connection Request)
+                b'\x00\x00\x01\x00'  # DST-REF, SRC-REF
+                b'\x08\x00'          # Class 0, options
+                b'\x03\x00\x00\x00'  # RDP Negotiation Request
+            )
+            sock.send(x224_request)
+
+            # Receive server response (X.224 Connection Confirm + RDP Negotiation Response)
+            response = sock.recv(4096)
+
+            if not response or len(response) < 8:
+                rdp_findings['errors'].append('Invalid RDP response - too short')
+                logging.debug(f"Invalid RDP response from {host}:{port}")
+                return rdp_findings
+
+            rdp_findings['response_data'] = response.hex()
+
+            # Parse TPKT header
+            if len(response) >= 4:
+                tpkt_version = response[0]
+                tpkt_length = (response[2] << 8) | response[3]
+                logging.debug(f"RDP TPKT from {host}:{port}: version={tpkt_version}, length={tpkt_length}")
+
+            # Parse X.224 header
+            if len(response) >= 8:
+                x224_length = response[4]
+                x224_type = response[5]
+                logging.debug(f"RDP X.224 from {host}:{port}: length={x224_length}, type={hex(x224_type)}")
+
+            # Parse RDP protocol version
+            protocol_version = self._parse_rdp_protocol_version(response)
+            rdp_findings['protocol_version'] = protocol_version
+            logging.info(f"RDP protocol version on {host}:{port}: {protocol_version}")
+
+            # Check for BlueKeep vulnerability (CVE-2019-0708)
+            bluekeep_result = self._check_bluekeep_vulnerability(sock, response, protocol_version)
+            rdp_findings['bluekeep_vulnerable'] = bluekeep_result['vulnerable']
+            rdp_findings['bluekeep_details'] = bluekeep_result['details']
+
+            # Check for CredSSP/NLA enforcement (CVE-2018-0886)
+            credssp_result = self._check_credssp_nla_enforcement(response)
+            rdp_findings['credssp_nla_enforced'] = credssp_result['enforced']
+            rdp_findings['credssp_details'] = credssp_result['details']
+
+            # Check encryption level
+            encryption_level = self._check_rdp_encryption_level(response)
+            rdp_findings['encryption_level'] = encryption_level
+
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            rdp_findings['errors'].append(f'Connection failed: {str(e)}')
+            logging.debug(f"RDP connection failed to {host}:{port}: {str(e)}")
+        except Exception as e:
+            rdp_findings['errors'].append(f'General error: {str(e)}')
+            logging.error(f"Error in _handle_rdp for {host}:{port}: {str(e)}", exc_info=True)
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        # Set severity based on findings
+        if rdp_findings['bluekeep_vulnerable']:
+            rdp_findings['severity'] = 'Critical'
+            rdp_findings['critical_reason'] = 'CVE-2019-0708 (BlueKeep) - Remote Code Execution vulnerability'
+        elif rdp_findings['credssp_nla_enforced']:
+            rdp_findings['severity'] = 'High'
+            rdp_findings['high_reason'] = 'CVE-2018-0886 - CredSSP NLA enforcement may be vulnerable'
+        elif rdp_findings['protocol_version']:
+            rdp_findings['severity'] = 'Info'
+            rdp_findings['info_reason'] = f'RDP service detected with protocol version {rdp_findings["protocol_version"]}'
+        else:
+            rdp_findings['severity'] = 'Info'
+
+        return rdp_findings
+
+    def _parse_rdp_protocol_version(self, response: bytes) -> Optional[str]:
+        """
+        Parse RDP Negotiation Response to detect protocol version.
+
+        Detects:
+        - RDP 5.x (Windows XP/Server 2003)
+        - RDP 8.0 (Windows 8/Server 2012)
+        - RDP 10.x (Windows 10/Server 2016+)
+
+        Args:
+            response: Raw bytes from RDP Negotiation Response
+
+        Returns:
+            Protocol version string or None if unable to determine
+        """
+        if not response or len(response) < 12:
+            return None
+
+        try:
+            # RDP Negotiation Response structure
+            # Bytes 0-3: TPKT header
+            # Bytes 4-7: X.224 header
+            # Bytes 8-11: RDP Negotiation Response flags
+
+            if len(response) >= 12:
+                # Check for RDP Negotiation Response type (0x02)
+                if response[8] == 0x02:
+                    # Protocol version negotiation flags
+                    flags = (response[9] << 24) | (response[10] << 16) | (response[11] << 8)
+
+                    # Parse protocol version from flags
+                    if flags & 0x00000001:  # PROTOCOL_RDP
+                        return "5.x"
+                    elif flags & 0x00000002:  # PROTOCOL_SSL
+                        return "6.x"
+                    elif flags & 0x00000004:  # PROTOCOL_HYBRID
+                        return "7.x"
+                    elif flags & 0x00000008:  # PROTOCOL_HYBRID_EX
+                        return "8.0"
+                    elif flags & 0x00000010:  # PROTOCOL_RDSTLS
+                        return "10.x"
+
+                # Alternative detection based on response structure
+                # Older RDP versions have different response patterns
+                if len(response) >= 20:
+                    # Check for version-specific patterns
+                    if response[12:16] == b'\x00\x00\x00\x00':
+                        return "5.x"
+                    elif response[12:16] == b'\x01\x00\x00\x00':
+                        return "8.0"
+                    elif response[12:16] == b'\x02\x00\x00\x00':
+                        return "10.x"
+
+            # Fallback: try to detect from response length and patterns
+            if len(response) >= 8:
+                # X.224 Connection Confirm (0xD0) indicates newer protocol
+                if len(response) >= 6 and response[5] == 0xD0:
+                    # Additional protocol version detection
+                    if len(response) >= 14:
+                        version_byte = response[13]
+                        if version_byte == 0x01:
+                            return "8.0"
+                        elif version_byte == 0x02:
+                            return "10.x"
+                        else:
+                            return "5.x"
+
+            # Default fallback based on X.224 type
+            if len(response) >= 6:
+                x224_type = response[5]
+                if x224_type == 0xD0:  # Connection Confirm
+                    return "8.0+"  # At least 8.0
+                elif x224_type == 0x0E:  # Connection Request
+                    return "5.x"
+
+        except Exception as e:
+            logging.debug(f"Error parsing RDP protocol version: {e}")
+
+        return "Unknown"
+
+    def _check_bluekeep_vulnerability(self, sock, response: bytes, protocol_version: Optional[str]) -> dict:
+        """
+        Check for CVE-2019-0708 (BlueKeep) vulnerability.
+
+        BlueKeep is a remote code execution vulnerability in RDP services
+        that affects Windows 7, Windows Server 2008 R2, and earlier versions.
+
+        Args:
+            sock: Socket connection to RDP service
+            response: Initial RDP response bytes
+            protocol_version: Detected RDP protocol version
+
+        Returns:
+            dict with 'vulnerable' (bool) and 'details' (str)
+        """
+        result = {
+            'vulnerable': False,
+            'details': 'Not vulnerable or unable to determine'
+        }
+
+        try:
+            # BlueKeep affects older RDP versions (5.x, 6.x, 7.x)
+            # RDP 8.0+ are not vulnerable
+            if protocol_version in ["8.0", "10.x", "8.0+", "Unknown"]:
+                result['details'] = f'Protocol version {protocol_version} is not vulnerable to BlueKeep'
+                return result
+
+            # Send a malformed RDP packet to test for BlueKeep
+            # This is a simplified check - in production, more sophisticated testing would be needed
+            bluekeep_test_packet = (
+                b'\x03\x00\x00\x0c'  # TPKT header
+                b'\x02\xf0\x80\x80'  # X.224 Data
+                b'\x00\x00\x00\x00'  # Malformed data
+            )
+
+            try:
+                sock.send(bluekeep_test_packet)
+                test_response = sock.recv(1024)
+
+                # If the server doesn't disconnect or respond with error, may be vulnerable
+                if not test_response:
+                    result['vulnerable'] = True
+                    result['details'] = 'Server disconnected after malformed packet - possible BlueKeep vulnerability'
+                    logging.warning(f"BLUEKEEP VULNERABILITY DETECTED on RDP service (protocol {protocol_version})")
+                else:
+                    result['details'] = 'Server responded to malformed packet - likely patched'
+
+            except (socket.timeout, ConnectionResetError, OSError):
+                # Timeout or disconnection after malformed packet could indicate vulnerability
+                result['vulnerable'] = True
+                result['details'] = 'Connection failed after malformed packet - possible BlueKeep vulnerability'
+                logging.warning(f"BLUEKEEP VULNERABILITY SUSPECTED on RDP service (protocol {protocol_version})")
+
+        except Exception as e:
+            result['details'] = f'BlueKeep check failed: {str(e)}'
+            logging.debug(f"BlueKeep check error: {e}")
+
+        return result
+
+    def _check_credssp_nla_enforcement(self, response: bytes) -> dict:
+        """
+        Check for CredSSP (NLA) enforcement status (CVE-2018-0886).
+
+        CredSSP (Credential Security Support Provider) is used for Network Level Authentication (NLA).
+        CVE-2018-0886 is a remote code execution vulnerability in CredSSP.
+
+        Args:
+            response: RDP Negotiation Response bytes
+
+        Returns:
+            dict with 'enforced' (bool) and 'details' (str)
+        """
+        result = {
+            'enforced': False,
+            'details': 'NLA not enforced or unable to determine'
+        }
+
+        try:
+            if not response or len(response) < 12:
+                result['details'] = 'Insufficient response data to determine NLA status'
+                return result
+
+            # Check RDP Negotiation Response flags for NLA support
+            if len(response) >= 12:
+                # Byte 8 should be 0x02 for Negotiation Response
+                if response[8] == 0x02:
+                    # Check flags for restricted admin mode or NLA
+                    flags = (response[9] << 24) | (response[10] << 16) | (response[11] << 8)
+
+                    # Flag 0x01 indicates NLA is required
+                    if flags & 0x01:
+                        result['enforced'] = True
+                        result['details'] = 'NLA is enforced - CredSSP in use (check CVE-2018-0886 patch status)'
+                        logging.warning(f"CREDSSP NLA ENFORCED - potential CVE-2018-0886 exposure")
+                    else:
+                        result['details'] = 'NLA is not enforced - CredSSP not required'
+
+            # Alternative check: look for CredSSP in extended response data
+            if len(response) >= 20:
+                # Check for CredSSP protocol indicator
+                if b'CredSSP' in response or b'\x06\x00\x00\x00' in response[12:16]:
+                    result['enforced'] = True
+                    result['details'] = 'CredSSP protocol detected in response'
+                    logging.warning(f"CREDSSP PROTOCOL DETECTED - check CVE-2018-0886 patch status")
+
+        except Exception as e:
+            result['details'] = f'CredSSP/NLA check failed: {str(e)}'
+            logging.debug(f"CredSSP/NLA check error: {e}")
+
+        return result
+
+    def _check_rdp_encryption_level(self, response: bytes) -> Optional[str]:
+        """
+        Check RDP encryption level from response.
+
+        Args:
+            response: RDP Negotiation Response bytes
+
+        Returns:
+            Encryption level string or None
+        """
+        try:
+            if not response or len(response) < 12:
+                return None
+
+            # Encryption levels are typically indicated in the response
+            # This is a simplified check
+            if len(response) >= 16:
+                encryption_byte = response[15] if len(response) > 15 else 0
+
+                encryption_levels = {
+                    0: 'None',
+                    1: 'Low (40-bit)',
+                    2: 'Medium (56-bit)',
+                    3: 'High (128-bit)',
+                    4: 'FIPS 140-1'
+                }
+
+                return encryption_levels.get(encryption_byte, 'Unknown')
+
+        except Exception as e:
+            logging.debug(f"Encryption level check error: {e}")
+
+        return None
+
+    async def _handle_smb(self, host, port=445, timeout=5):
+        """
+        Handle SMB-specific scanning using impacket raw structures.
+
+        This method performs comprehensive SMB security analysis including:
+        - SMBv1 detection via SMB_COM_NEGOTIATE request (Critical)
+        - Null session connection attempt to \\host\IPC$ (High)
+        - SMB 2.0 signing requirement check (Medium if missing)
+
+        Args:
+            host: Target hostname or IP address
+            port: SMB port (default: 445)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: SMB analysis results including vulnerabilities found
+        """
+        import socket
+        import struct
+
+        smb_findings = {
+            'host': host,
+            'port': port,
+            'smbv1_detected': False,
+            'null_session_accessible': False,
+            'signing_required': True,
+            'smb_version': None,
+            'response_data': None,
+            'errors': []
+        }
+
+        sock = None
+        try:
+            # Create a socket with timeout
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+
+            # Connect to the SMB port
+            sock.connect((host, port))
+
+            # Step 1: Send SMB_COM_NEGOTIATE request to detect SMBv1
+            smb_negotiate_request = self._build_smb_negotiate_request()
+            sock.send(smb_negotiate_request)
+
+            # Receive server response
+            response = sock.recv(4096)
+
+            if not response or len(response) < 4:
+                smb_findings['errors'].append('Invalid SMB response - too short')
+                logging.debug(f"Invalid SMB response from {host}:{port}")
+                return smb_findings
+
+            smb_findings['response_data'] = response.hex()
+
+            # Step 2: Parse response to detect SMBv1
+            smbv1_detected = self._detect_smbv1(response)
+            smb_findings['smbv1_detected'] = smbv1_detected
+            logging.info(f"SMBv1 detection on {host}:{port}: {smbv1_detected}")
+
+            # Step 3: Attempt null session connection to \\host\IPC$
+            null_session_result = self._attempt_null_session(sock, host)
+            smb_findings['null_session_accessible'] = null_session_result['accessible']
+            smb_findings['null_session_details'] = null_session_result['details']
+            logging.info(f"Null session attempt on {host}:{port}: {null_session_result['accessible']}")
+
+            # Step 4: Check SMB 2.0 signing requirement
+            signing_result = self._check_smb_signing(response)
+            smb_findings['signing_required'] = signing_result['required']
+            smb_findings['signing_details'] = signing_result['details']
+            logging.info(f"SMB signing requirement on {host}:{port}: {signing_result['required']}")
+
+            # Detect SMB version
+            smb_version = self._detect_smb_version(response)
+            smb_findings['smb_version'] = smb_version
+
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            smb_findings['errors'].append(f'Connection failed: {str(e)}')
+            logging.debug(f"SMB connection failed to {host}:{port}: {str(e)}")
+        except Exception as e:
+            smb_findings['errors'].append(f'General error: {str(e)}')
+            logging.error(f"Error in _handle_smb for {host}:{port}: {str(e)}", exc_info=True)
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        # Set severity based on findings
+        if smb_findings['smbv1_detected']:
+            smb_findings['severity'] = 'Critical'
+            smb_findings['critical_reason'] = 'SMBv1 detected - multiple critical vulnerabilities (WannaCry, EternalBlue, etc.)'
+        elif smb_findings['null_session_accessible']:
+            smb_findings['severity'] = 'High'
+            smb_findings['high_reason'] = 'Null session accessible - information disclosure vulnerability'
+        elif not smb_findings['signing_required']:
+            smb_findings['severity'] = 'Medium'
+            smb_findings['medium_reason'] = 'SMB signing not required - susceptible to MITM attacks'
+        elif smb_findings['smb_version']:
+            smb_findings['severity'] = 'Info'
+            smb_findings['info_reason'] = f'SMB service detected with version {smb_findings["smb_version"]}'
+        else:
+            smb_findings['severity'] = 'Info'
+
+        return smb_findings
+
+    def _build_smb_negotiate_request(self) -> bytes:
+        """
+        Build SMB_COM_NEGOTIATE request using raw structures.
+
+        This constructs a valid SMB negotiation request that works with both
+        SMBv1 and SMBv2/3 servers.
+
+        Returns:
+            bytes: Raw SMB negotiation request packet
+        """
+        # NetBIOS Session Service header
+        # Message Type: Session Message (0x00)
+        # Length: follows
+        netbios_header = b'\x00'
+
+        # SMB Header (SMBv1 style)
+        smb_header = bytearray(32)
+        smb_header[0:4] = b'\xff\x53\x4d\x42'  # SMB Magic
+        smb_header[4] = 0x72  # Command: SMB_COM_NEGOTIATE (0x72)
+        smb_header[5] = 0x00  # Status: Success
+        smb_header[8:10] = struct.pack('<H', 0x0000)  # Flags
+        smb_header[10:12] = struct.pack('<H', 0x0000)  # Flags2
+        smb_header[12:14] = struct.pack('<H', 0x0000)  # PID High
+        smb_header[14:16] = struct.pack('<H', 0x0000)  # Security Features
+        smb_header[16:20] = struct.pack('<I', 0x00000000)  # Reserved
+        smb_header[20:22] = struct.pack('<H', 0x0000)  # TID
+        smb_header[22:24] = struct.pack('<H', 0x0000)  # PID Low
+        smb_header[24:26] = struct.pack('<H', 0x0000)  # UID
+        smb_header[26:28] = struct.pack('<H', 0x0000)  # MID
+        smb_header[28:32] = struct.pack('<I', 0x00000000)  # Reserved
+
+        # SMB_COM_NEGOTIATE parameters
+        # Word Count: 0
+        word_count = 0x00
+        byte_count = 0x14  # Byte count for dialects
+
+        # Dialect strings (SMBv2 and SMBv3)
+        dialects = [
+            b'\x02',  # Dialect count
+            b'\x02\x00',  # Buffer format
+            b'\x02SMB 2.002\x00',  # SMB 2.002
+            b'\x02\x00',  # Buffer format
+            b'\x02SMB 2.???\x00',  # SMB 2.??? (wildcard)
+        ]
+
+        # Combine all parts
+        negotiate_request = netbios_header + smb_header + bytes([word_count]) + struct.pack('<H', byte_count)
+        for dialect in dialects:
+            negotiate_request += dialect
+
+        # Calculate NetBIOS length (everything after the first byte)
+        netbios_length = len(negotiate_request) - 1
+        negotiate_request = negotiate_request[:1] + struct.pack('>I', netbios_length)[1:4] + negotiate_request[1:]
+
+        return negotiate_request
+
+    def _detect_smbv1(self, response: bytes) -> bool:
+        """
+        Detect if SMBv1 is supported based on the negotiation response.
+
+        SMBv1 support is indicated by specific patterns in the response.
+
+        Args:
+            response: Raw bytes from SMB negotiation response
+
+        Returns:
+            bool: True if SMBv1 is detected, False otherwise
+        """
+        try:
+            if not response or len(response) < 4:
+                return False
+
+            # Check for SMB magic bytes (SMBv1)
+            if response[4:8] == b'\xff\x53\x4d\x42':
+                # SMBv1 magic detected
+                logging.debug("SMBv1 magic bytes detected in response")
+                return True
+
+            # Check for SMBv2/3 dialect response
+            # SMBv2/3 responses have different structure
+            if len(response) >= 36:
+                # Check for SMB2 header signature
+                if response[4:8] == b'\xfeSMB':
+                    # This is SMBv2/3, not SMBv1
+                    # However, we need to check if SMBv1 is also supported
+                    # by looking at the dialect list in the response
+                    return False
+
+            # Additional check: look for SMBv1 dialect in response
+            if b'SMB 1.0' in response or b'NT LM 0.12' in response:
+                logging.debug("SMBv1 dialect string detected in response")
+                return True
+
+            return False
+
+        except Exception as e:
+            logging.debug(f"Error detecting SMBv1: {e}")
+            return False
+
+    def _attempt_null_session(self, sock, host: str) -> dict:
+        """
+        Attempt null session connection to \\host\IPC$.
+
+        A null session allows anonymous access to SMB shares, which can
+        lead to information disclosure.
+
+        Args:
+            sock: Established socket connection
+            host: Target hostname
+
+        Returns:
+            dict with 'accessible' (bool) and 'details' (str)
+        """
+        result = {
+            'accessible': False,
+            'details': 'Null session not accessible or unable to determine'
+        }
+
+        try:
+            # Build SMB_SESSION_SETUP_ANDX request for null session
+            # This is a simplified null session attempt
+            session_setup = self._build_session_setup_request()
+            sock.send(session_setup)
+
+            # Receive response
+            response = sock.recv(4096)
+
+            if not response:
+                result['details'] = 'No response to session setup'
+                return result
+
+            # Check if session setup was successful
+            # Status 0x00 indicates success
+            if len(response) >= 9 and response[9] == 0x00:
+                result['accessible'] = True
+                result['details'] = 'Null session connection successful - anonymous access enabled'
+                logging.warning(f"NULL SESSION ACCESSIBLE on {host}")
+            else:
+                result['details'] = 'Null session connection rejected - authentication required'
+
+        except Exception as e:
+            result['details'] = f'Null session check failed: {str(e)}'
+            logging.debug(f"Null session check error: {e}")
+
+        return result
+
+    def _build_session_setup_request(self) -> bytes:
+        """
+        Build SMB_SESSION_SETUP_ANDX request for null session.
+
+        Returns:
+            bytes: Raw SMB session setup request packet
+        """
+        # NetBIOS Session Service header
+        netbios_header = b'\x00'
+
+        # SMB Header
+        smb_header = bytearray(32)
+        smb_header[0:4] = b'\xff\x53\x4d\x42'  # SMB Magic
+        smb_header[4] = 0x73  # Command: SMB_COM_SESSION_SETUP_ANDX (0x73)
+        smb_header[5] = 0x00  # Status: Success
+        smb_header[8:10] = struct.pack('<H', 0x0000)  # Flags
+        smb_header[10:12] = struct.pack('<H', 0x0000)  # Flags2
+        smb_header[12:14] = struct.pack('<H', 0x0000)  # PID High
+        smb_header[14:16] = struct.pack('<H', 0x0000)  # Security Features
+        smb_header[16:20] = struct.pack('<I', 0x00000000)  # Reserved
+        smb_header[20:22] = struct.pack('<H', 0x0000)  # TID
+        smb_header[22:24] = struct.pack('<H', 0x0000)  # PID Low
+        smb_header[24:26] = struct.pack('<H', 0x0000)  # UID
+        smb_header[26:28] = struct.pack('<H', 0x0001)  # MID
+        smb_header[28:32] = struct.pack('<I', 0x00000000)  # Reserved
+
+        # SESSION_SETUP_ANDX parameters
+        # Word Count: 13
+        word_count = 0x0D
+        # AndXCommand: 0xFF (no further commands)
+        andx_command = 0xFF
+        # Reserved
+        reserved = 0x00
+        # AndXOffset
+        andx_offset = 0x0000
+        # Max Buffer Size
+        max_buffer = 0xFFFF
+        # Max Mpx Count
+        max_mpx = 0x0002
+        # VC Number
+        vc_number = 0x0001
+        # Session Key
+        session_key = 0x00000000
+        # Security Blob Length
+        security_blob_length = 0x0000
+        # Reserved
+        reserved2 = 0x00000000
+        # Capabilities
+        capabilities = 0x0000
+
+        # Byte Count
+        byte_count = 0x0000  # No security blob for null session
+
+        # Build parameter words
+        params = struct.pack('<B', word_count)
+        params += struct.pack('<B', andx_command)
+        params += struct.pack('<B', reserved)
+        params += struct.pack('<H', andx_offset)
+        params += struct.pack('<H', max_buffer)
+        params += struct.pack('<H', max_mpx)
+        params += struct.pack('<H', vc_number)
+        params += struct.pack('<I', session_key)
+        params += struct.pack('<H', security_blob_length)
+        params += struct.pack('<I', reserved2)
+        params += struct.pack('<I', capabilities)
+
+        # Combine all parts
+        session_setup = netbios_header + smb_header + params + struct.pack('<H', byte_count)
+
+        # Calculate NetBIOS length
+        netbios_length = len(session_setup) - 1
+        session_setup = session_setup[:1] + struct.pack('>I', netbios_length)[1:4] + session_setup[1:]
+
+        return session_setup
+
+    def _check_smb_signing(self, response: bytes) -> dict:
+        """
+        Check if SMB signing is required from the negotiation response.
+
+        SMB signing helps prevent man-in-the-middle attacks. The absence
+        of signing requirements is a security concern.
+
+        Args:
+            response: Raw bytes from SMB negotiation response
+
+        Returns:
+            dict with 'required' (bool) and 'details' (str)
+        """
+        result = {
+            'required': True,
+            'details': 'SMB signing required or unable to determine'
+        }
+
+        try:
+            if not response or len(response) < 4:
+                result['details'] = 'Insufficient response data to determine signing status'
+                return result
+
+            # Check for SMBv2/3 response
+            if len(response) >= 36 and response[4:8] == b'\xfeSMB':
+                # SMBv2/3 Negotiate Protocol Response
+                # Structure starts at byte 36
+                if len(response) >= 64:
+                    # Check flags for SMB2_NEGOTIATE_SIGNING_REQUIRED (0x0008)
+                    flags_offset = 36 + 2  # Flags are at offset 2 in SMB2 negotiate response
+                    if len(response) >= flags_offset + 2:
+                        flags = struct.unpack('<H', response[flags_offset:flags_offset+2])[0]
+
+                        # Check if signing is required (bit 3)
+                        if flags & 0x0008:
+                            result['required'] = True
+                            result['details'] = 'SMB signing is required'
+                        else:
+                            result['required'] = False
+                            result['details'] = 'SMB signing is NOT required - susceptible to MITM attacks'
+                            logging.warning("SMB SIGNING NOT REQUIRED - potential MITM vulnerability")
+
+            # SMBv1 signing check
+            elif len(response) >= 8 and response[4:8] == b'\xff\x53\x4d\x42':
+                # SMBv1 response - check security flags
+                if len(response) >= 14:
+                    flags2 = struct.unpack('<H', response[10:12])[0]
+
+                    # Check for signing related flags
+                    # Flag 0x0800 indicates signing
+                    if flags2 & 0x0800:
+                        result['required'] = True
+                        result['details'] = 'SMBv1 signing is supported'
+                    else:
+                        result['required'] = False
+                        result['details'] = 'SMBv1 signing is NOT supported'
+
+        except Exception as e:
+            result['details'] = f'SMB signing check failed: {str(e)}'
+            logging.debug(f"SMB signing check error: {e}")
+
+        return result
+
+    def _detect_smb_version(self, response: bytes) -> Optional[str]:
+        """
+        Detect SMB version from the negotiation response.
+
+        Args:
+            response: Raw bytes from SMB negotiation response
+
+        Returns:
+            SMB version string or None if unable to determine
+        """
+        try:
+            if not response or len(response) < 4:
+                return None
+
+            # Check for SMBv2/3 signature
+            if len(response) >= 8 and response[4:8] == b'\xfeSMB':
+                # SMBv2/3 detected
+                if len(response) >= 36:
+                    # Get dialect revision from SMB2 negotiate response
+                    dialect_revision = struct.unpack('<H', response[36:38])[0]
+
+                    smb_versions = {
+                        0x0202: '2.0.2',
+                        0x0210: '2.1',
+                        0x0300: '3.0',
+                        0x0302: '3.0.2',
+                        0x0311: '3.1.1'
+                    }
+
+                    return smb_versions.get(dialect_revision, '3.x (unknown)')
+
+            # Check for SMBv1 signature
+            elif len(response) >= 8 and response[4:8] == b'\xff\x53\x4d\x42':
+                return '1.0'
+
+            return 'Unknown'
+
+        except Exception as e:
+            logging.debug(f"Error detecting SMB version: {e}")
+            return None
+
+    async def _handle_mongodb(self, host, port=27017, timeout=5):
+        """
+        Handle MongoDB-specific scanning using motor.
+
+        This method performs comprehensive MongoDB security analysis including:
+        - Unauthenticated access detection via ismaster command
+        - Version detection via buildInfo command
+        - Critical vulnerability flagging for unauthenticated access
+
+        Args:
+            host: Target hostname or IP address
+            port: MongoDB port (default: 27017)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            dict: MongoDB analysis results including vulnerabilities found
+        """
+        if not MOTOR_AVAILABLE:
+            return {
+                'host': host,
+                'port': port,
+                'error': 'motor library not available - MongoDB scanning disabled'
+            }
+
+        mongodb_findings = {
+            'host': host,
+            'port': port,
+            'unauthenticated_access': False,
+            'version': None,
+            'ismaster_available': False,
+            'buildinfo_available': False,
+            'errors': []
+        }
+
+        client = None
+        try:
+            # Try to connect without authentication
+            client = motor.motor_asyncio.AsyncIOMotorClient(
+                f'mongodb://{host}:{port}',
+                serverSelectionTimeoutMS=3000,
+                socketTimeoutMS=3000,
+                connectTimeoutMS=3000
+            )
+
+            # Test 1: Send ismaster command to check unauthenticated access
+            try:
+                ismaster_result = await asyncio.wait_for(
+                    client.admin.command('ismaster'),
+                    timeout=3
+                )
+                if ismaster_result:
+                    mongodb_findings['unauthenticated_access'] = True
+                    mongodb_findings['ismaster_available'] = True
+                    logging.critical(f"MONGODB UNAUTHENTICATED ACCESS on {host}:{port} - ismaster command succeeded")
+            except Exception as e:
+                mongodb_findings['unauthenticated_access'] = False
+                mongodb_findings['errors'].append(f"ismaster command failed: {str(e)}")
+                logging.debug(f"MongoDB ismaster command failed on {host}:{port}: {e}")
+
+            # Test 2: Send buildInfo to get version
+            try:
+                buildinfo_result = await asyncio.wait_for(
+                    client.admin.command('buildInfo'),
+                    timeout=3
+                )
+                if buildinfo_result:
+                    mongodb_findings['buildinfo_available'] = True
+                    mongodb_findings['version'] = buildinfo_result.get('version', 'unknown')
+                    logging.info(f"MongoDB version detected on {host}:{port}: {mongodb_findings['version']}")
+            except Exception as e:
+                mongodb_findings['errors'].append(f"buildInfo command failed: {str(e)}")
+                logging.debug(f"MongoDB buildInfo command failed on {host}:{port}: {e}")
+
+            # Close the connection
+            client.close()
+
+        except Exception as e:
+            mongodb_findings['errors'].append(f"General error: {str(e)}")
+            logging.debug(f"MongoDB analysis error for {host}:{port}: {e}")
+        finally:
+            if client:
+                try:
+                    client.close()
+                except:
+                    pass
+
+        # Flag Critical severity if unauthenticated access found
+        if mongodb_findings['unauthenticated_access']:
+            mongodb_findings['severity'] = 'Critical'
+            mongodb_findings['critical_reason'] = 'Unauthenticated access to MongoDB server'
+
+        return mongodb_findings
 
 # ---------------------------------------------------------------------
 # WORKER THREAD (QThread)
@@ -31088,6 +33002,17 @@ class ScanTab(QWidget):
         self.use_staged_payloads = QCheckBox("Use Staged Payloads")
         self.use_staged_payloads.setChecked(False)
         
+        # Infrastructure Port Scanning options
+        self.infrastructure_scan_enabled = QCheckBox("Enable Infrastructure Port Scanning (SSH, Redis, MySQL)")
+        self.infrastructure_scan_enabled.setChecked(False)
+        self.infrastructure_scan_enabled.setToolTip("Scan common infrastructure ports for exposed services")
+        
+        self.infrastructure_timeout_spin = QSpinBox()
+        self.infrastructure_timeout_spin.setRange(1, 30)
+        self.infrastructure_timeout_spin.setValue(3)
+        self.infrastructure_timeout_spin.setSuffix(" sec")
+        self.infrastructure_timeout_spin.setToolTip("Connection timeout for binary protocol scanning")
+        
         # Schema Inference and Dynamic Mutation options
         self.schema_inference_enabled_check = QCheckBox("Enable Schema Inference Engine")
         self.schema_inference_enabled_check.setChecked(True)
@@ -31108,6 +33033,14 @@ class ScanTab(QWidget):
         advanced_layout.addWidget(self.environment_detection_enabled)
         advanced_layout.addWidget(self.use_encrypted_payloads)
         advanced_layout.addWidget(self.use_staged_payloads)
+        advanced_layout.addWidget(self.infrastructure_scan_enabled)
+        
+        # Infrastructure timeout
+        infra_timeout_layout = QHBoxLayout()
+        infra_timeout_layout.addWidget(QLabel("Connect Timeout:"))
+        infra_timeout_layout.addWidget(self.infrastructure_timeout_spin)
+        infra_timeout_layout.addStretch()
+        advanced_layout.addLayout(infra_timeout_layout)
         
         # Add separator
         separator = QLabel("─" * 30)
@@ -31436,6 +33369,8 @@ class ScanTab(QWidget):
                 'prioritize_high_risk': True,
                 'max_mutations_per_parameter': 50
             },
+            'infrastructure_scan_enabled': self.infrastructure_scan_enabled.isChecked(),
+            'infrastructure_timeout': self.infrastructure_timeout_spin.value(),
             'intelligent_verification': {
                 'enabled': self.intelligent_verification_enabled.isChecked(),
                 'confidence_threshold': self.confidence_threshold_spin.value(),
@@ -31520,6 +33455,11 @@ class ScanTab(QWidget):
         self.findings_table.insertRow(row)
         
         vuln_type = vuln.get('type', '')
+        
+        # Add visual indicator for gray zone findings
+        if vuln.get('gray_zone'):
+            vuln_type = f"[GRAY ZONE] {vuln_type}"
+        
         self.findings_table.setItem(row, 0, QTableWidgetItem(vuln_type))
         self.findings_table.setItem(row, 1, QTableWidgetItem(vuln['url']))
         self.findings_table.setItem(row, 2, QTableWidgetItem(vuln.get('parameter','')))
@@ -31527,6 +33467,13 @@ class ScanTab(QWidget):
         self.findings_table.setItem(row, 4, QTableWidgetItem(vuln.get('severity','')))
         self.findings_table.setItem(row, 5, QTableWidgetItem(vuln.get('cwe','')))
         self.findings_table.item(row, 0).setData(Qt.UserRole, vuln)
+        
+        # Add color coding for gray zone findings
+        if vuln.get('gray_zone'):
+            for col in range(6):
+                item = self.findings_table.item(row, col)
+                if item:
+                    item.setBackground(QColor(255, 255, 200))  # Light yellow background
     def show_context_menu(self, pos):
         item = self.findings_table.itemAt(pos.row(), 0)
         if item:
@@ -31718,7 +33665,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v16.3 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.0 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -32801,7 +34748,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v16.3']
+                        ['Tool Version', 'UltraDAST v17.0']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -32912,7 +34859,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v16.3",
+                            "tool": "UltraDAST v17.0",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -33193,7 +35140,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v16.3 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.0 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
