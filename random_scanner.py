@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v17.3 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.4 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -494,9 +494,6 @@ RECURSION_LIMIT = 10000
 
 # Remote OS fingerprinting constants
 DEFAULT_TTL_ESTIMATE_LINUX = 64
-FAST_RESPONSE_THRESHOLD = 0.05  # seconds
-MODERATE_RESPONSE_THRESHOLD = 0.1  # seconds
-FAST_RESPONSE_CONFIDENCE = 0.4
 
 # Cache and storage constants
 DEFAULT_CACHE_MAX_SIZE = 1000
@@ -1420,8 +1417,7 @@ class DeepOSFingerprinter:
         http_data = {
             'server_header': None,
             'x_powered_by': None,
-            'via': None,
-            'ttl': None
+            'via': None
         }
         
         try:
@@ -1434,9 +1430,6 @@ class DeepOSFingerprinter:
                     http_data['x_powered_by'] = headers.get('X-Powered-By', '')
                     http_data['via'] = headers.get('Via', '')
                     
-                    # Estimate TTL from response timing
-                    http_data['ttl'] = self._estimate_ttl_from_timing(resp)
-                    
         except Exception as e:
             import traceback
             error_details = f"HTTP header analysis failed for {host}:{port}\n"
@@ -1447,95 +1440,7 @@ class DeepOSFingerprinter:
             logging.warning(error_details)
         
         return http_data
-    
-    def _estimate_ttl_from_timing(self, response):
-        """
-        Estimate TTL from HTTP response timing and headers.
-        Enhanced with multi-factor analysis for better OS fingerprinting.
-        """
-        # Get timing information
-        timing = getattr(response, 'total_time', 0)
-        
-        # Get additional timing metrics if available
-        if hasattr(response, 'elapsed'):
-            timing = response.elapsed.total_seconds()
-        
-        # Analyze response headers for OS clues
-        server_header = ''
-        x_powered_by = ''
-        via_header = ''
-        
-        if hasattr(response, 'headers'):
-            server_header = response.headers.get('Server', '').lower()
-            x_powered_by = response.headers.get('X-Powered-By', '').lower()
-            via_header = response.headers.get('Via', '').lower()
-        
-        # Base TTL estimation on timing
-        estimated_ttl = None
-        confidence = 0.0
-        
-        # Fast response times typically indicate local or same-network systems
-        if timing < FAST_RESPONSE_THRESHOLD:
-            # Very fast - likely local network or CDN
-            estimated_ttl = DEFAULT_TTL_ESTIMATE_LINUX  # Linux/macOS common in modern infrastructure
-            confidence = FAST_RESPONSE_CONFIDENCE
-        elif timing < MODERATE_RESPONSE_THRESHOLD:
-            # Fast - could be Linux/macOS
-            estimated_ttl = DEFAULT_TTL_ESTIMATE_LINUX
-            confidence = 0.5
-        elif timing < 0.2:
-            # Moderate - could be Windows
-            estimated_ttl = 128
-            confidence = 0.5
-        elif timing < 0.5:
-            # Slower - network devices or distant servers
-            estimated_ttl = 255
-            confidence = FAST_RESPONSE_CONFIDENCE
-        else:
-            # Very slow - network devices or distant
-            estimated_ttl = 255
-            confidence = 0.3
-        
-        # Adjust based on server header analysis
-        if 'windows' in server_header or 'win' in server_header or 'iis' in server_header:
-            estimated_ttl = 128
-            confidence += 0.3
-        elif 'linux' in server_header or 'unix' in server_header or 'apache' in server_header:
-            estimated_ttl = 64
-            confidence += 0.3
-        elif 'nginx' in server_header or 'cloudflare' in server_header:
-            estimated_ttl = 64  # Most CDNs use Linux
-            confidence += 0.2
-        elif 'f5' in server_header or 'big-ip' in server_header or 'netscaler' in server_header:
-            estimated_ttl = 255  # Network appliances
-            confidence += 0.3
-        
-        # Adjust based on X-Powered-By header
-        if 'asp' in x_powered_by or '.net' in x_powered_by:
-            estimated_ttl = 128
-            confidence += 0.2
-        elif 'php' in x_powered_by:
-            estimated_ttl = 64  # PHP typically runs on Linux
-            confidence += 0.2
-        
-        # Adjust based on Via header (proxy/CDN information)
-        if 'cloudflare' in via_header:
-            estimated_ttl = 64
-            confidence += 0.2
-        elif 'akamai' in via_header:
-            estimated_ttl = 64
-            confidence += 0.2
-        
-        # Cap confidence at 1.0
-        confidence = min(confidence, 1.0)
-        
-        # Return TTL with confidence metadata
-        # If confidence is too low, return None to indicate uncertainty
-        if confidence < 0.3:
-            return None
-        
-        return estimated_ttl
-    
+
     def _match_os_signatures(self, tcp_data):
         """Match TCP data against OS signature database"""
         matches = []
@@ -1600,6 +1505,7 @@ class CVETemplateEngine:
         self.template_directory = template_directory or os.path.join(os.path.dirname(__file__), 'cve_templates')
         self.templates = {}
         self.template_cache = {}
+        self.version_engine = None  # Will be set by VersionDetectionEngine
         self._ensure_template_directory()
         self._load_templates()
         
@@ -1731,6 +1637,54 @@ class CVETemplateEngine:
                     
         return True, None
         
+    def apply_template_to_vulnerability(self, vuln):
+        """
+        Apply template information to enhance vulnerability detection.
+        
+        Args:
+            vuln: Vulnerability dictionary
+            
+        Returns:
+            dict: Enhanced vulnerability dictionary
+        """
+        vuln_type = vuln.get('type', '').lower()
+        
+        # Search for matching templates based on vulnerability type
+        for template_id, template in self.templates.items():
+            template_type = template.get('type', '').lower()
+            
+            # Check if template matches vulnerability type
+            if template_type in vuln_type or vuln_type in template_type:
+                # Add template information to vulnerability
+                vuln['template_id'] = template_id
+                vuln['template_name'] = template.get('name', template_id)
+                
+                # Add additional template information
+                if 'description' in template and 'description' not in vuln:
+                    vuln['description'] = template['description']
+                
+                if 'severity' in template:
+                    vuln['template_severity'] = template['severity']
+                
+                if 'cvss_score' in template:
+                    vuln['template_cvss'] = template['cvss_score']
+                
+                if 'references' in template:
+                    vuln['references'] = template['references']
+                
+                # Add detection methods from template
+                if 'detection' in template:
+                    vuln['detection_methods'] = template['detection']
+                
+                # If template has request patterns, add them for testing
+                if 'requests' in template:
+                    vuln['template_requests'] = template['requests']
+                
+                logging.debug(f"Enhanced vulnerability {vuln_type} with template {template_id}")
+                break
+        
+        return vuln
+    
     def generate_detection_request(self, template_id, base_url, parameters=None):
         """
         Generate detection request parameters from a template.
@@ -1969,11 +1923,16 @@ class VersionDetectionEngine:
     Now integrated with CVETemplateEngine for extensible template-based detection.
     """
     
-    def __init__(self, template_directory=None):
+    def __init__(self, template_directory=None, cve_feed_integration=None):
         self.version_cache = {}
         self.software_signatures = self._build_software_signatures()
         self.cve_version_mappings = self._build_cve_version_mappings()
         self.template_engine = CVETemplateEngine(template_directory)
+        self.cve_feed_integration = cve_feed_integration
+        
+        # Link template engine back to version detection for cross-referencing
+        if self.template_engine:
+            self.template_engine.version_engine = self
         
     def _build_software_signatures(self):
         """
@@ -2430,6 +2389,21 @@ class VersionDetectionEngine:
                         'recommended_payloads': cve_data.get('recommended_payloads', [])
                     })
         
+        # Check external CVE feed integration for additional relevant CVEs
+        if self.cve_feed_integration:
+            external_cves = self.cve_feed_integration.check_software_cves(software_name, version)
+            for external_cve in external_cves:
+                # Avoid duplicates
+                if not any(cve['cve_id'] == external_cve['id'] for cve in cves):
+                    cves.append({
+                        'cve_id': external_cve['id'],
+                        'severity': external_cve.get('severity', 'UNKNOWN'),
+                        'cvss_score': external_cve.get('cvss', 0.0),
+                        'description': external_cve.get('description', ''),
+                        'source': external_cve.get('source', 'external'),
+                        'recommended_payloads': []  # External CVEs don't have recommended payloads
+                    })
+        
         return cves
     
     def _is_version_affected(self, version, affected_versions):
@@ -2547,7 +2521,7 @@ class CVEFeedIntegration:
     Fetches latest CVE data from NVD and other sources.
     """
     
-    def __init__(self):
+    def __init__(self, version_engine=None):
         self.cve_cache = {}
         self.last_update = None
         self.update_interval = 86400  # 24 hours
@@ -2556,8 +2530,8 @@ class CVEFeedIntegration:
         self.nvd_api_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         self.circl_api_url = "https://cve.circl.lu/api/cve/"
         
-        # Integration with version detection engine
-        self.version_engine = VersionDetectionEngine()
+        # Integration with version detection engine (optional, injected by scanner)
+        self.version_engine = version_engine
         
     async def update_cve_database(self, force=False):
         """
@@ -2720,6 +2694,34 @@ class CVEFeedIntegration:
                     recent.append(cve_data)
         
         return recent
+    
+    def check_software_cves(self, software_name, version=None):
+        """
+        Check for CVEs related to specific software and version.
+        
+        Args:
+            software_name: Name of the software (e.g., 'Apache', 'nginx', 'WordPress')
+            version: Optional version string for version-specific CVEs
+            
+        Returns:
+            list: List of relevant CVE data
+        """
+        relevant_cves = []
+        software_lower = software_name.lower()
+        
+        for cve_id, cve_data in self.cve_cache.items():
+            description = cve_data.get('description', '').lower()
+            
+            # Check if software name appears in CVE description
+            if software_lower in description:
+                # If version specified, check if version is mentioned
+                if version:
+                    if str(version) in description or version in cve_id:
+                        relevant_cves.append(cve_data)
+                else:
+                    relevant_cves.append(cve_data)
+        
+        return relevant_cves
 
 
 class BrowserAuthHelper:
@@ -3452,15 +3454,38 @@ class AdvancedProxyTab(QWidget):
         
         return tab
     
-    async def start_proxy(self):
-        """Start the proxy server"""
+    def start_proxy(self):
+        """Start the proxy server (synchronous wrapper for async proxy start)"""
         try:
-            self.proxy = InteractiveProxy()
-            await self.proxy.start_proxy()
+            import asyncio
+            import threading
             
-            self.start_proxy_btn.setEnabled(False)
-            self.stop_proxy_btn.setEnabled(True)
-            self.status_label.setText("Proxy running on 127.0.0.1:8080")
+            # Create async function to start proxy
+            async def _start_async_proxy():
+                try:
+                    self.proxy = InteractiveProxy()
+                    await self.proxy.start_proxy()
+                    
+                    # Update UI from main thread
+                    QMetaObject.invokeMethod(self, "_update_proxy_ui_started", 
+                                          Qt.QueuedConnection)
+                except Exception as e:
+                    import traceback
+                    error_details = f"Failed to start proxy on 127.0.0.1:8080\n\n"
+                    error_details += f"Exception Type: {type(e).__name__}\n"
+                    error_details += f"Error Message: {str(e)}\n"
+                    error_details += f"Timestamp: {datetime.now().isoformat()}\n\n"
+                    error_details += "Stack Trace:\n" + traceback.format_exc()
+                    QMetaObject.invokeMethod(self, "_show_proxy_error", 
+                                          Qt.QueuedConnection,
+                                          Q_ARG(str, error_details))
+            
+            # Run async function in background thread
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=lambda: loop.run_until_complete(_start_async_proxy()), 
+                           daemon=True).start()
+            
+            self.status_label.setText("Starting proxy...")
             
         except Exception as e:
             import traceback
@@ -3471,15 +3496,64 @@ class AdvancedProxyTab(QWidget):
             error_details += "Stack Trace:\n" + traceback.format_exc()
             QMessageBox.critical(self, "Proxy Error", error_details)
     
-    async def stop_proxy(self):
-        """Stop the proxy server"""
-        if self.proxy:
-            await self.proxy.stop()
-            self.proxy = None
+    def _update_proxy_ui_started(self):
+        """Update UI when proxy is started (called from async thread)"""
+        self.start_proxy_btn.setEnabled(False)
+        self.stop_proxy_btn.setEnabled(True)
+        self.status_label.setText("Proxy running on 127.0.0.1:8080")
+    
+    def _show_proxy_error(self, error_details):
+        """Show proxy error message (called from async thread)"""
+        QMessageBox.critical(self, "Proxy Error", error_details)
+    
+    def stop_proxy(self):
+        """Stop the proxy server (synchronous wrapper for async proxy stop)"""
+        try:
+            import asyncio
+            import threading
             
-            self.start_proxy_btn.setEnabled(True)
-            self.stop_proxy_btn.setEnabled(False)
-            self.status_label.setText("Proxy stopped")
+            # Create async function to stop proxy
+            async def _stop_async_proxy():
+                try:
+                    if self.proxy:
+                        await self.proxy.stop()
+                        self.proxy = None
+                    
+                    # Update UI from main thread
+                    QMetaObject.invokeMethod(self, "_update_proxy_ui_stopped", 
+                                          Qt.QueuedConnection)
+                except Exception as e:
+                    import traceback
+                    error_details = f"Failed to stop proxy\n\n"
+                    error_details += f"Exception Type: {type(e).__name__}\n"
+                    error_details += f"Error Message: {str(e)}\n"
+                    error_details += f"Timestamp: {datetime.now().isoformat()}\n\n"
+                    error_details += "Stack Trace:\n" + traceback.format_exc()
+                    QMetaObject.invokeMethod(self, "_show_proxy_error", 
+                                          Qt.QueuedConnection,
+                                          Q_ARG(str, error_details))
+            
+            # Run async function in background thread
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=lambda: loop.run_until_complete(_stop_async_proxy()), 
+                           daemon=True).start()
+            
+            self.status_label.setText("Stopping proxy...")
+            
+        except Exception as e:
+            import traceback
+            error_details = f"Failed to stop proxy\n\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error Message: {str(e)}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n\n"
+            error_details += "Stack Trace:\n" + traceback.format_exc()
+            QMessageBox.critical(self, "Proxy Error", error_details)
+    
+    def _update_proxy_ui_stopped(self):
+        """Update UI when proxy is stopped (called from async thread)"""
+        self.start_proxy_btn.setEnabled(True)
+        self.stop_proxy_btn.setEnabled(False)
+        self.status_label.setText("Proxy stopped")
     
     def toggle_intercept(self):
         """Toggle interception mode"""
@@ -21153,12 +21227,13 @@ class OOBManager:
 # REPORTING ENGINE
 # ---------------------------------------------------------------------
 class ReportingEngine:
-    def __init__(self, config, signals, session_manager=None):
+    def __init__(self, config, signals, session_manager=None, cve_template_engine=None):
         self.config = config
         self.signals = signals
         self.vulnerabilities = []
         self.fp_db = FP_Database(config=config)
         self.session_manager = session_manager
+        self.cve_template_engine = cve_template_engine
     def log(self, msg):
         if hasattr(self.signals, 'log'):
             self.signals.log.emit(msg)
@@ -21168,11 +21243,30 @@ class ReportingEngine:
         # Add to vulnerabilities list for export purposes
         self.vulnerabilities.append(vuln)
         
+        # Use CVE template engine if available to enhance vulnerability data
+        if self.cve_template_engine:
+            vuln = self._enhance_with_cve_templates(vuln)
+        
         # Emit signal for GUI display
         if hasattr(self.signals, 'finding'):
             self.signals.finding.emit(vuln)
         else:
             logging.info(f"Finding: {vuln}")
+    
+    def _enhance_with_cve_templates(self, vuln):
+        """
+        Enhance vulnerability data with information from CVE templates.
+        
+        Args:
+            vuln: Vulnerability dictionary
+            
+        Returns:
+            dict: Enhanced vulnerability dictionary
+        """
+        if self.cve_template_engine:
+            return self.cve_template_engine.apply_template_to_vulnerability(vuln)
+        return vuln
+    
     def update_progress(self, current, total):
         if hasattr(self.signals, 'progress'):
             self.signals.progress.emit(current, total)
@@ -21790,8 +21884,9 @@ class InjectionEngine:
         self.maturity_model = ReconnaissanceMaturityModel(maturity_level, dry_run)
         print(f"Safety Controls Initialized - Maturity Level: {maturity_level}, Dry Run: {dry_run}")
         
-        # Taint tracking integration
-        self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
+        # Taint tracking integration - DISABLED due to missing implementation
+        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
+        self.taint_tracking_enabled = False  # config.get('taint_tracking_enabled', True)
         self.taint_tracker = None
         self.taint_instrumentor = None
         
@@ -21985,12 +22080,11 @@ class InjectionEngine:
             logging.debug(f"Unexpected error during async fetch for {url}: {e}", exc_info=True)
             return None
     async def run_tests(self):
-        # Initialize taint tracking if enabled and available from scanner
-        if self.taint_tracking_enabled and hasattr(self.scanner, 'taint_tracker'):
-            self.taint_tracker = self.scanner.taint_tracker
-            if hasattr(self.scanner, 'taint_instrumentor'):
-                self.taint_instrumentor = self.scanner.taint_instrumentor
-            self.log("Taint tracking enabled for injection tests")
+        # Taint tracking disabled due to missing implementation
+        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
+        self.taint_tracking_enabled = False
+        self.taint_tracker = None
+        self.taint_instrumentor = None
         
         # Log dynamic payload system status
         if self.dynamic_payloads_enabled:
@@ -22066,6 +22160,18 @@ class InjectionEngine:
             os_info = await self.perform_remote_os_fingerprinting()
             if os_info:
                 self.log(f"Remote OS detected: {os_info} - use for targeted payload selection after RCE confirmation")
+
+        # Update CVE database from external feeds
+        if self.config.get('enable_cve_feed_integration', True):
+            self.log("Updating CVE database from external feeds...")
+            await self.cve_feed_integration.update_cve_database()
+            self.log("CVE database updated successfully")
+
+        # Start multiprocessing scanner if enabled
+        if self.config.get('enable_multiprocessing', False):
+            self.log("Starting multiprocessing scanner for parallel processing...")
+            self.multiprocessing_scanner.start_workers()
+            self.log(f"Multiprocessing scanner started with {self.multiprocessing_scanner.num_processes} processes")
     async def run_active_tests(self):
         param_count = len(self.crawler_engine.parameters)
         self.log(f"Active tests on {param_count} parameters")
@@ -22105,6 +22211,10 @@ class InjectionEngine:
         
         # Ensure all workflow automation results are aggregated
         await self._aggregate_workflow_automation_results()
+        
+        # Use multiprocessing scanner for parallel URL scanning if enabled
+        if self.config.get('enable_multiprocessing', False) and hasattr(self, 'multiprocessing_scanner'):
+            await self._run_multiprocessing_scans()
     
     async def _aggregate_workflow_automation_results(self):
         try:
@@ -22130,6 +22240,54 @@ class InjectionEngine:
             
         except Exception as e:
             logging.warning(f"Workflow automation aggregation error: {e}")
+    
+    async def _run_multiprocessing_scans(self):
+        """
+        Run parallel scans using the multiprocessing scanner.
+        Distributes URL scanning and payload testing across multiple processes.
+        """
+        try:
+            self.log("Running parallel scans with multiprocessing scanner...")
+            
+            # Prepare URL scanning tasks
+            url_tasks = []
+            for page in self.crawler_engine.crawled_pages:
+                url_tasks.append(('url_scan', {'url': page['url'], 'config': self.config}))
+            
+            # Add tasks to multiprocessing scanner
+            self.multiprocessing_scanner.add_tasks_batch(url_tasks)
+            
+            # Wait for results
+            import time
+            total_tasks = len(url_tasks)
+            completed = 0
+            
+            while completed < total_tasks:
+                results = self.multiprocessing_scanner.get_results(timeout=1.0)
+                for result in results:
+                    if result.get('success'):
+                        completed += 1
+                        self.log(f"Multiprocessing scan completed: {result.get('url')} (Status: {result.get('status')})")
+                    else:
+                        self.log(f"Multiprocessing scan failed: {result.get('url')} - {result.get('error')}")
+                
+                # Update progress
+                stats = self.multiprocessing_scanner.get_stats()
+                self.log(f"Multiprocessing progress: {stats.get('completed', 0)}/{total_tasks} completed, {stats.get('errors', 0)} errors")
+                
+                # Small delay to avoid busy waiting
+                await asyncio.sleep(0.1)
+            
+            # Get final statistics
+            final_stats = self.multiprocessing_scanner.get_stats()
+            self.log(f"Multiprocessing scan completed: {final_stats.get('completed', 0)} successful, {final_stats.get('errors', 0)} errors, {final_stats.get('vulnerabilities_found', 0)} vulnerabilities found")
+            
+        except Exception as e:
+            logging.warning(f"Multiprocessing scan error: {e}")
+        finally:
+            # Ensure multiprocessing scanner is properly shut down
+            if hasattr(self, 'multiprocessing_scanner'):
+                self.multiprocessing_scanner.shutdown()
     
     async def _populate_baselines(self):
         if not self.crawler_engine.parameters:
@@ -25373,6 +25531,10 @@ class InjectionEngine:
             await self._test_oauth_redirect_manipulation(oauth_url, session_manager, session_id)
             await self._test_oauth_pkce_flow(oauth_url, session_manager, session_id)
             
+            # Use BrowserAuthHelper for complex OAuth flows if available
+            if hasattr(self, 'browser_auth_helper') and self.config.get('enable_browser_oauth_auth', False):
+                await self._test_oauth_with_browser_auth(oauth_url)
+            
             # Interconnect with race condition tests on OAuth endpoints with FSM context
             fsm_context = self.business_logic_fsm if self.fsm_aware_testing_enabled else None
             await self._test_basic_race_condition(oauth_url, session_manager, session_id, fsm_context=fsm_context)
@@ -25899,6 +26061,96 @@ class InjectionEngine:
             
         except Exception as e:
             logging.warning(f"OAuth PKCE flow test error: {e}")
+    
+    async def _test_oauth_with_browser_auth(self, auth_url):
+        """
+        Test OAuth flows using BrowserAuthHelper for complex authentication scenarios.
+        
+        Args:
+            auth_url: OAuth authorization URL
+        """
+        try:
+            logging.info(f"[OAUTH BROWSER] Testing OAuth with browser automation at {auth_url}")
+            
+            # Get OAuth credentials from config if available
+            oauth_credentials = self.config.get('oauth_credentials', {})
+            
+            # Use BrowserAuthHelper to perform authentication
+            auth_result = await self.browser_auth_helper.authenticate_oauth(
+                auth_url=auth_url,
+                callback_url=None,  # Let browser handle callback
+                credentials=oauth_credentials if oauth_credentials else None
+            )
+            
+            if auth_result and auth_result.get('success'):
+                logging.info(f"[OAUTH BROWSER] Successfully authenticated via browser")
+                
+                # Extract authentication artifacts for analysis
+                cookies = auth_result.get('cookies', {})
+                tokens = auth_result.get('tokens', {})
+                final_url = auth_result.get('url', '')
+                
+                # Analyze authentication results for security issues
+                await self._analyze_browser_auth_results(auth_url, auth_result)
+            else:
+                logging.warning(f"[OAUTH BROWSER] Browser authentication failed: {auth_result.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            logging.warning(f"OAuth browser authentication test error: {e}")
+    
+    async def _analyze_browser_auth_results(self, auth_url, auth_result):
+        """
+        Analyze browser authentication results for security issues.
+        
+        Args:
+            auth_url: OAuth authorization URL
+            auth_result: Authentication result from BrowserAuthHelper
+        """
+        try:
+            # Check for insecure token exposure in URL
+            final_url = auth_result.get('url', '')
+            if 'access_token=' in final_url or 'id_token=' in final_url:
+                await self._add_vulnerability({
+                    "type": "OAuth Token Exposure in URL",
+                    "url": auth_url,
+                    "parameter": "access_token",
+                    "evidence": "Access tokens exposed in URL fragment after browser authentication",
+                    "severity": "High",
+                    "confidence": 90,
+                    "cwe": CWE_MAP["OAuthTokenExposure"],
+                    "oauth_test_results": {
+                        "test_type": "browser_auth_analysis",
+                        "token_in_url": True,
+                        "final_url": final_url
+                    }
+                })
+            
+            # Check for missing HTTP-only and Secure flags on cookies
+            cookies = auth_result.get('cookies', {})
+            for cookie_name, cookie_value in cookies.items():
+                # This is a simplified check - in real implementation would check cookie attributes
+                if 'session' in cookie_name.lower() or 'auth' in cookie_name.lower():
+                    logging.debug(f"[OAUTH BROWSER] Found authentication cookie: {cookie_name}")
+            
+            # Check for insecure redirect destinations
+            if 'http://' in final_url and 'localhost' not in final_url:
+                await self._add_vulnerability({
+                    "type": "OAuth Insecure Redirect",
+                    "url": auth_url,
+                    "parameter": "redirect_uri",
+                    "evidence": f"OAuth flow redirected to insecure HTTP endpoint: {final_url}",
+                    "severity": "Medium",
+                    "confidence": 75,
+                    "cwe": CWE_MAP["OAuthInsecureRedirect"],
+                    "oauth_test_results": {
+                        "test_type": "browser_auth_analysis",
+                        "insecure_redirect": True,
+                        "redirect_url": final_url
+                    }
+                })
+                
+        except Exception as e:
+            logging.warning(f"Browser auth results analysis error: {e}")
     
     async def complex_purchase_sequence_automation(self):
         self.log("Testing complex purchase sequence automation...")
@@ -26991,9 +27243,27 @@ class InjectionEngine:
             return None
     
     async def _fingerprint_via_tcp_analysis(self):
-        """Fingerprint OS via TCP/IP characteristics"""
+        """Fingerprint OS via TCP/IP characteristics using DeepOSFingerprinter"""
         try:
-            # TCP fingerprinting via connection analysis
+            # Extract hostname from target URL
+            from urllib.parse import urlparse
+            parsed = urlparse(self.target)
+            hostname = parsed.hostname or parsed.netloc.split(':')[0]
+            
+            # Use DeepOSFingerprinter for advanced TCP stack analysis
+            if not hasattr(self, 'deep_os_fingerprinter'):
+                self.deep_os_fingerprinter = DeepOSFingerprinter()
+            
+            # Perform deep OS fingerprinting
+            fingerprint_result = await self.deep_os_fingerprinter.fingerprint_host(hostname)
+            
+            if fingerprint_result and fingerprint_result.get('detected_os') != 'unknown':
+                detected_os = fingerprint_result['detected_os']
+                confidence = fingerprint_result.get('confidence', 0.0)
+                logging.info(f"DeepOSFingerprinter detected: {detected_os} (confidence: {confidence}%)")
+                return detected_os
+            
+            # Fallback to basic TCP fingerprinting via connection analysis
             url = f"{self.target}/"
             
             # Measure response timing patterns
@@ -27009,7 +27279,7 @@ class InjectionEngine:
             if not timings:
                 return None
             
-            # Analyze timing patterns - different OSes have different timing characteristics
+            # Fallback: Analyze timing patterns - different OSes have different timing characteristics
             avg_timing = sum(timings) / len(timings)
             timing_variance = sum((t - avg_timing) ** 2 for t in timings) / len(timings)
             
@@ -28257,8 +28527,15 @@ class OmegaDAST:
         )
         print("Creating SessionManager...")
         self.session_manager = SessionManager(config, self.loop, self.circuit_breaker, self.target)
+        
+        # Initialize CVE Template Engine for extensible template-based detection (before ReportingEngine)
+        print("Creating CVETemplateEngine...")
+        template_directory = config.get('cve_template_directory', os.path.join(os.path.dirname(__file__), 'cve_templates'))
+        self.cve_template_engine = CVETemplateEngine(template_directory)
+        print("CVETemplateEngine created successfully")
+        
         print("Creating ReportingEngine...")
-        self.reporting_engine = ReportingEngine(config, signals, self.session_manager)
+        self.reporting_engine = ReportingEngine(config, signals, self.session_manager, cve_template_engine=self.cve_template_engine)
         print("Creating OOBManager...")
         self.oob_manager = OOBManager(config, self.public_ip)
         print("Creating InjectionEngine...")
@@ -28267,10 +28544,29 @@ class OmegaDAST:
         )
         print("InjectionEngine created successfully")
         
+        # Initialize CVE Feed Integration for external CVE data
+        print("Creating CVEFeedIntegration...")
+        self.cve_feed_integration = CVEFeedIntegration()
+        print("CVEFeedIntegration created successfully")
+
         # Initialize Version Detection Engine for CVE-based vulnerability testing
         print("Creating VersionDetectionEngine...")
-        self.version_detection = VersionDetectionEngine()
+        self.version_detection = VersionDetectionEngine(cve_feed_integration=self.cve_feed_integration)
         print("VersionDetectionEngine created successfully")
+
+        # Link CVE feed integration back to version detection for cross-referencing
+        self.cve_feed_integration.version_engine = self.version_detection
+
+        # Initialize BrowserAuthHelper for complex OAuth flows
+        print("Creating BrowserAuthHelper...")
+        self.browser_auth_helper = BrowserAuthHelper(headless=config.get('browser_headless', True))
+        print("BrowserAuthHelper created successfully")
+
+        # Initialize MultiprocessingScanner for parallel scanning
+        print("Creating MultiprocessingScanner...")
+        num_processes = config.get('multiprocessing_num_processes', multiprocessing.cpu_count())
+        self.multiprocessing_scanner = MultiprocessingScanner(num_processes=num_processes)
+        print("MultiprocessingScanner created successfully")
         
         self.subdomain_discovery = SubdomainDiscovery()
         self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
@@ -28307,7 +28603,9 @@ class OmegaDAST:
         # Set thread-local reference for OOB handlers to prevent race conditions
         _oob_scanner_local.instance = self
         
-        # Taint tracking initialization - DISABLED DUE TO RECURSION ERROR
+        # Taint tracking initialization - DISABLED DUE TO RECURSION ERROR and missing implementation
+        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
+        # This feature requires additional implementation before it can be enabled
         self.taint_tracking_enabled = False  # config.get('taint_tracking_enabled', True)
         self.taint_tracker = None
         self.taint_instrumentor = None
@@ -28650,7 +28948,8 @@ class OmegaDAST:
         await self.session_manager.setup()
         await self.oob_manager.setup()
         
-        # Taint tracking removed due to RecursionError issues and lack of utility
+        # Taint tracking removed due to missing implementation (TaintTracker, TaintInstrumentor classes)
+        # This feature requires additional implementation before it can be enabled
         self.taint_tracking_enabled = False
         self.taint_integrated_session = None
         
@@ -32125,6 +32424,7 @@ class OmegaDAST:
         return None
     
     def dns_bruteforce(self, domain, wordlist=None):
+        """Synchronous DNS bruteforce to discover subdomains."""
         if not DNS_AVAILABLE:
             # Fallback to HTTP-based bruteforce if DNS is not available
             return self.http_based_bruteforce_sync(domain, wordlist)
@@ -32134,8 +32434,50 @@ class OmegaDAST:
                        'app', 'portal', 'dashboard', 'cdn', 'static', 'media', 'img', 'assets', 'v1', 'v2', 'api2',
                        'mobile', 'm', 'auth', 'login', 'signup', 'register', 'support', 'help', 'docs', 'wiki',
                        'forum', 'community', 'news', 'blog', 'store', 'shop', 'cart', 'checkout', 'payment']
-        # DNS bruteforce implementation would go here
-        return []
+        
+        discovered = []
+        
+        # Use shorter timeouts for bruteforce to speed up the process
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 1
+        resolver.lifetime = 1
+        
+        # Try multiple DNS record types for each subdomain
+        record_types = ['A', 'AAAA', 'CNAME', 'MX']
+        
+        for sub in wordlist:
+            full_domain = f"{sub}.{domain}"
+            found = False
+            
+            for record_type in record_types:
+                if found:
+                    break
+                
+                try:
+                    answers = resolver.resolve(full_domain, record_type)
+                    if answers:
+                        discovered.append(full_domain)
+                        logging.debug(f"DNS bruteforce found: {full_domain} ({record_type})")
+                        found = True
+                except dns.resolver.NXDOMAIN:
+                    # Subdomain doesn't exist - move to next record type
+                    continue
+                except dns.resolver.NoAnswer:
+                    # No answer for this record type - try next
+                    continue
+                except (dns.resolver.Timeout, Exception) as e:
+                    # Timeout or other error - try next record type
+                    continue
+        
+        # If DNS bruteforce didn't find much, try HTTP-based fallback
+        if len(discovered) < 5:
+            try:
+                http_discovered = self.http_based_bruteforce_sync(domain, wordlist)
+                discovered.extend(http_discovered)
+            except Exception as e:
+                logging.debug(f"HTTP-based fallback error: {e}")
+        
+        return discovered
 
     async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None, use_cache=True, session_manager: SessionStateManager = None, session_id: str = None, cookies=None):
         """
@@ -32982,6 +33324,7 @@ class GraphQLSelfReferencingFragmentGenerator:
         except Exception as e:
             logging.error(f"Validation error for {vuln.get('type', 'unknown')}: {e}")
     def dns_bruteforce(self, domain, wordlist=None):
+        """Synchronous DNS bruteforce to discover subdomains."""
         if not DNS_AVAILABLE:
             # Fallback to HTTP-based bruteforce if DNS is not available
             return self.http_based_bruteforce_sync(domain, wordlist)
@@ -32991,8 +33334,107 @@ class GraphQLSelfReferencingFragmentGenerator:
                        'app', 'portal', 'dashboard', 'cdn', 'static', 'media', 'img', 'assets', 'v1', 'v2', 'api2',
                        'mobile', 'm', 'auth', 'login', 'signup', 'register', 'support', 'help', 'docs', 'wiki',
                        'forum', 'community', 'news', 'blog', 'store', 'shop', 'cart', 'checkout', 'payment']
-        # DNS bruteforce implementation would go here
-        return []
+        
+        discovered = []
+        
+        # Use shorter timeouts for bruteforce to speed up the process
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 1
+        resolver.lifetime = 1
+        
+        # Try multiple DNS record types for each subdomain
+        record_types = ['A', 'AAAA', 'CNAME', 'MX']
+        
+        for sub in wordlist:
+            full_domain = f"{sub}.{domain}"
+            found = False
+            
+            for record_type in record_types:
+                if found:
+                    break
+                
+                try:
+                    answers = resolver.resolve(full_domain, record_type)
+                    if answers:
+                        discovered.append(full_domain)
+                        logging.debug(f"DNS bruteforce found: {full_domain} ({record_type})")
+                        found = True
+                except dns.resolver.NXDOMAIN:
+                    # Subdomain doesn't exist - move to next record type
+                    continue
+                except dns.resolver.NoAnswer:
+                    # No answer for this record type - try next
+                    continue
+                except (dns.resolver.Timeout, Exception) as e:
+                    # Timeout or other error - try next record type
+                    continue
+        
+        # If DNS bruteforce didn't find much, try HTTP-based fallback
+        if len(discovered) < 5:
+            try:
+                http_discovered = self.http_based_bruteforce_sync(domain, wordlist)
+                discovered.extend(http_discovered)
+            except Exception as e:
+                logging.debug(f"HTTP-based fallback error: {e}")
+        
+        return discovered
+    
+    def http_based_bruteforce_sync(self, domain, wordlist=None):
+        """Synchronous wrapper for http_based_bruteforce."""
+        import asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.http_based_bruteforce(domain, wordlist))
+            loop.close()
+            return result
+        except Exception as e:
+            logging.debug(f"HTTP-based bruteforce sync error: {e}")
+            return []
+    
+    async def http_based_bruteforce(self, domain, wordlist=None):
+        """Fallback HTTP-based subdomain bruteforce when DNS is not available."""
+        import aiohttp
+        import asyncio
+        
+        if wordlist is None:
+            wordlist = ['www', 'mail', 'ftp', 'admin', 'api', 'dev', 'staging', 'test', 'blog', 'shop', 'secure',
+                       'app', 'portal', 'dashboard', 'cdn', 'static', 'media', 'img', 'assets', 'v1', 'v2', 'api2',
+                       'mobile', 'm', 'auth', 'login', 'signup', 'register', 'support', 'help', 'docs', 'wiki',
+                       'forum', 'community', 'news', 'blog', 'store', 'shop', 'cart', 'checkout', 'payment']
+        
+        discovered = []
+        
+        async def check_subdomain(sub):
+            full_domain = f"{sub}.{domain}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"http://{full_domain}", timeout=aiohttp.ClientTimeout(total=3)) as response:
+                        if response.status not in (404, 403, 502, 503):
+                            return full_domain
+            except Exception:
+                pass
+            return None
+        
+        # Run checks in batches to avoid overwhelming the server
+        batch_size = 20
+        all_results = []
+        
+        for i in range(0, len(wordlist), batch_size):
+            batch = wordlist[i:i + batch_size]
+            tasks = [check_subdomain(sub) for sub in batch]
+            results = await asyncio.gather(*tasks)
+            all_results.extend(results)
+            
+            # Small delay between batches to be polite
+            await asyncio.sleep(0.5)
+        
+        http_discovered = [r for r in all_results if r]
+        
+        for subdomain in http_discovered:
+            self.discovered_subdomains.add(subdomain)
+        
+        return http_discovered
 
     async def _async_fetch(self, url, method='GET', data=None, json_data=None, headers=None, use_cache=True, session_manager: SessionStateManager = None, session_id: str = None, cookies=None):
         """
@@ -37987,7 +38429,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v17.3 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.4 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -39070,7 +39512,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v17.3']
+                        ['Tool Version', 'UltraDAST v17.4']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -39181,7 +39623,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v17.3",
+                            "tool": "UltraDAST v17.4",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -39463,7 +39905,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v17.3 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.4 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
