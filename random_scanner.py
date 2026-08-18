@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v17.4 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.5 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -15695,12 +15695,12 @@ class ScanStateManager:
     def __init__(self, db_path="scan_state.db", html_cache_dir="html_cache"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.c = self.conn.cursor()
+        self.html_cache_dir = html_cache_dir
+        os.makedirs(self.html_cache_dir, exist_ok=True)
         self._init_tables()
         self.lock = threading.Lock()
         self.pending_page_inserts = []
         self.batch_size = 100
-        self.html_cache_dir = html_cache_dir
-        os.makedirs(self.html_cache_dir, exist_ok=True)
     def _init_tables(self):
         self.c.execute('''CREATE TABLE IF NOT EXISTS scan_state
              (id INTEGER PRIMARY KEY, target TEXT, timestamp TEXT, 
@@ -15708,6 +15708,12 @@ class ScanStateManager:
               crawled_pages TEXT, config TEXT)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS page_hashes
              (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, html_path TEXT, timestamp TEXT)''')
+        # Migration: add html_path column if it doesn't exist
+        try:
+            self.c.execute("SELECT html_path FROM page_hashes LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist, add it
+            self.c.execute("ALTER TABLE page_hashes ADD COLUMN html_path TEXT")
         # Migration: if old html_content column exists, migrate to html_path
         try:
             self.c.execute("SELECT html_content FROM page_hashes LIMIT 1")
@@ -22162,7 +22168,7 @@ class InjectionEngine:
                 self.log(f"Remote OS detected: {os_info} - use for targeted payload selection after RCE confirmation")
 
         # Update CVE database from external feeds
-        if self.config.get('enable_cve_feed_integration', True):
+        if self.config.get('enable_cve_feed_integration', True) and hasattr(self, 'cve_feed_integration') and self.cve_feed_integration:
             self.log("Updating CVE database from external feeds...")
             await self.cve_feed_integration.update_cve_database()
             self.log("CVE database updated successfully")
@@ -27181,6 +27187,40 @@ class InjectionEngine:
         except Exception as e:
             logging.warning(f"OPTIONS method test error for {url}: {e}")
     
+    async def _test_head_method(self, url):
+        try:
+            baseline_resp = await self._async_fetch(url, method='GET')
+            resp = await self._async_fetch(url, method='HEAD')
+            if resp:
+                # Check if HEAD method is enabled and exposes information
+                if resp.status == 200:
+                    # HEAD should not return a body, but some servers might
+                    if resp.text and len(resp.text) > 0:
+                        await self._add_vulnerability({
+                            "type": "HEAD Method Body Disclosure",
+                            "url": url,
+                            "evidence": "HEAD method returned response body",
+                            "severity": "Low",
+                            "confidence": 80
+                        })
+                
+                # Check if HEAD reveals different headers than GET
+                if baseline_resp:
+                    get_headers = dict(baseline_resp.headers)
+                    head_headers = dict(resp.headers)
+                    
+                    # Check for header discrepancies that might indicate misconfiguration
+                    if get_headers.get('Content-Length') != head_headers.get('Content-Length'):
+                        await self._add_vulnerability({
+                            "type": "HEAD Method Header Inconsistency",
+                            "url": url,
+                            "evidence": f"Content-Length differs between GET ({get_headers.get('Content-Length')}) and HEAD ({head_headers.get('Content-Length')})",
+                            "severity": "Low",
+                            "confidence": 60
+                        })
+        except Exception as e:
+            logging.warning(f"HEAD method test error for {url}: {e}")
+    
     # ---------------------------------------------------------------------
     # REMOTE OS FINGERPRINTING & LPE DETECTION
     # ---------------------------------------------------------------------
@@ -29915,21 +29955,10 @@ class OmegaDAST:
             logging.warning(f"gRPC service analysis error: {e}")
             return None
     def _fuzz_grpc_sync(self, target):
-        channel = grpc.insecure_channel(target)
-        for payload in PAYLOADS.get("gRPC", []):
-            try:
-                # Use grammar-based structured payloads instead of raw bytes
-                # Ensure payload is properly structured for gRPC protocol
-                if isinstance(payload, bytes) and len(payload) > 1000:
-                    # Skip overly long random byte sequences that likely corrupt protocol
-                    logging.debug(f"Skipping oversized raw payload: {len(payload)} bytes")
-                    continue
-                
-                channel._channel.send(payload)
-                return True
-            except (grpc.RpcError, AttributeError, Exception) as e:
-                logging.exception(f"gRPC fuzzing error: {e}")
-                pass
+        # This method is deprecated - use _fuzz_grpc_comprehensive instead
+        # The gRPC library doesn't support direct payload sending via channel.send()
+        # Proper gRPC fuzzing requires stub creation and method calls
+        logging.debug("Sync gRPC fuzzing skipped - use comprehensive async method")
         return False
     
     async def _fuzz_grpc_comprehensive(self, target, service_analysis=None):
@@ -38429,7 +38458,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v17.4 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.5 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -39512,7 +39541,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v17.4']
+                        ['Tool Version', 'UltraDAST v17.5']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -39623,7 +39652,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v17.4",
+                            "tool": "UltraDAST v17.5",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -39905,7 +39934,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v17.4 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.5 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
