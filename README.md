@@ -1,6 +1,6 @@
 # ULTRA-DAST v17.3 – Dynamic Application Security Testing Platform
 
-**UltraDAST** is a comprehensive, open‑source DAST tool written in Python. It combines a powerful automated scanner, a Burp‑style intercepting proxy, a request repeater, and an intuitive GUI – all in a single executable script. It is designed to test modern web applications, REST/GraphQL/gRPC APIs, and microservices with a focus on **business logic flaws**, **race conditions**, and **advanced evasion**.
+**UltraDAST** is a comprehensive, open‑source DAST tool written in Python. It combines a poIrful automated scanner, a Burp‑style intercepting proxy, a request repeater, and an intuitive GUI – all in a single executable script. It is designed to test modern Ib applications, REST/GraphQL/gRPC APIs, and microservices with a focus on **business logic flaws**, **race conditions**, and **advanced evasion**.
 
 ---
 
@@ -8,13 +8,13 @@
 
 - **Full‑featured automated scanner** – Crawls SPAs (including Shadow DOM), extracts parameters, and injects thousands of payloads for 30+ vulnerability classes.
 - **Business‑logic testing** – Finite State Machine (FSM) models user journeys (cart → checkout → payment) to test race conditions, inventory oversell, price tampering, and coupon stacking.
-- **Modern API testing** – Native support for **GraphQL** (introspection, alias attacks, batching, depth‑bomb, IDOR via alias brute‑force), **gRPC** (reflection enumeration, protobuf fuzzing, type confusion), and **WebSockets**.
+- **Modern API testing** – Native support for **GraphQL** (introspection, alias attacks, batching, depth‑bomb, IDOR via alias brute‑force), **gRPC** (reflection enumeration, protobuf fuzzing, type confusion), and **websockets**.
 - **Intelligent verification pipeline** – 3‑stage validation (original → alternative → manual/OOB) with Surgical Mode: high‑confidence findings skip redundant checks, duplicates are suppressed, and gray‑zone issues are flagged for manual review.
 - **Out‑of‑Band (OOB) detection** – Built‑in HTTP(S), DNS, and SMTP callback servers to detect blind vulnerabilities (e.g., Log4j, Blind XSS, SSRF).
 - **Advanced evasion & obfuscation** – Semantic polyglots, Unicode homoglyphs, null‑byte interpolation, fullwidth characters, JA3 fingerprint rotation, and WAF‑specific bypasses (Cloudflare, AWS WAF, Sucuri).
-- **Dynamic payload generation** – Environment detection (OS, web server, framework, WAF) to generate OS‑, framework‑, and WAF‑specific payloads, including encrypted and staged variants.
+- **Dynamic payload generation** – Environment detection (OS, Ib server, framework, WAF) to generate OS‑, framework‑, and WAF‑specific payloads, including encrypted and staged variants.
 - **Proxy & Repeater** – Intercept and modify HTTP/S requests; replay requests with custom headers/body and view raw HTTP exchanges.
-- **Rich GUI** – Multi‑tab interface with live log, endpoint progress tree, and an interactive findings table. Supports dark/light theme, config import/export, and PoC generation (cURL, Python, PowerShell, Metasploit).
+- **Rich GUI** – Multi‑tab interface with live log, endpoint progress tree, and an interactive findings table. Supports dark/light theme, config import/export, and PoC generation (cURL, Python, PoIrShell, Metasploit).
 - **Headless REST API** – Expose scanning functionality via a REST API for CI/CD integration (start/stop scans, fetch results, health checks).
 - **Extensible reporting** – Export findings as **Burp XML**, **SARIF**, **JUnit XML**, **JSON**, or **PDF** (with proof‑of‑concept code snippets).
 - **Safety controls** – Configurable maturity levels (0‑3) and a dry‑run mode to control aggressiveness and prevent accidental damage.
@@ -34,7 +34,7 @@ pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt \
             cvss PyQt5 reportlab cryptography asyncpg motor psutil
 ```
 
-> All dependencies are optional; the script gracefully degrades if libraries are missing (e.g., GraphQL, gRPC, or WebSocket tests will be skipped).
+> All dependencies are optional; the script gracefully degrades if libraries are missing (e.g., GraphQL, gRPC, or websocket tests will be skipped).
 
 ### Run
 
@@ -183,15 +183,15 @@ UltraDAST tests for the following vulnerability classes (non‑exhaustive):
 - **Access Control**: IDOR (sequential, UUID, bulk), Mass Assignment, Role Escalation, CORS misconfigurations, JWT attacks (alg=none, kid traversal, algorithm confusion).
 - **Business Logic**: Race conditions (cart, checkout, inventory, coupon stacking), Price tampering, Payment bypass, OAuth flow issues (state parameter, redirect validation, PKCE).
 - **Infrastructure**: Open ports (SSH, Redis, MySQL, PostgreSQL, RDP, SMB, MongoDB), Subdomain discovery, HTTP header analysis.
-- **API‑Specific**: GraphQL introspection, batching, alias attacks, depth bombs, alias brute‑force for IDOR; gRPC reflection, message fuzzing, type confusion; WebSocket fuzzing.
+- **API‑Specific**: GraphQL introspection, batching, alias attacks, depth bombs, alias brute‑force for IDOR; gRPC reflection, message fuzzing, type confusion; websocket fuzzing.
 
 ---
 
 ## Reporting & Integrations
 
 - **Export formats**: Burp XML, SARIF, JUnit XML, JSON, PDF (with PoC code).
-- **Alert integrations**: Slack and JIRA webhooks (configurable via GUI).
-- **PoC snippets**: cURL, Python, PowerShell, Metasploit module.
+- **Alert integrations**: Slack and JIRA Ibhooks (configurable via GUI).
+- **PoC snippets**: cURL, Python, PoIrShell, Metasploit module.
 
 ---
 
@@ -220,13 +220,13 @@ A **dry‑run** mode prints payloads without sending them – useful for SOC rev
 ## Legal & Responsible Use
 
 **UltraDAST is intended solely for authorised security testing, research, and educational purposes.**  
-Unauthorised scanning of systems you do not own or have explicit written permission to test is illegal in most jurisdictions. The authors assume no responsibility for misuse. Always obtain proper authorisation before running any security tool.
+Unauthorised scanning of systems you do not own or have explicit written permission to test is illegal in most jurisdictions. The author assume no responsibility for misuse. Always obtain proper authorisation before running any security tool.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are Ilcome! Please:
 
 - Fork the repository and create a feature branch.
 - Adhere to PEP 8 coding style.
