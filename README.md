@@ -1,318 +1,238 @@
-# UltraDAST v14.0 – The Unstoppable Pentester Platform
+# ULTRA-DAST v17.3 – Dynamic Application Security Testing Platform
 
-**Enterprise-Grade Web Application Security Scanner | Free & Open-Source**
-
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-GPLv3-red.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
-[![Version](https://img.shields.io/badge/Version-14.0-green.svg)]()
+**UltraDAST** is a comprehensive, open‑source DAST tool written in Python. It combines a powerful automated scanner, a Burp‑style intercepting proxy, a request repeater, and an intuitive GUI – all in a single executable script. It is designed to test modern web applications, REST/GraphQL/gRPC APIs, and microservices with a focus on **business logic flaws**, **race conditions**, and **advanced evasion**.
 
 ---
 
-## Overview
+## Key Features (as implemented)
 
-UltraDAST v14.0 is a fully-featured web application security scanner that combines the evasion capabilities of a red-team toolkit, the precision of enterprise DAST, and the workflow of Burp Suite—all in a single, free platform.
-
-I built this because I got tired of not being able to use the paid version of Burp Suite and dealing with the limitations of free tools. It started as a personal project and grew into something that can actually compete with the commercial heavyweights.
-
-**Why I built this:**
-
-- Zero cost: Enterprise-grade scanning without the annual license fees.
-- Unmatched evasion: Grammar-based WAF bypass plus deep OS fingerprinting.
-- Modern protocol support: GraphQL, gRPC, WebSockets, OAuth 2.0.
-- DevSecOps ready: Full REST API for CI/CD integration.
-- Burp-class proxy: Intercept, modify, replay—all built-in.
-
----
-
-## Table of Contents
-
-- [Key Features](#key-features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Performance Benchmarks](#performance-benchmarks)
-- [Comparison with Commercial Tools](#comparison-with-commercial-tools)
-- [Use Cases](#use-cases)
-- [Security and Legal](#security-and-legal)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- **Full‑featured automated scanner** – Crawls SPAs (including Shadow DOM), extracts parameters, and injects thousands of payloads for 30+ vulnerability classes.
+- **Business‑logic testing** – Finite State Machine (FSM) models user journeys (cart → checkout → payment) to test race conditions, inventory oversell, price tampering, and coupon stacking.
+- **Modern API testing** – Native support for **GraphQL** (introspection, alias attacks, batching, depth‑bomb, IDOR via alias brute‑force), **gRPC** (reflection enumeration, protobuf fuzzing, type confusion), and **WebSockets**.
+- **Intelligent verification pipeline** – 3‑stage validation (original → alternative → manual/OOB) with Surgical Mode: high‑confidence findings skip redundant checks, duplicates are suppressed, and gray‑zone issues are flagged for manual review.
+- **Out‑of‑Band (OOB) detection** – Built‑in HTTP(S), DNS, and SMTP callback servers to detect blind vulnerabilities (e.g., Log4j, Blind XSS, SSRF).
+- **Advanced evasion & obfuscation** – Semantic polyglots, Unicode homoglyphs, null‑byte interpolation, fullwidth characters, JA3 fingerprint rotation, and WAF‑specific bypasses (Cloudflare, AWS WAF, Sucuri).
+- **Dynamic payload generation** – Environment detection (OS, web server, framework, WAF) to generate OS‑, framework‑, and WAF‑specific payloads, including encrypted and staged variants.
+- **Proxy & Repeater** – Intercept and modify HTTP/S requests; replay requests with custom headers/body and view raw HTTP exchanges.
+- **Rich GUI** – Multi‑tab interface with live log, endpoint progress tree, and an interactive findings table. Supports dark/light theme, config import/export, and PoC generation (cURL, Python, PowerShell, Metasploit).
+- **Headless REST API** – Expose scanning functionality via a REST API for CI/CD integration (start/stop scans, fetch results, health checks).
+- **Extensible reporting** – Export findings as **Burp XML**, **SARIF**, **JUnit XML**, **JSON**, or **PDF** (with proof‑of‑concept code snippets).
+- **Safety controls** – Configurable maturity levels (0‑3) and a dry‑run mode to control aggressiveness and prevent accidental damage.
 
 ---
 
-## Key Features
+##  Requirements & Installation
 
-### Core Scanning Engine
+- **Python 3.9+**
+- **ChromeDriver** (for Selenium-based crawling) – must be in your `PATH`.
 
-- 100+ vulnerability tests: XSS (reflected/DOM/stored), SQLi (error/time/boolean/union/OOB), RCE, SSTI, SSRF, XXE, CRLF, Path Traversal, NoSQLi, LDAPi, JWT, CORS, CSRF, and 40 more.
-- Multi-protocol: HTTP/1.1, HTTP/2, WebSockets, GraphQL, gRPC.
-- Intelligent crawling: JavaScript rendering (Selenium), SPA route discovery, form auto-submission.
-
-### Advanced Evasion
-
-- Grammar-based mutations: Database-specific syntax (`/*!50000*/`, `$$`, `EXEC`), WAF-specific obfuscation.
-- Deep OS fingerprinting: TCP stack analysis (TTL, Window Size, ISN) detects Windows/Linux/macOS, generating OS-accurate RCE payloads.
-- Dynamic payloads: OS-specific, framework-specific (PHP/Java/Python/Node.js), encrypted (AES/XOR/ROT13), staged delivery.
-- Traffic shaping: Randomized intervals, header order/case randomization, browser simulation, JA3 fingerprint rotation.
-
-### Protocol and API Fuzzing
-
-- GraphQL: Self-referencing fragments, alias brute-force (IDOR), depth-bombs, complexity pre-flight, batching auth bypass.
-- gRPC: Reflection analysis, Protobuf type-confusion fuzzing, field mutation, boundary testing, reflection fallback.
-- WebSocket: Structured payload fuzzing, real-time message injection, protocol compliance testing.
-
-### Automation and CI/CD
-
-- REST API: Full headless operation—start scans, poll status, retrieve results via JSON.
-- Multiprocessing: True parallelism across CPU cores, overcoming Python GIL limitations.
-- Scan checkpointing: Pause and resume scans, save/load state.
-
-### Manual Testing Tools
-
-- Burp-class interactive proxy: Intercept, modify, forward, drop requests/responses with full history.
-- Repeater: Manual request replay with CSRF auto-injection and raw response viewing.
-- Advanced proxy tab: Intercept control, history table, modification rules editor.
-
-### Reporting and Alerts
-
-- CVSS 4.0 scoring: Dynamic vector generation based on vulnerability context.
-- Multiple export formats: Burp XML, PDF, JSON, JUnit, SARIF.
-- Integration: JIRA and Slack webhooks for real-time alerts.
-- CVE feed integration: Automatic CVE mapping from NVD and CIRCL APIs.
-
-### Advanced Detection
-
-- Taint tracking: Source-to-sink dataflow analysis with symbolic execution.
-- Genetic fuzzing: AFL++/libFuzzer-inspired mutation and crossover for raw HTTP fuzzing.
-- Second-order verification: Context replay for stored XSS/SQLi validation.
-- False positive learning: Parameter-specific suppression, context whitelisting, confidence decay on duplicates.
-
----
-
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-- Chrome/Chromium (for Selenium/JS rendering)
-- ChromeDriver (in PATH)
-
-### Dependencies
+### Install dependencies
 
 ```bash
-pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt
-pip install dnspython html5lib websockets grpcio grpcio-reflection cvss PyQt5 reportlab
+pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt \
+            dnspython html5lib websockets grpcio grpcio-reflection \
+            cvss PyQt5 reportlab cryptography asyncpg motor psutil
 ```
 
-### Quick Install
+> All dependencies are optional; the script gracefully degrades if libraries are missing (e.g., GraphQL, gRPC, or WebSocket tests will be skipped).
+
+### Run
 
 ```bash
-git clone https://github.com/ultradast/ultradast.git
-cd ultradast
-pip install -r requirements.txt
 python random_scanner.py
 ```
+
+The script is self‑contained – no setup or packaging required.
 
 ---
 
 ## Quick Start
 
-### GUI Mode (Desktop)
+### GUI Mode
 
+Launch the GUI:
 ```bash
 python random_scanner.py
 ```
 
-- Load the GUI, go to the Scan Tab, enter the target URL, and click Start Scan.
-- Use the Proxy Tab for interception and modification.
-- View findings in the Findings Table; double-click for evidence.
+- Enter a target URL (e.g., `https://example.com`).
+- Configure scan depth, threads, delay, and confidence threshold.
+- Choose a **Maturity Level** (0–3) and optionally enable **Dry Run**.
+- Click **Start Scan**.
 
-### Headless Mode (REST API)
+### Command‑Line / Headless (REST API)
 
-```bash
-python random_scanner.py --api --port 8080
+The built‑in REST API server allows programmatic control:
+
+```python
+from random_scanner import RESTAPIServer, OmegaDAST
+
+# Create scanner instance
+scanner = OmegaDAST(target="https://example.com", config={}, signals=None)
+
+# Start API server
+api = RESTAPIServer(host="127.0.0.1", port=8080)
+api.set_scanner(scanner)
+await api.start()
 ```
 
-Interact via cURL:
-
-```bash
-# Start a scan
-curl -X POST http://localhost:8080/api/scan \
-  -H "Content-Type: application/json" \
-  -d '{"target_url": "https://example.com"}'
-
-# Check status
-curl http://localhost:8080/api/scan/{task_id}
-
-# Get results
-curl http://localhost:8080/api/results?task_id={task_id}
-```
+Available endpoints:
+- `POST /api/scan` – start a scan (JSON body: `{"target_url": "...", "config": {...}}`)
+- `GET /api/scan/{task_id}` – check status and results
+- `DELETE /api/scan/{task_id}` – stop a scan
+- `GET /api/results` – retrieve all results
+- `GET /api/health` – health check
 
 ---
 
-## Configuration
+##  Configuration
 
-### Basic Configuration (GUI)
+UltraDAST is configured via a Python dictionary (or JSON) passed to the `OmegaDAST` constructor. The script’s top‑level docstring contains a comprehensive example. Below are key configuration sections:
 
-| Setting               | Description                     | Default |
-|-----------------------|---------------------------------|---------|
-| Target URL            | Base URL to scan                | -       |
-| Scan Depth            | Crawl recursion depth           | 3       |
-| Thread Count          | Concurrent requests             | 5       |
-| Request Delay         | Delay between requests (s)      | 0.2     |
-| Confidence Threshold  | Minimum confidence to report    | 75%     |
-
-### Advanced Configuration (JSON)
+### Proxy Pool
 
 ```json
 {
   "proxy_pool": {
     "enable_rotation": true,
     "rotation_interval": 100,
+    "health_check_interval": 300,
+    "prefer_geo_diverse": true,
+    "max_failure_rate": 0.5,
+    "auto_healing_enabled": true,
+    "sticky_session_enabled": true,
+    "sticky_session_duration": 600,
     "proxies": [
-      {"url": "proxy1:8080", "type": "http", "country": "US"}
+      {"url": "proxy1.example.com:8080", "type": "http", "username": "user1", "password": "pass1", "country": "US"},
+      {"url": "proxy2.example.com:1080", "type": "socks5", "country": "GB"}
     ]
-  },
+  }
+}
+```
+
+### IDS/IPS Throttling
+
+```json
+{
   "ids_ips_throttling": {
     "enabled": true,
     "max_requests_per_second": 10,
-    "burst_capacity": 20
-  },
-  "dynamic_payloads": {
-    "enabled": true,
-    "use_encrypted": false,
-    "use_staged": false
-  },
-  "oauth_discovery": {
-    "enabled": true,
-    "well_known": true,
-    "js_scraping": true
+    "burst_capacity": 20,
+    "min_requests_per_second": 0.1,
+    "max_requests_per_second": 100
   }
+}
+```
+
+### Intelligent Verification (Surgical Mode)
+
+```json
+{
+  "intelligent_verification": {
+    "enabled": true,
+    "confidence_threshold": 95,
+    "gray_zone_threshold": 10,
+    "verification_rate_limit": 1,
+    "discovery_rate_limit": 10,
+    "off_peak_scheduling": true,
+    "proximity_validation_sample_size": 3
+  }
+}
+```
+
+### GraphQL Advanced Testing
+
+```json
+{
+  "graphql_advanced_testing": true,
+  "graphql_depth_limit": 100,
+  "graphql_batch_limit": 1000,
+  "graphql_variables_support": true
+}
+```
+
+### gRPC Advanced Testing
+
+```json
+{
+  "grpc_advanced_testing": true,
+  "grpc_ports": [50051, 50052, 8080],
+  "grpc_fuzzing_intensity": 0.5
+}
+```
+
+### Dynamic Payloads
+
+```json
+{
+  "dynamic_payloads_enabled": true,
+  "environment_detection_enabled": true,
+  "use_encrypted_payloads": false,
+  "use_staged_payloads": false
 }
 ```
 
 ---
 
-## Architecture
+## Vulnerability Coverage
 
-```
-+------------------------------------------------------+
-|                   ULTRA-DAST v14.0                    |
-+------------------------------------------------------+
-|  GUI (PyQt5)           |  REST API (aiohttp)         |
-|  - Scan Tab            |  - /api/scan                |
-|  - Proxy Tab           |  - /api/scan/{id}           |
-|  - Repeater Tab        |  - /api/results             |
-|  - Findings Table      |  - /api/health              |
-+------------------------------------------------------+
-|  Core Engine (OmegaDAST)                              |
-|  - Multiprocessing Scanner                            |
-|  - Crawler Engine                                    |
-|  - Injection Engine                                  |
-|  - Detection Engine (AST)                            |
-|  - Validation Engine (3x)                            |
-+------------------------------------------------------+
-|  Specialized Modules                                 |
-|  - DeepOSFingerprinter                               |
-|  - GraphQLComplexityCalculator                       |
-|  - ProtobufMessageBuilder                            |
-|  - TaintTracker                                      |
-|  - GeneticFuzzer                                     |
-|  - InteractiveProxy                                  |
-|  - BrowserAuthHelper                                 |
-|  - CVEFeedIntegration                                |
-+------------------------------------------------------+
-|  Network Layer                                       |
-|  - AsyncSession (aiohttp)                            |
-|  - ProxyPool (HTTP/SOCKS)                            |
-|  - TokenBucket (Throttling)                          |
-|  - OOB Callbacks (HTTP/DNS/SMTP)                    |
-+------------------------------------------------------+
-```
+UltraDAST tests for the following vulnerability classes (non‑exhaustive):
+
+- **Injection**: SQLi (error‑, time‑, boolean‑, union‑based), NoSQLi, LDAPi, Command Injection, SSTI, XXE, CRLF, Log4j, Spring4Shell, Text4Shell.
+- **XSS**: Reflected, Stored, DOM‑based, Blind (with OOB), Self‑XSS (context‑aware filtering).
+- **Access Control**: IDOR (sequential, UUID, bulk), Mass Assignment, Role Escalation, CORS misconfigurations, JWT attacks (alg=none, kid traversal, algorithm confusion).
+- **Business Logic**: Race conditions (cart, checkout, inventory, coupon stacking), Price tampering, Payment bypass, OAuth flow issues (state parameter, redirect validation, PKCE).
+- **Infrastructure**: Open ports (SSH, Redis, MySQL, PostgreSQL, RDP, SMB, MongoDB), Subdomain discovery, HTTP header analysis.
+- **API‑Specific**: GraphQL introspection, batching, alias attacks, depth bombs, alias brute‑force for IDOR; gRPC reflection, message fuzzing, type confusion; WebSocket fuzzing.
 
 ---
 
-## Performance Benchmarks
+## Reporting & Integrations
 
-| Metric                    | ULTRA-DAST v14.0 | OWASP ZAP | Burp Suite Pro | Acunetix |
-|---------------------------|------------------|-----------|----------------|----------|
-| False Positive Rate       | ~5%              | ~10%      | ~5-8%          | ~3%      |
-| False Negative Rate       | ~15%             | ~35%      | ~20-25%        | ~15%     |
-| RCE Detection             | ~95% (OS-aware)  | ~60%      | ~60%           | ~70%     |
-| GraphQL Coverage          | 100% (native)    | 60% (add-on) | 85% (add-on) | 90%      |
-| WAF Evasion               | 10/10            | 4/10      | 6/10           | 8/10     |
-| Scalability               | Excellent        | Good      | Excellent      | Excellent |
-| CI/CD Integration         | REST API         | REST API  | API            | API      |
-| Price                     | Free             | Free      | Commercial     | Commercial |
+- **Export formats**: Burp XML, SARIF, JUnit XML, JSON, PDF (with PoC code).
+- **Alert integrations**: Slack and JIRA webhooks (configurable via GUI).
+- **PoC snippets**: cURL, Python, PowerShell, Metasploit module.
 
 ---
 
-## Use Cases
+## Safety Controls (Reconnaissance Maturity Model)
 
-- **Bug Bounty Hunters**: Find unreported RCE/IDOR with OS-aware payloads and OAuth automation.
-- **Penetration Testers**: All-in-one platform covering interception, scanning, and replay.
-- **DevSecOps Engineers**: CI/CD integration via REST API for automated security gates.
-- **Security Researchers**: Study state-of-the-art DAST techniques (genetic fuzzing, taint tracking).
-- **Red Teams**: Bypass Cloudflare/WAF and gain initial access with precision RCE.
+| Level | Name        | Description                                                                 |
+|-------|-------------|-----------------------------------------------------------------------------|
+| 0     | Passive     | Crawl only – no attack payloads sent.                                       |
+| 1     | Low & Slow  | Idempotent GET‑based payloads only (no state‑changing tests).               |
+| 2     | Aggressive  | Time‑based SQLi, POST mutations, OOB tests.                                 |
+| 3     | Nuclear     | Full capabilities: stacked queries, race conditions, and all advanced attacks. |
+
+A **dry‑run** mode prints payloads without sending them – useful for SOC review.
 
 ---
 
-## Security and Legal
+## Known Limitations
 
-**IMPORTANT**: UltraDAST is designed for authorised security testing only.
+- **Single‑file architecture** – While functional, the codebase is monolithic (~20,000 lines). Refactoring into a proper package is recommended for long‑term maintainability.
+- **False positives** – Despite the verification pipeline, some false positives may still occur; manual triage is advised.
+- **Dependency‑heavy** – Requires multiple third‑party libraries; missing libraries will disable corresponding features gracefully.
+- **GUI performance** – The PyQt5 interface may be slow on large scans; use the REST API for headless operation in production environments.
 
-**Permitted**: Testing your own applications, authorised penetration tests, bug bounty programs.
+---
 
-**Prohibited**: Scanning systems without explicit written permission (violates CFAA and international law).
+## Legal & Responsible Use
 
-The tool includes a mandatory legal banner displayed on every start:
-
-```
-*** UNAUTHORIZED USE IS A FEDERAL CRIME ***
-```
-
-**Safe Usage Guidelines**:
-
-1. Never run race condition tests on production payment systems.
-2. Always use --safe mode when testing unknown endpoints.
-3. Configure allowed_domains in config to restrict scope.
-4. Use the throttling controls to avoid DoS.
+**UltraDAST is intended solely for authorised security testing, research, and educational purposes.**  
+Unauthorised scanning of systems you do not own or have explicit written permission to test is illegal in most jurisdictions. The authors assume no responsibility for misuse. Always obtain proper authorisation before running any security tool.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. Areas needing help:
+Contributions are welcome! Please:
 
-- Testing: Validate detection accuracy against vulnerable apps.
-- Documentation: Improve examples and tutorials.
-- UI/UX: Enhance the PyQt5 interface.
-- Plugins: Build support for external vulnerability databases.
-
-**Development Setup:**
-
-```bash
-git clone https://github.com/ultradast/ultradast.git
-cd ultradast
-pip install -r requirements-dev.txt
-python -m pytest tests/
-```
- ---
-
-## Acknowledgements
-
-- OWASP ZAP and Burp Suite for inspiration.
-- AFL++ and libFuzzer for genetic fuzzing algorithms.
-- PortSwigger for the JWT attack research.
-- The open-source community for the Python libraries this depends on.
+- Fork the repository and create a feature branch.
+- Adhere to PEP 8 coding style.
+- Update inline documentation for new modules.
+- Submit a pull request with a clear description of changes.
 
 ---
 
-## Contact and Support
-
-- GitHub Issues: https://github.com/LeonardoParchao/ultradast/issues
-
----
-
-Star the repository on GitHub to support ongoing development.
+**UltraDAST – Built to catch what others miss.**
