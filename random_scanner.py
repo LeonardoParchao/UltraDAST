@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v17.5 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.6 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -427,6 +427,7 @@ import secrets
 import multiprocessing
 from multiprocessing import Queue, Manager, Process
 import aiohttp
+from aiohttp import ClientTimeout
 import glob
 
 # Optional psutil import for process cleanup
@@ -475,12 +476,12 @@ DEFAULT_THREADS = 100
 DEFAULT_DELAY = 0.0
 
 # Network timeout constants
-DEFAULT_REQUEST_TIMEOUT = 30
-DEFAULT_CONNECT_TIMEOUT = 5
-DEFAULT_SOCK_READ_TIMEOUT = 10
-DEFAULT_HEALTH_CHECK_TIMEOUT = 5
-PROBE_TIMEOUT = 10
-EXTENDED_REQUEST_TIMEOUT = 15.0
+DEFAULT_REQUEST_TIMEOUT = 180
+DEFAULT_CONNECT_TIMEOUT = 30
+DEFAULT_SOCK_READ_TIMEOUT = 120
+DEFAULT_HEALTH_CHECK_TIMEOUT = 30
+PROBE_TIMEOUT = 60
+EXTENDED_REQUEST_TIMEOUT = 90.0
 
 # Rate limiting constants
 VERIFICATION_RATE_LIMIT = 1  # Requests per second for verification
@@ -738,7 +739,7 @@ class MultiprocessingScanner:
             
             async def scan():
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                    async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                         headers = dict(resp.headers)
                         content = await resp.text()
                         return {
@@ -779,7 +780,7 @@ class MultiprocessingScanner:
                 async with aiohttp.ClientSession() as session:
                     if method == 'GET':
                         async with session.get(url, params=payload, headers=headers, 
-                                             timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                                             timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                             content = await resp.text()
                             return {
                                 'url': url,
@@ -790,7 +791,7 @@ class MultiprocessingScanner:
                             }
                     else:
                         async with session.post(url, data=payload, headers=headers,
-                                              timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                                              timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                             content = await resp.text()
                             return {
                                 'url': url,
@@ -828,7 +829,7 @@ class MultiprocessingScanner:
             
             async def check():
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                    async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
                         content = await resp.text()
                         
                         vulnerabilities = []
@@ -1423,7 +1424,7 @@ class DeepOSFingerprinter:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"http://{host}:{port}", 
-                                     timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                                     timeout=ClientTimeout(total=timeout)) as resp:
                     headers = resp.headers
                     
                     http_data['server_header'] = headers.get('Server', '')
@@ -3962,6 +3963,7 @@ class AdvancedProxyTab(QWidget):
 import aiohttp
 from aiohttp import FormData
 from bs4 import BeautifulSoup
+import bs4
 import json
 
 try:
@@ -4034,6 +4036,24 @@ class BeautifulSoupCache:
         Returns:
             BeautifulSoup object
         """
+        # Handle empty or invalid content
+        if not html_content or not isinstance(html_content, str):
+            html_content = '<html></html>'
+        
+        # Check if content looks like a filename instead of HTML
+        if len(html_content) < 100 and not any(tag in html_content.lower() for tag in ['<html', '<body', '<div', '<span', '<p>', '<a ']):
+            # If it looks like a filename, treat it as such and try to read the file
+            import os
+            if os.path.exists(html_content):
+                try:
+                    with open(html_content, 'r', encoding='utf-8', errors='ignore') as f:
+                        html_content = f.read()
+                except Exception:
+                    html_content = '<html></html>'
+            else:
+                # Not a valid file or HTML, use placeholder
+                html_content = '<html></html>'
+            
         content_hash = self._get_hash(html_content)
         cache_key = f"{content_hash}:{parser}"
         
@@ -4044,8 +4064,11 @@ class BeautifulSoupCache:
             
             self._misses += 1
             
-            # Create new BeautifulSoup object
-            soup = BeautifulSoup(html_content, parser)
+            # Create new BeautifulSoup object with explicit parser
+            # Suppress the MarkupResemblesLocatorWarning
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=bs4.MarkupResemblesLocatorWarning)
+                soup = BeautifulSoup(html_content, 'html.parser')
             
             # Implement LRU eviction if cache is full
             if len(self._cache) >= self._max_size:
@@ -9070,7 +9093,7 @@ async def get_public_ip():
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.ipify.org", timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.get("https://api.ipify.org", timeout=ClientTimeout(total=DEFAULT_HEALTH_CHECK_TIMEOUT)) as response:
                 return (await response.text()).strip()
     except Exception as e:
         logging.warning(f"Failed to get public IP: {e}")
@@ -10528,7 +10551,7 @@ class JWTAttack:
                 headers = {
                     'Cookie': f'{session_cookie_name}={original_session}; {session_cookie_name}={malicious_session}'
                 }
-                async with session.get(base_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response1:
+                async with session.get(base_url, headers=headers, timeout=ClientTimeout(total=DEFAULT_HEALTH_CHECK_TIMEOUT)) as response1:
                     results.append({
                         'test': 'original_first_malicious_last',
                         'cookies_sent': f'{session_cookie_name}={original_session}; {session_cookie_name}={malicious_session}',
@@ -10538,7 +10561,7 @@ class JWTAttack:
                 headers = {
                     'Cookie': f'{session_cookie_name}={malicious_session}; {session_cookie_name}={original_session}'
                 }
-                async with session.get(base_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response2:
+                async with session.get(base_url, headers=headers, timeout=ClientTimeout(total=DEFAULT_HEALTH_CHECK_TIMEOUT)) as response2:
                     results.append({
                         'test': 'malicious_first_original_last',
                         'cookies_sent': f'{session_cookie_name}={malicious_session}; {session_cookie_name}={original_session}',
@@ -10548,7 +10571,7 @@ class JWTAttack:
                 headers = {
                     'Cookie': f'{session_cookie_name}={original_session}'
                 }
-                async with session.get(base_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response3:
+                async with session.get(base_url, headers=headers, timeout=ClientTimeout(total=DEFAULT_HEALTH_CHECK_TIMEOUT)) as response3:
                     results.append({
                         'test': 'header_and_cookie_param',
                         'header_cookie': f'{session_cookie_name}={original_session}',
@@ -10602,7 +10625,7 @@ class JWTAttack:
                 session = aiohttp.ClientSession()
                 close_session = True
             try:
-                async with session.get(jwks_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                async with session.get(jwks_url, timeout=ClientTimeout(total=DEFAULT_HEALTH_CHECK_TIMEOUT)) as response:
                     if response.status != 200:
                         logging.warning(f"JWKS endpoint not accessible: {jwks_url}")
                         return None
@@ -12239,7 +12262,7 @@ class AsyncSession:
             loop=self.loop,
             connector=connector,
             headers=default_headers,
-            timeout=aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
+            timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT, connect=DEFAULT_CONNECT_TIMEOUT, sock_read=DEFAULT_SOCK_READ_TIMEOUT)
         )
     async def request(self, method, url, **kwargs):
         # Check domain whitelist before making request
@@ -12287,7 +12310,7 @@ class AsyncSession:
         try:
             # Apply tarpit defense timeout: total=30s, connect=5s, sock_read=10s
             # This prevents slow body streaming attacks (1 byte/sec DoS)
-            timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
+            timeout = ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT, connect=DEFAULT_CONNECT_TIMEOUT, sock_read=DEFAULT_SOCK_READ_TIMEOUT)
             kwargs['timeout'] = timeout
             
             async with self.session.request(method, url, **kwargs) as resp:
@@ -15152,26 +15175,28 @@ class FP_Database:
     
     async def check_duplicate_and_decay(self, vuln):
         """
-        Check if this is a duplicate vulnerability and apply confidence decay.
+        Check if this is a duplicate vulnerability and apply confidence decay with aggregation.
         
         If the exact same vulnerability (same signature) is found on multiple URLs
-        with identical response patterns, drop confidence of duplicates to 0%.
+        with identical response patterns, aggregate them into a single finding with metadata
+        about affected endpoints instead of reporting duplicates.
         
         Returns:
-            tuple: (is_duplicate, adjusted_confidence)
+            tuple: (is_duplicate, adjusted_confidence, should_report, duplicate_info)
         """
         if not self.confidence_decay_on_duplicates:
-            return False, vuln.get('confidence', 50)
+            return False, vuln.get('confidence', 50), True, None
             
         async with self.signature_lock:
             signature = self._generate_vulnerability_signature(vuln)
             
             if signature not in self.vulnerability_signatures:
-                # First occurrence
+                # First occurrence - report normally
                 self.vulnerability_signatures[signature] = {
                     'count': 1,
                     'first_url': vuln['url'],
-                    'original_confidence': vuln.get('confidence', 50)
+                    'original_confidence': vuln.get('confidence', 50),
+                    'affected_urls': [vuln['url']]
                 }
                 
                 # Enforce size limit to prevent memory bloat
@@ -15181,19 +15206,23 @@ class FP_Database:
                     for key in keys_to_remove:
                         del self.vulnerability_signatures[key]
                 
-                return False, vuln.get('confidence', 50)
+                return False, vuln.get('confidence', 50), True, None
             else:
-                # Duplicate detected
+                # Duplicate detected - aggregate instead of reporting
                 self.vulnerability_signatures[signature]['count'] += 1
+                self.vulnerability_signatures[signature]['affected_urls'].append(vuln['url'])
                 count = self.vulnerability_signatures[signature]['count']
                 
-                # If this is the Nth or later duplicate (configurable threshold), drop confidence to 0%
-                if count >= self.duplicate_threshold:
-                    logging.debug(f"Duplicate vulnerability detected (count={count}), dropping confidence to 0% for {vuln['type']} on {vuln['url']}")
-                    return True, 0
+                # Don't report the duplicate, but track it for aggregation info
+                duplicate_info = {
+                    'signature': signature,
+                    'first_url': self.vulnerability_signatures[signature]['first_url'],
+                    'total_count': count,
+                    'affected_urls': self.vulnerability_signatures[signature]['affected_urls'].copy()
+                }
                 
-                # Otherwise, return original confidence (could implement gradual decay here)
-                return True, vuln.get('confidence', 50)
+                logging.debug(f"Duplicate vulnerability detected (count={count}), aggregating for {vuln['type']} on {vuln['url']}")
+                return True, 0, False, duplicate_info
     
     async def get_duplicate_stats(self):
         """Get statistics about duplicate vulnerabilities"""
@@ -15207,7 +15236,9 @@ class FP_Database:
                 'total_unique_signatures': total_signatures,
                 'duplicate_signatures': duplicate_count,
                 'total_duplicate_instances': total_duplicate_instances,
-                'suppressed_instances': sum(max(0, data['count'] - 1) for data in duplicates.values())
+                'suppressed_instances': sum(max(0, data['count'] - 1) for data in duplicates.values()),
+                'aggregated_findings': duplicate_count,  # Number of aggregated findings instead of individual duplicates
+                'affected_urls_per_duplicate': {sig: len(data.get('affected_urls', [])) for sig, data in duplicates.items()}
             }
     
     async def record_fp(self, vuln, mark_parameter=False):
@@ -15526,7 +15557,7 @@ class ProxyPool:
                 async with session.get(
                     proxy_config.health_check_url,
                     proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT),
                     ssl=ssl.create_default_context()
                 ) as response:
                     response_time = time.time() - start
@@ -15927,7 +15958,7 @@ class MITMProxyHandler:
                     import aiohttp
                     async def forward_request():
                         async with aiohttp.ClientSession() as session:
-                            async with session.request(method, target_url, headers=dict(self.headers), data=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.request(method, target_url, headers=dict(self.headers), data=body, timeout=ClientTimeout(total=10)) as resp:
                                 content = await resp.read()
                                 text = await resp.text()
                                 return resp.status, dict(resp.headers), content, text
@@ -16066,7 +16097,9 @@ class CWE_RemediationGuide:
 async def safe_async_wait(tasks, timeout=None, return_when=asyncio.ALL_COMPLETED):
     if not tasks:
         return set(), set()
-    return await asyncio.wait(tasks, timeout=timeout, return_when=return_when)
+    # Convert coroutines to tasks to avoid deprecation warning
+    task_list = [asyncio.create_task(task) if asyncio.iscoroutine(task) else task for task in tasks]
+    return await asyncio.wait(task_list, timeout=timeout, return_when=return_when)
 
 # ---------------------------------------------------------------------
 # VALIDATION ENGINE - 3x Validation & Remediation Testing
@@ -16312,22 +16345,20 @@ class ValidationEngine:
                     status = resp.status
             vuln_type = vuln.get('type', '')
             if 'XSS' in vuln_type:
-                # Use stack-based HTML parser for context-aware XSS detection
-                parser = HTMLContextParser()
-                context_result = parser.parse(html, payload)
-                
-                # Drop XSS finding if in safe context (Self-XSS)
-                if context_result['is_safe']:
-                    is_present = False
-                    logging.info(f"XSS payload in safe context: {context_result['context']}, dropping finding")
-                else:
-                    # Use mutated payload if in JavaScript string context
-                    if context_result['payload_mutated'] != payload:
-                        logging.info(f"XSS payload mutated for {context_result['context']}: {context_result['payload_mutated']}")
-                        # You might want to re-test with mutated payload here
-                        is_present = payload in html  # Still check original payload
+                # Use the same sophisticated XSS detection logic as the main Detector.xss method
+                # This ensures consistency between detection and validation
+                try:
+                    detector_result = Detector.xss(html, payload)
+                    if detector_result is None:
+                        is_present = False
+                        logging.info(f"XSS validation: Detector.xss returned None (likely Self-XSS or safe context)")
                     else:
-                        is_present = payload in html
+                        is_present = True
+                        logging.info(f"XSS validation: Detector.xss confirmed XSS with confidence {detector_result.get('confidence', 0)}%")
+                except Exception as e:
+                    logging.warning(f"XSS validation using Detector.xss failed: {e}, falling back to simple check")
+                    # Fallback to simple check if Detector.xss fails
+                    is_present = payload in html
             elif 'SQLi' in vuln_type:
                 # Use enhanced SQL dialect validation
                 validation_result = validate_sqli_error_message(html)
@@ -17019,8 +17050,16 @@ class OOBServiceMonitor:
 
             # Create bin via API
             async with self.session_manager.post(api_config['create']) as resp:
-                if resp.status == 201:
-                    data = await resp.json()
+                if resp.status in (200, 201):  # Accept both 200 and 201 as success
+                    content_type = resp.headers.get('Content-Type', '')
+                    if 'application/json' in content_type:
+                        data = await resp.json()
+                    else:
+                        # Handle non-JSON responses
+                        text = await resp.text()
+                        logging.warning(f"Unexpected content type from {service}: {content_type}. Response: {text[:200]}")
+                        return None, None
+                    
                     bin_id = data.get('bin_id') or data.get('uuid') or data.get('id')
                     bin_url = data.get('url') or data.get('endpoint') or f"https://{service}/{bin_id}"
 
@@ -17543,14 +17582,28 @@ class SurgicalModeOrchestrator:
                 vuln['probability_score'] = gray_zone_entry.get('probability_score', 0)
                 vuln['gray_zone_recommendation'] = gray_zone_entry.get('recommendation', 'manual_review')
                 
-                # Add to reporting engine vulnerabilities list
-                self.scanner.reporting_engine.vulnerabilities.append(vuln)
+                # Check if this gray zone finding is already in the vulnerabilities list to avoid duplicates
+                vuln_key = (vuln.get('type', ''), vuln.get('url', ''), vuln.get('parameter', ''))
+                already_exists = False
+                for v in self.scanner.reporting_engine.vulnerabilities:
+                    if (v.get('type', '') == vuln_key[0] and 
+                        v.get('url', '') == vuln_key[1] and 
+                        v.get('parameter', '') == vuln_key[2]):
+                        # Update existing entry instead of adding duplicate
+                        v.update(vuln)
+                        already_exists = True
+                        logging.info(f"Gray zone finding already exists, updated: {vuln.get('type')} - Probability: {gray_zone_entry.get('probability_score', 0)}%")
+                        break
+                
+                if not already_exists:
+                    # Add to reporting engine vulnerabilities list
+                    self.scanner.reporting_engine.vulnerabilities.append(vuln)
+                    logging.info(f"Gray zone finding added to reporting: {vuln.get('type')} - Probability: {gray_zone_entry.get('probability_score', 0)}%")
                 
                 # Emit finding signal for GUI display
                 if hasattr(self.scanner.reporting_engine, 'add_finding'):
                     self.scanner.reporting_engine.add_finding(vuln)
                 
-                logging.info(f"Gray zone finding added to reporting: {vuln.get('type')} - Probability: {gray_zone_entry.get('probability_score', 0)}%")
         except Exception as e:
             logging.error(f"Failed to add gray zone finding to reporting: {e}")
     
@@ -17706,8 +17759,21 @@ class SurgicalModeOrchestrator:
                     # Already processed by _add_gray_zone_to_reporting
                     continue
                 
-                # Add to reporting engine vulnerabilities list
-                self.scanner.reporting_engine.vulnerabilities.append(finding)
+                # Check for duplicates before adding
+                vuln_key = (finding.get('type', ''), finding.get('url', ''), finding.get('parameter', ''))
+                already_exists = False
+                for v in self.scanner.reporting_engine.vulnerabilities:
+                    if (v.get('type', '') == vuln_key[0] and 
+                        v.get('url', '') == vuln_key[1] and 
+                        v.get('parameter', '') == vuln_key[2]):
+                        # Update existing entry instead of adding duplicate
+                        v.update(finding)
+                        already_exists = True
+                        break
+                
+                if not already_exists:
+                    # Add to reporting engine vulnerabilities list
+                    self.scanner.reporting_engine.vulnerabilities.append(finding)
                 
                 # Emit finding signal for GUI display
                 if hasattr(self.scanner.reporting_engine, 'add_finding'):
@@ -20974,7 +21040,8 @@ class SessionManager:
         if session_manager and session_id and method.upper() == 'POST':
             # Extract CSRF tokens from the page before submitting POST
             try:
-                get_resp = await self.async_session.request('GET', url, allow_redirects=False)
+                get_resp = await self.async_session.request('GET', url, allow_redirects=False, 
+                    timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT, connect=DEFAULT_CONNECT_TIMEOUT, sock_read=DEFAULT_SOCK_READ_TIMEOUT))
                 if get_resp and get_resp.status == 200:
                     html = await get_resp.text()
                     session_manager.extract_csrf_tokens_from_html(session_id, url, html)
@@ -21024,6 +21091,8 @@ class SessionManager:
         if data: kwargs['data'] = data
         if json_data: kwargs['json'] = json_data
         if cookies: kwargs['cookies'] = cookies
+        # Add timeout for slow/unresponsive servers
+        kwargs['timeout'] = ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT, connect=DEFAULT_CONNECT_TIMEOUT, sock_read=DEFAULT_SOCK_READ_TIMEOUT)
         
         # Proxy handling - AsyncSession now handles proxy pool internally
         # Only use legacy proxy_rotator if proxy_pool is not available
@@ -21072,6 +21141,17 @@ class SessionManager:
                         logging.debug(f"Failed to cache response: {cache_error}")
                 
                 return resp
+            except asyncio.TimeoutError as e:
+                logging.warning(f"Timeout error {url} (attempt {attempt + 1}/{self.circuit_breaker.max_retries}): {e}")
+                if attempt < self.circuit_breaker.max_retries - 1:
+                    backoff_delay = self.circuit_breaker.get_backoff_delay(attempt)
+                    logging.info(f"Retrying in {backoff_delay}s due to timeout...")
+                    await asyncio.sleep(backoff_delay)
+                else:
+                    self.circuit_breaker.record_failure()
+                    if proxy:
+                        self.proxy_rotator.mark_failed(proxy)
+                    logging.error(f"Max retries reached for {url} due to timeout")
             except Exception as e:
                 logging.warning(f"Fetch error {url} (attempt {attempt + 1}/{self.circuit_breaker.max_retries}): {e}")
                 if attempt < self.circuit_breaker.max_retries - 1:
@@ -21233,11 +21313,12 @@ class OOBManager:
 # REPORTING ENGINE
 # ---------------------------------------------------------------------
 class ReportingEngine:
-    def __init__(self, config, signals, session_manager=None, cve_template_engine=None):
+    def __init__(self, config, signals, session_manager=None, cve_template_engine=None, fp_db=None):
         self.config = config
         self.signals = signals
         self.vulnerabilities = []
-        self.fp_db = FP_Database(config=config)
+        # Use shared FP_Database instance if provided, otherwise create new one
+        self.fp_db = fp_db if fp_db is not None else FP_Database(config=config)
         self.session_manager = session_manager
         self.cve_template_engine = cve_template_engine
     def log(self, msg):
@@ -21851,7 +21932,7 @@ class HeuristicRegressionOracle:
 # INJECTION ENGINE
 # ---------------------------------------------------------------------
 class InjectionEngine:
-    def __init__(self, config, crawler_engine, session_manager, reporting_engine, oob_manager, scanner, signals=None):
+    def __init__(self, config, crawler_engine, session_manager, reporting_engine, oob_manager, scanner, signals=None, fp_db=None):
         print("InjectionEngine.__init__ started")
         self.config = config
         self.crawler_engine = crawler_engine
@@ -21953,13 +22034,9 @@ class InjectionEngine:
         self.fsm_aware_testing_enabled = getattr(scanner, 'fsm_aware_testing_enabled', True)
         self.spa_route_discovery_enabled = getattr(scanner, 'spa_route_discovery_enabled', True)
         
-        # Initialize false positive database
-        try:
-            self.fp_db = FP_Database(config=config)
-            print("FP_Database initialized successfully in InjectionEngine")
-        except Exception as e:
-            print(f"Error initializing FP_Database in InjectionEngine: {e}")
-            self.fp_db = None
+        # Use shared FP_Database instance if provided, otherwise create new one
+        self.fp_db = fp_db if fp_db is not None else FP_Database(config=config)
+        print(f"FP_Database initialized successfully in InjectionEngine (shared: {fp_db is not None})")
         
         # Initialize Heuristic Regression Oracle for false positive reduction
         try:
@@ -22189,7 +22266,7 @@ class InjectionEngine:
         self.total_tasks = param_count
         for i, param in enumerate(self.crawler_engine.parameters):
             task = asyncio.ensure_future(self._test_param(param))
-            task.add_done_callback(lambda t: logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None)
+            task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None))
             tasks.append(task)
             self.current_task = i + 1
             self.update_progress(self.current_task, self.total_tasks)
@@ -22198,7 +22275,7 @@ class InjectionEngine:
             if hasattr(self.signals, 'endpoint_progress'):
                 self.signals.endpoint_progress.emit(param['url'], "In Progress", self.current_task, self.total_tasks)
         
-        done, pending = await safe_async_wait(tasks, timeout=300, return_when=asyncio.ALL_COMPLETED)
+        done, pending = await safe_async_wait(tasks, timeout=600, return_when=asyncio.ALL_COMPLETED)
         
         # Mark all parameters as completed in endpoint progress
         if hasattr(self.signals, 'endpoint_progress'):
@@ -22325,7 +22402,7 @@ class InjectionEngine:
                     'elapsed': elapsed
                 })
         tasks = [baseline_for(p) for p in self.crawler_engine.parameters]
-        done, pending = await safe_async_wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+        done, pending = await safe_async_wait(tasks, timeout=240, return_when=asyncio.ALL_COMPLETED)
         if pending:
             for task in pending:
                 task.cancel()
@@ -25130,7 +25207,7 @@ class InjectionEngine:
                     logging.info(f"[TOKEN VALIDATION] Email changed to {new_email} during OTP window")
                     return True
                 return False
-            done, pending = await safe_async_wait([brute_force_otp(), change_email_race()], timeout=60, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait([brute_force_otp(), change_email_race()], timeout=120, return_when=asyncio.ALL_COMPLETED)
             if pending:
                 for task in pending:
                     task.cancel()
@@ -25420,7 +25497,7 @@ class InjectionEngine:
             # Use sequential request IDs but share the same cart_id via session state
             request_ids = [f"req_{i}" for i in range(50)]
             tasks = [single_purchase(rid) for rid in request_ids]
-            done, pending = await safe_async_wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait(tasks, timeout=240, return_when=asyncio.ALL_COMPLETED)
             if pending:
                 for task in pending:
                     task.cancel()
@@ -25782,7 +25859,7 @@ class InjectionEngine:
             # Send 10 concurrent requests with same auth code
             request_ids = [f"token_req_{i}" for i in range(10)]
             tasks = [token_request(rid) for rid in request_ids]
-            done, pending = await safe_async_wait(tasks, timeout=60, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
             
             if pending:
                 for task in pending:
@@ -26296,7 +26373,7 @@ class InjectionEngine:
             # Race between different shipping methods
             shipping_methods = ['standard', 'express', 'overnight']
             tasks = [initiate_checkout_with_race(method) for method in shipping_methods]
-            done, pending = await safe_async_wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait(tasks, timeout=60, return_when=asyncio.ALL_COMPLETED)
             
             if pending:
                 for task in pending:
@@ -26368,7 +26445,7 @@ class InjectionEngine:
             ]
             
             tasks = [cart_operation(op, qty) for op, qty in operations]
-            done, pending = await safe_async_wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait(tasks, timeout=60, return_when=asyncio.ALL_COMPLETED)
             
             if pending:
                 for task in pending:
@@ -26468,7 +26545,7 @@ class InjectionEngine:
             
             # Apply coupons concurrently
             tasks = [apply_coupon(coupon) for coupon in coupons]
-            done, pending = await safe_async_wait(tasks, timeout=30, return_when=asyncio.ALL_COMPLETED)
+            done, pending = await safe_async_wait(tasks, timeout=60, return_when=asyncio.ALL_COMPLETED)
             
             if pending:
                 for task in pending:
@@ -26849,7 +26926,7 @@ class InjectionEngine:
         try:
             # Test 1: GET request with Origin header (main resource access)
             headers = {"Origin": test_origin}
-            async with self.session_manager.async_session.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with self.session_manager.async_session.session.get(url, headers=headers, timeout=ClientTimeout(total=5)) as resp:
                 acao = resp.headers.get("Access-Control-Allow-Origin", "")
                 vary_header = resp.headers.get("Vary", "")
                 
@@ -26896,7 +26973,7 @@ class InjectionEngine:
                     "Access-Control-Request-Method": "GET",
                     "Access-Control-Request-Headers": "Authorization, Content-Type"
                 }
-                async with self.session_manager.async_session.session.options(url, headers=options_headers, timeout=aiohttp.ClientTimeout(total=5)) as options_resp:
+                async with self.session_manager.async_session.session.options(url, headers=options_headers, timeout=ClientTimeout(total=5)) as options_resp:
                     acao_options = options_resp.headers.get("Access-Control-Allow-Origin", "")
                     acac_options = options_resp.headers.get("Access-Control-Allow-Credentials", "")
                     
@@ -28574,13 +28651,21 @@ class OmegaDAST:
         self.cve_template_engine = CVETemplateEngine(template_directory)
         print("CVETemplateEngine created successfully")
         
+        print("Creating FP_Database (shared instance)...")
+        try:
+            self.fp_db = FP_Database(config=config)
+            print("FP_Database initialized successfully in OmegaDAST")
+        except Exception as e:
+            print(f"Error initializing FP_Database in OmegaDAST: {e}")
+            self.fp_db = None
+        
         print("Creating ReportingEngine...")
-        self.reporting_engine = ReportingEngine(config, signals, self.session_manager, cve_template_engine=self.cve_template_engine)
+        self.reporting_engine = ReportingEngine(config, signals, self.session_manager, cve_template_engine=self.cve_template_engine, fp_db=self.fp_db)
         print("Creating OOBManager...")
         self.oob_manager = OOBManager(config, self.public_ip)
         print("Creating InjectionEngine...")
         self.injection_engine = InjectionEngine(
-            config, self.crawler_engine, self.session_manager, self.reporting_engine, self.oob_manager, self, signals
+            config, self.crawler_engine, self.session_manager, self.reporting_engine, self.oob_manager, self, signals, fp_db=self.fp_db
         )
         print("InjectionEngine created successfully")
         
@@ -28615,12 +28700,6 @@ class OmegaDAST:
         self.validation_tasks = set()
         self.memory_efficient = config.get('memory_efficient', True)
         self.vulnerability_timestamps = {}
-        try:
-            self.fp_db = FP_Database(config=config)
-            print("FP_Database initialized successfully in OmegaDAST")
-        except Exception as e:
-            print(f"Error initializing FP_Database in OmegaDAST: {e}")
-            self.fp_db = None
         self.validation_enabled = config.get('validation_enabled', DEFAULT_VALIDATION_ENABLED)
         self.validation_engine = None
         self.selenium_driver = None
@@ -28804,13 +28883,20 @@ class OmegaDAST:
         
         # Confidence decay on duplicates: Check for duplicate vulnerabilities
         if self.fp_db:
-            is_duplicate, adjusted_confidence = await self.fp_db.check_duplicate_and_decay(vuln)
+            is_duplicate, adjusted_confidence, should_report, duplicate_info = await self.fp_db.check_duplicate_and_decay(vuln)
         else:
-            is_duplicate, adjusted_confidence = False, vuln.get('confidence', 50)
+            is_duplicate, adjusted_confidence, should_report, duplicate_info = False, vuln.get('confidence', 50), True, None
         if is_duplicate:
             vuln['confidence'] = adjusted_confidence
             vuln['is_duplicate'] = True
             vuln['duplicate_decay_applied'] = True
+            if duplicate_info:
+                vuln['duplicate_info'] = duplicate_info
+            
+            # If should_report is False, don't add this finding to the report
+            if not should_report:
+                self.log(f"[DUPLICATE] Aggregated duplicate {vuln['type']} on {vuln['url']} (total: {duplicate_info['total_count']} occurrences)")
+                return
         
         conf = vuln.get('confidence', 0)
         if conf < self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
@@ -28872,9 +28958,9 @@ class OmegaDAST:
         self.add_finding(vuln)
         if vuln.get('severity') in ('Critical','High'):
             slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
-            slack_task.add_done_callback(lambda t: logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None)
+            slack_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None))
             jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
-            jira_task.add_done_callback(lambda t: logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None)
+            jira_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None))
     
     async def send_jira_alert(self, vuln):
         jira_url = self.config.get('jira_webhook')
@@ -28922,22 +29008,39 @@ class OmegaDAST:
             validation_status = validated_vuln.get('validation_results', {}).get('validation_status', 'unknown')
             final_confidence = validated_vuln.get('confidence', vuln.get('confidence', 0))
             
-            # Update existing vulnerability entry with validation results
+            # Update existing vulnerability entry with validation results (merge, don't overwrite)
+            v_to_remove = None
             for v in self.reporting_engine.vulnerabilities:
                 if (v['type'] == vuln['type'] and
                     v['url'] == vuln['url'] and
                     v.get('parameter') == vuln.get('parameter')):
-                    v.update(validated_vuln)
+                    # Merge validation results while preserving original exploitation data
+                    # Only update validation-specific fields, not exploitation data
+                    if 'validation_results' in validated_vuln:
+                        v['validation_results'] = validated_vuln['validation_results']
+                    if 'confidence' in validated_vuln:
+                        v['confidence'] = validated_vuln['confidence']
+                    if 'validated' in validated_vuln:
+                        v['validated'] = validated_vuln['validated']
                     v['validation_pending'] = False
+                    
+                    # Store reference for potential removal if confidence drops below threshold
+                    v_to_remove = v
                     break
             
             self.log(f"[VALIDATION COMPLETE] {vuln['type']} - Status: {validation_status}, Final Confidence: {final_confidence}%")
             
+            # Remove finding if validation status is false_positive or confidence dropped below threshold
+            confidence_threshold = self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)
+            if validation_status == 'false_positive' or final_confidence < confidence_threshold:
+                if v_to_remove:
+                    self.reporting_engine.vulnerabilities.remove(v_to_remove)
+                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed due to low confidence ({final_confidence}% < {confidence_threshold}%) or false positive")
+                return
+            
             # Only push verified findings to GUI and export if validation succeeded
             if validation_status in ['confirmed', 'verified_by_proximity', 'likely']:
                 self.add_finding(validated_vuln)
-            elif validation_status == 'false_positive':
-                self.log(f"[FALSE POSITIVE DETECTED] {vuln['type']} at {vuln['url']} - marked for review")
             elif validation_status == 'skipped_circuit_breaker':
                 self.log(f"[CIRCUIT BREAKER] {vuln['type']} at {vuln['url']} - skipped due to rate limiting")
         except Exception as e:
@@ -28967,7 +29070,18 @@ class OmegaDAST:
                 if (v.get('type', '') == vuln_key[0] and 
                     v.get('url', '') == vuln_key[1] and 
                     v.get('parameter', '') == vuln_key[2]):
-                    v.update(vuln)
+                    # Merge data intelligently - preserve original exploitation data
+                    # but update validation results and confidence
+                    if 'validation_results' in vuln:
+                        v['validation_results'] = vuln['validation_results']
+                    if 'confidence' in vuln:
+                        v['confidence'] = vuln['confidence']
+                    if 'validated' in vuln:
+                        v['validated'] = vuln['validated']
+                    # Only update other fields if they don't exist in the original
+                    for key, value in vuln.items():
+                        if key not in v:
+                            v[key] = value
                     updated = True
                     break
             
@@ -29327,7 +29441,7 @@ class OmegaDAST:
             
             async with aiohttp.ClientSession(headers=headers) as session:
                 try:
-                    async with session.get(self.target, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(self.target, timeout=ClientTimeout(total=10)) as response:
                         response_headers = dict(response.headers)
                         
                         # Analyze Server header
@@ -29741,7 +29855,7 @@ class OmegaDAST:
         try:
             # Test 1: GET request with Origin header (main resource access)
             headers = {"Origin": test_origin}
-            async with self.session_manager.async_session.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with self.session_manager.async_session.session.get(url, headers=headers, timeout=ClientTimeout(total=5)) as resp:
                 acao = resp.headers.get("Access-Control-Allow-Origin", "")
                 vary_header = resp.headers.get("Vary", "")
                 
@@ -29788,7 +29902,7 @@ class OmegaDAST:
                     "Access-Control-Request-Method": "GET",
                     "Access-Control-Request-Headers": "Authorization, Content-Type"
                 }
-                async with self.session_manager.async_session.session.options(url, headers=options_headers, timeout=aiohttp.ClientTimeout(total=5)) as options_resp:
+                async with self.session_manager.async_session.session.options(url, headers=options_headers, timeout=ClientTimeout(total=5)) as options_resp:
                     acao_options = options_resp.headers.get("Access-Control-Allow-Origin", "")
                     acac_options = options_resp.headers.get("Access-Control-Allow-Credentials", "")
                     
@@ -32736,7 +32850,7 @@ class OmegaDAST:
                 method,
                 url,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=ClientTimeout(total=10)
             ) as response:
                 text = await response.text()
                 return {
@@ -32893,7 +33007,7 @@ class OmegaDAST:
                 url,
                 json=data,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=ClientTimeout(total=10)
             ) as response:
                 text = await response.text()
                 return {
@@ -33268,13 +33382,20 @@ class GraphQLSelfReferencingFragmentGenerator:
         
         # Confidence decay on duplicates: Check for duplicate vulnerabilities
         if self.fp_db:
-            is_duplicate, adjusted_confidence = await self.fp_db.check_duplicate_and_decay(vuln)
+            is_duplicate, adjusted_confidence, should_report, duplicate_info = await self.fp_db.check_duplicate_and_decay(vuln)
         else:
-            is_duplicate, adjusted_confidence = False, vuln.get('confidence', 50)
+            is_duplicate, adjusted_confidence, should_report, duplicate_info = False, vuln.get('confidence', 50), True, None
         if is_duplicate:
             vuln['confidence'] = adjusted_confidence
             vuln['is_duplicate'] = True
             vuln['duplicate_decay_applied'] = True
+            if duplicate_info:
+                vuln['duplicate_info'] = duplicate_info
+            
+            # If should_report is False, don't add this finding to the report
+            if not should_report:
+                self.log(f"[DUPLICATE] Aggregated duplicate {vuln['type']} on {vuln['url']} (total: {duplicate_info['total_count']} occurrences)")
+                return
         
         conf = vuln.get('confidence', 0)
         if conf < self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
@@ -33336,9 +33457,9 @@ class GraphQLSelfReferencingFragmentGenerator:
         self.add_finding(vuln)
         if vuln.get('severity') in ('Critical','High'):
             slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
-            slack_task.add_done_callback(lambda t: logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None)
+            slack_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None))
             jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
-            jira_task.add_done_callback(lambda t: logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None)
+            jira_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"JIRA alert failed: {t.exception()}") if t.exception() else None))
     async def _validate_vulnerability(self, vuln):
         try:
             if not self.validation_engine:
@@ -33346,10 +33467,38 @@ class GraphQLSelfReferencingFragmentGenerator:
             self.log(f"[VALIDATION] Starting 3x validation for {vuln['type']} at {vuln['url']}")
             validated_vuln = await self.validation_engine.validate_finding(vuln)
             validation_status = validated_vuln.get('validation_results', {}).get('validation_status', 'unknown')
+            
+            # Update existing vulnerability entry with validation results (merge, don't overwrite)
+            v_to_remove = None
+            for v in self.reporting_engine.vulnerabilities:
+                if (v['type'] == vuln['type'] and
+                    v['url'] == vuln['url'] and
+                    v.get('parameter') == vuln.get('parameter')):
+                    # Merge validation results while preserving original exploitation data
+                    if 'validation_results' in validated_vuln:
+                        v['validation_results'] = validated_vuln['validation_results']
+                    if 'confidence' in validated_vuln:
+                        v['confidence'] = validated_vuln['confidence']
+                    if 'validated' in validated_vuln:
+                        v['validated'] = validated_vuln['validated']
+                    v['validation_pending'] = False
+                    
+                    # Store reference for potential removal if confidence drops below threshold
+                    v_to_remove = v
+                    break
+            
+            final_confidence = validated_vuln.get('confidence', vuln.get('confidence', 0))
+            
+            # Remove finding if validation status is false_positive or confidence dropped below threshold
+            confidence_threshold = self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)
+            if validation_status == 'false_positive' or final_confidence < confidence_threshold:
+                if v_to_remove:
+                    self.reporting_engine.vulnerabilities.remove(v_to_remove)
+                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed due to low confidence ({final_confidence}% < {confidence_threshold}%) or false positive")
+                return
+            
             if validation_status == 'confirmed':
                 self.log(f"[VALIDATION CONFIRMED] {vuln['type']} at {vuln['url']}")
-            elif validation_status == 'false_positive':
-                self.log(f"[VALIDATION REJECTED] False positive: {vuln['type']} at {vuln['url']}")
         except Exception as e:
             logging.error(f"Validation error for {vuln.get('type', 'unknown')}: {e}")
     def dns_bruteforce(self, domain, wordlist=None):
@@ -33438,7 +33587,7 @@ class GraphQLSelfReferencingFragmentGenerator:
             full_domain = f"{sub}.{domain}"
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://{full_domain}", timeout=aiohttp.ClientTimeout(total=3)) as response:
+                    async with session.get(f"http://{full_domain}", timeout=ClientTimeout(total=3)) as response:
                         if response.status not in (404, 403, 502, 503):
                             return full_domain
             except Exception:
@@ -34225,7 +34374,7 @@ class SubdomainDiscovery:
             async with aiohttp.ClientSession() as session:
                 for ct_url in ct_urls:
                     try:
-                        async with session.get(ct_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        async with session.get(ct_url, timeout=ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 
@@ -34393,7 +34542,7 @@ class SubdomainDiscovery:
             full_domain = f"{sub}.{domain}"
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://{full_domain}", timeout=aiohttp.ClientTimeout(total=3)) as response:
+                    async with session.get(f"http://{full_domain}", timeout=ClientTimeout(total=3)) as response:
                         if response.status not in (404, 403, 502, 503):
                             return full_domain
             except Exception:
@@ -34455,7 +34604,7 @@ class SubdomainDiscovery:
                 # First crawl main pages
                 for url in urls:
                     try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        async with session.get(url, timeout=ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 text = await resp.text()
                                 soup = get_cached_soup(text, 'html.parser')
@@ -34493,7 +34642,7 @@ class SubdomainDiscovery:
                 # Then try additional endpoints
                 for url in additional_endpoints:
                     try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        async with session.get(url, timeout=ClientTimeout(total=5)) as resp:
                             if resp.status == 200:
                                 text = await resp.text()
                                 
@@ -36270,6 +36419,7 @@ class ScannerWorker(QThread):
     finished = pyqtSignal(dict)
     progress = pyqtSignal(int, int)
     endpoint_progress = pyqtSignal(str, str, int, int)  # url, status, current_task, total_tasks
+    scanner_ready = pyqtSignal(object)  # Signal to pass scanner instance (for FP_Database sharing)
 
     def __init__(self, target, config):
         QThread.__init__(self)
@@ -36286,6 +36436,8 @@ class ScannerWorker(QThread):
             self.log.emit("Creating OmegaDAST scanner...")
             self.scanner = OmegaDAST(self.target, self.config, self, loop=self.loop)
             self.log.emit("OmegaDAST created successfully, starting scan...")
+            # Emit scanner_ready signal to allow GUI to access shared FP_Database
+            self.scanner_ready.emit(self.scanner)
             self.loop.run_until_complete(self.scanner.scan())
             
             # Collect safety statistics from injection engine
@@ -37174,7 +37326,7 @@ class ProxyTab(QWidget):
             
             async def detect():
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(target_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    async with session.get(target_url, timeout=ClientTimeout(total=10)) as resp:
                         headers = dict(resp.headers)
                         html_content = await resp.text()
                         cookies = resp.cookies
@@ -37493,7 +37645,7 @@ class RepeaterTab(QWidget):
                 async def extract_csrf_tokens(session, url):
                     """Extract CSRF tokens from the page before POST request"""
                     try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        async with session.get(url, timeout=ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 html = await resp.text()
                                 soup = get_cached_soup(html, 'html.parser')
@@ -37539,37 +37691,37 @@ class RepeaterTab(QWidget):
                         raw_request = self.build_raw_request(method, url, headers, body)
                         
                         if method == "GET":
-                            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.get(url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "POST":
-                            async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.post(url, headers=headers, json=body, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "PUT":
-                            async with session.put(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.put(url, headers=headers, json=body, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "DELETE":
-                            async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.delete(url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "PATCH":
-                            async with session.patch(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.patch(url, headers=headers, json=body, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "HEAD":
-                            async with session.head(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.head(url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
                                 text = ""
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
                         elif method == "OPTIONS":
-                            async with session.options(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.options(url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
                                 text = await resp.text()
                                 status = resp.status
                                 resp_headers = dict(resp.headers)
@@ -38047,7 +38199,8 @@ class ScanTab(QWidget):
         layout.addWidget(main_splitter)
         
         self.worker = None
-        self.fp_db = FP_Database(config={})
+        # FP_Database will be provided by the scanner when it starts
+        self.fp_db = None
         self.total_tasks = 0
         self.current_task = 0
     
@@ -38194,6 +38347,7 @@ class ScanTab(QWidget):
         self.worker.progress.connect(self.update_progress)
         self.worker.status.connect(self.update_status)
         self.worker.endpoint_progress.connect(self.update_endpoint_progress)
+        self.worker.scanner_ready.connect(self.on_scanner_ready)
         self.worker.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -38217,6 +38371,12 @@ class ScanTab(QWidget):
             self.log_area.append("[SAFETY] AUTO-RESUME MODE: Will automatically resume from most recent checkpoint")
         if not dry_run:
             self.log_area.append("[SAFETY] LIVE MODE: Payloads will be sent to target")
+    
+    def on_scanner_ready(self, scanner):
+        """Called when scanner is ready - set shared FP_Database for GUI context menu"""
+        if hasattr(scanner, 'fp_db'):
+            self.fp_db = scanner.fp_db
+            self.log_area.append("[FP_DATABASE] Using shared FP_Database from scanner")
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
@@ -38279,9 +38439,18 @@ class ScanTab(QWidget):
             action = menu.exec_(self.findings_table.mapToGlobal(pos))
             if action == mark_fp_action:
                 if self.fp_db:
-                    self.fp_db.record_fp(vuln)
-                    self.log_area.append(f"[FP] Marked {vuln['type']} at {vuln['url']} as false positive")
-                    self.findings_table.removeRow(pos.row())
+                    # Mark as false positive with parameter-specific suppression enabled
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(self.fp_db.record_fp(vuln, mark_parameter=True))
+                        self.log_area.append(f"[FP] Marked {vuln['type']} at {vuln['url']} as false positive (parameter suppression enabled)")
+                        self.findings_table.removeRow(pos.row())
+                    except Exception as e:
+                        self.log_area.append(f"[ERROR] Failed to mark FP: {e}")
+                    finally:
+                        loop.close()
                 else:
                     self.log_area.append("[ERROR] FP database not available")
             elif action == show_remediation_action:
@@ -38458,7 +38627,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v17.5 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.6 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -39541,7 +39710,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v17.5']
+                        ['Tool Version', 'UltraDAST v17.6']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -39652,7 +39821,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v17.5",
+                            "tool": "UltraDAST v17.6",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -39934,7 +40103,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v17.5 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.6 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -40282,7 +40451,7 @@ class GeneticFuzzer:
                 self.target_url, 
                 data=data,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=ClientTimeout(total=10)
             ) as response:
                 text = await response.text()
                 status = response.status
@@ -40701,7 +40870,7 @@ class SchemaInferenceEngine:
                 url,
                 json=data,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=ClientTimeout(total=10)
             ) as response:
                 text = await response.text()
                 return {
@@ -41672,7 +41841,7 @@ class RequestTemplateFuzzer:
                 url,
                 json=data,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=ClientTimeout(total=10)
             ) as response:
                 text = await response.text()
                 return {
@@ -41930,7 +42099,7 @@ class RequestTemplateFuzzer:
                     headers=headers,
                     data=data,
                     json=json_data,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=ClientTimeout(total=10)
                 ) as response:
                     text = await response.text()
                     
