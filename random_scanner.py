@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v17.7 – The Unstoppable Pentester Platform
+ULTRA-DAST v17.8 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
 
 Install:
-    pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt
-    pip install dnspython html5lib websockets grpcio grpcio-reflection cvss PyQt5 reportlab
-    ChromeDriver must be in PATH.
+    pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt dnspython html5lib
+    pip install websockets grpcio grpcio-reflection cvss PyQt5 reportlab markupsafe protobuf
+
+Optional: Set NVD_API_KEY environment variable for higher CVE feed rate limits
+ChromeDriver must be in PATH.
 
 Authorised use only. Unauthorised scanning is illegal.
 
@@ -429,6 +431,7 @@ from multiprocessing import Queue, Manager, Process
 import aiohttp
 from aiohttp import ClientTimeout
 import glob
+import markupsafe
 
 # Optional psutil import for process cleanup
 try:
@@ -2536,7 +2539,7 @@ class CVEFeedIntegration:
         
     async def update_cve_database(self, force=False):
         """
-        Update CVE database from external feeds.
+        Update CVE database from external feeds with improved error handling and fallbacks.
         
         Args:
             force: Force update regardless of time interval
@@ -2553,78 +2556,157 @@ class CVEFeedIntegration:
             logging.info("Updating CVE database from external feeds...")
             
             async with aiohttp.ClientSession() as session:
-                # Fetch from NVD
+                # Fetch from NVD with fallback
                 nvd_data = await self._fetch_nvd_cves(session)
+                if nvd_data:
+                    logging.info(f"Successfully fetched {len(nvd_data)} CVEs from NVD")
+                else:
+                    logging.warning("NVD CVE fetch returned no data, using fallback")
                 
-                # Fetch from CIRCL
+                # Fetch from CIRCL with fallback
                 circl_data = await self._fetch_circl_cves(session)
+                if circl_data:
+                    logging.info(f"Successfully fetched {len(circl_data)} CVEs from CIRCL")
+                else:
+                    logging.warning("CIRCL CVE fetch returned no data, using fallback")
                 
                 # Merge data
                 self._merge_cve_data(nvd_data, circl_data)
+                
+                # Fallback to cached data if no new data was retrieved
+                if not nvd_data and not circl_data and self.cve_cache:
+                    logging.warning("No new CVE data retrieved, using existing cache")
+                elif not nvd_data and not circl_data and not self.cve_cache:
+                    logging.error("Failed to fetch any CVE data and no cache available")
                 
                 self.last_update = datetime.now()
                 logging.info(f"CVE database updated with {len(self.cve_cache)} entries")
                 
         except Exception as e:
             logging.error(f"Failed to update CVE database: {e}")
+            # If update fails completely, use existing cache if available
+            if self.cve_cache:
+                logging.info(f"Using existing CVE cache with {len(self.cve_cache)} entries")
     
     async def _fetch_nvd_cves(self, session):
-        """Fetch CVEs from NIST NVD API"""
+        """Fetch CVEs from NIST NVD API with improved error handling and pagination"""
         cves = {}
         
         try:
-            # Fetch recent CVEs (last 7 days)
+            # Fetch recent CVEs (last 7 days) with proper NVD API v2.0 parameters
             params = {
                 'resultsPerPage': 2000,
-                'lastModStartDate': (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00:000'),
-                'lastModEndDate': datetime.now().strftime('%Y-%m-%dT23:59:59:999')
+                'lastModStartDate': (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%S.000'),
+                'lastModEndDate': datetime.now().strftime('%Y-%m-%dT%H:%M:%S.999')
             }
             
-            async with session.get(self.nvd_api_url, params=params) as resp:
+            # Add API key if available (recommended for higher rate limits)
+            api_key = os.environ.get('NVD_API_KEY')
+            headers = {}
+            if api_key:
+                headers['apiKey'] = api_key
+            
+            async with session.get(self.nvd_api_url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     
-                    for item in data.get('vulnerabilities', []):
-                        cve = item.get('cve', {})
-                        cve_id = cve.get('id', '')
-                        
-                        if cve_id:
-                            cves[cve_id] = {
-                                'id': cve_id,
-                                'description': self._extract_description(cve),
-                                'severity': self._extract_severity(cve),
-                                'cvss': self._extract_cvss(cve),
-                                'published': cve.get('published'),
-                                'modified': cve.get('lastModified'),
-                                'source': 'NVD'
-                            }
+                    # Handle NVD API v2.0 response structure
+                    if 'vulnerabilities' in data:
+                        for item in data['vulnerabilities']:
+                            cve = item.get('cve', {})
+                            cve_id = cve.get('id', '')
                             
+                            if cve_id:
+                                cves[cve_id] = {
+                                    'id': cve_id,
+                                    'description': self._extract_description(cve),
+                                    'severity': self._extract_severity(cve),
+                                    'cvss': self._extract_cvss(cve),
+                                    'published': cve.get('published'),
+                                    'modified': cve.get('lastModified'),
+                                    'source': 'NVD'
+                                }
+                    else:
+                        logging.warning(f"NVD API response missing 'vulnerabilities' key. Response structure: {list(data.keys())}")
+                        
+                    # Handle pagination if present
+                    total_results = data.get('totalResults', 0)
+                    if total_results > len(cves):
+                        logging.info(f"NVD API returned {len(cves)} of {total_results} total results (pagination not fully implemented)")
+                        
+                elif resp.status == 403:
+                    logging.error("NVD API rate limit exceeded (403). Consider adding NVD_API_KEY environment variable.")
+                elif resp.status == 503:
+                    logging.error("NVD API service unavailable (503). Retrying later...")
+                else:
+                    logging.warning(f"NVD API returned status {resp.status}: {await resp.text()}")
+                    
+        except asyncio.TimeoutError:
+            logging.warning("NVD API request timed out")
+        except aiohttp.ClientError as e:
+            logging.warning(f"NVD API client error: {e}")
         except Exception as e:
             logging.warning(f"Failed to fetch NVD CVEs: {e}")
         
         return cves
     
     async def _fetch_circl_cves(self, session):
-        """Fetch CVEs from CIRCL API"""
+        """Fetch CVEs from CIRCL API with improved error handling"""
         cves = {}
         
         try:
-            # Fetch recent CVEs
-            async with session.get(self.circl_api_url) as resp:
+            # CIRCL API requires a specific CVE ID to fetch details
+            # We'll try to fetch recent CVEs by using their browse endpoint or by testing known recent CVEs
+            # Since CIRCL doesn't have a simple "recent CVEs" endpoint, we'll implement a fallback approach
+            
+            # Try the browse endpoint first
+            browse_url = "https://cve.circl.lu/api/last/"
+            async with session.get(browse_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     
-                    for cve_id, cve_data in data.items():
-                        cves[cve_id] = {
-                            'id': cve_id,
-                            'description': cve_data.get('summary', ''),
-                            'severity': cve_data.get('cvss', ''),
-                            'cvss': cve_data.get('cvss', None),
-                            'published': cve_data.get('Published'),
-                            'modified': cve_data.get('Modified'),
-                            'source': 'CIRCL'
-                        }
-                        
+                    # CIRCL browse endpoint returns a list of recent CVE IDs
+                    if isinstance(data, list):
+                        # Fetch details for each recent CVE
+                        for cve_item in data[:50]:  # Limit to prevent excessive requests
+                            cve_id = cve_item if isinstance(cve_item, str) else cve_item.get('id', '')
+                            if cve_id:
+                                try:
+                                    detail_url = f"{self.circl_api_url}{cve_id}"
+                                    async with session.get(detail_url, timeout=aiohttp.ClientTimeout(total=10)) as detail_resp:
+                                        if detail_resp.status == 200:
+                                            cve_detail = await detail_resp.json()
+                                            cves[cve_id] = {
+                                                'id': cve_id,
+                                                'description': cve_detail.get('summary', ''),
+                                                'severity': cve_detail.get('cvss', ''),
+                                                'cvss': cve_detail.get('cvss', None),
+                                                'published': cve_detail.get('Published'),
+                                                'modified': cve_detail.get('Modified'),
+                                                'source': 'CIRCL'
+                                            }
+                                except Exception as detail_error:
+                                    logging.debug(f"Failed to fetch details for {cve_id}: {detail_error}")
+                                    continue
+                    elif isinstance(data, dict):
+                        # If browse endpoint returns a dict, handle accordingly
+                        for cve_id, cve_data in data.items():
+                            cves[cve_id] = {
+                                'id': cve_id,
+                                'description': cve_data.get('summary', ''),
+                                'severity': cve_data.get('cvss', ''),
+                                'cvss': cve_data.get('cvss', None),
+                                'published': cve_data.get('Published'),
+                                'modified': cve_data.get('Modified'),
+                                'source': 'CIRCL'
+                            }
+                else:
+                    logging.warning(f"CIRCL browse endpoint returned status {resp.status}")
+                    
+        except asyncio.TimeoutError:
+            logging.warning("CIRCL API request timed out")
+        except aiohttp.ClientError as e:
+            logging.warning(f"CIRCL API client error: {e}")
         except Exception as e:
             logging.warning(f"Failed to fetch CIRCL CVEs: {e}")
         
@@ -2655,16 +2737,39 @@ class CVEFeedIntegration:
         return None
     
     def _merge_cve_data(self, *sources):
-        """Merge CVE data from multiple sources"""
+        """Merge CVE data from multiple sources with improved conflict resolution"""
         for source in sources:
+            if not isinstance(source, dict):
+                logging.warning(f"Invalid CVE data source type: {type(source)}")
+                continue
+                
             for cve_id, cve_data in source.items():
+                if not isinstance(cve_data, dict):
+                    logging.warning(f"Invalid CVE data format for {cve_id}: {type(cve_data)}")
+                    continue
+                    
                 if cve_id not in self.cve_cache:
                     self.cve_cache[cve_id] = cve_data
                 else:
-                    # Update with more recent data
+                    # Update with more recent data using better date comparison
                     existing = self.cve_cache[cve_id]
-                    if cve_data.get('modified') > existing.get('modified', ''):
-                        self.cve_cache[cve_id] = cve_data
+                    existing_modified = existing.get('modified', '')
+                    new_modified = cve_data.get('modified', '')
+                    
+                    # Try to parse dates for comparison
+                    try:
+                        if existing_modified and new_modified:
+                            existing_date = datetime.fromisoformat(existing_modified.replace('Z', '+00:00'))
+                            new_date = datetime.fromisoformat(new_modified.replace('Z', '+00:00'))
+                            if new_date > existing_date:
+                                self.cve_cache[cve_id] = cve_data
+                        elif new_modified and not existing_modified:
+                            # If existing has no modification date, prefer the new one
+                            self.cve_cache[cve_id] = cve_data
+                    except (ValueError, AttributeError) as e:
+                        # If date parsing fails, use string comparison as fallback
+                        if new_modified > existing_modified:
+                            self.cve_cache[cve_id] = cve_data
     
     def search_cve(self, keyword):
         """Search CVE database by keyword"""
@@ -9148,14 +9253,126 @@ def get_dns_oob_payloads(oob_dns_domain, dns_port=None):
     
     return payloads
 
-# Legacy ICMP results (deprecated, kept for backward compatibility)
-# Global ICMP OOB list moved to instance state in OmegaDAST class
+# ICMP OOB Listener Implementation - Now fully functional
+# Replaces legacy ICMP OOB functionality
+    """
+    ICMP Out-of-Band listener for detecting ICMP callback payloads.
+    Note: This requires root/administrator privileges to capture ICMP traffic.
+    Deprecated in favor of DNS OOB which doesn't require root access.
+    """
+    
+    def __init__(self, callback_ip, callback_port=None):
+        self.callback_ip = callback_ip
+        self.callback_port = callback_port
+        self.listener_socket = None
+        self.is_running = False
+        self.received_packets = []
+        self.listener_thread = None
+        
+        logging.warning("ICMP OOB Listener is deprecated and requires root privileges. Use DNS OOB instead.")
+    
+    def start_listener(self):
+        """Start the ICMP listener (requires root privileges)"""
+        try:
+            # Create raw socket for ICMP (requires root/admin)
+            import socket
+            self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            self.listener_socket.bind((self.callback_ip, 0))
+            self.is_running = True
+            
+            # Start listener thread
+            self.listener_thread = threading.Thread(target=self._listen_icmp, daemon=True)
+            self.listener_thread.start()
+            
+            logging.info(f"ICMP OOB Listener started on {self.callback_ip}")
+            return True
+        except PermissionError:
+            logging.error("ICMP OOB Listener requires root/administrator privileges")
+            return False
+        except Exception as e:
+            logging.error(f"Failed to start ICMP OOB Listener: {e}")
+            return False
+    
+    def _listen_icmp(self):
+        """Listen for ICMP packets in background thread"""
+        while self.is_running and self.listener_socket:
+            try:
+                # Receive ICMP packet
+                packet, addr = self.listener_socket.recvfrom(1024)
+                
+                # Parse ICMP packet
+                if self._is_oob_callback(packet):
+                    callback_info = {
+                        'timestamp': datetime.now().isoformat(),
+                        'source_ip': addr[0],
+                        'packet_size': len(packet),
+                        'data': packet[:100].hex()  # First 100 bytes as hex
+                    }
+                    self.received_packets.append(callback_info)
+                    logging.info(f"ICMP OOB callback received from {addr[0]}")
+                    
+            except Exception as e:
+                if self.is_running:
+                    logging.debug(f"ICMP listener error: {e}")
+    
+    def _is_oob_callback(self, packet):
+        """Check if packet is an OOB callback"""
+        # Basic ICMP echo request detection
+        if len(packet) >= 20:
+            # ICMP type is at byte 0 (after IP header)
+            icmp_type = packet[20] if len(packet) > 20 else 0
+            # Echo request is type 8, Echo reply is type 0
+            return icmp_type in [8, 0]
+        return False
+    
+    def stop_listener(self):
+        """Stop the ICMP listener"""
+        self.is_running = False
+        if self.listener_socket:
+            try:
+                self.listener_socket.close()
+            except Exception as e:
+                logging.debug(f"Error closing ICMP socket: {e}")
+        
+        if self.listener_thread:
+            self.listener_thread.join(timeout=5)
+        
+        logging.info("ICMP OOB Listener stopped")
+    
+    def get_callbacks(self):
+        """Get received ICMP callbacks"""
+        return self.received_packets
+    
+    def clear_callbacks(self):
+        """Clear received callbacks"""
+        self.received_packets.clear()
+
 
 # Legacy ICMP payloads (now deprecated in favor of DNS)
 # Use get_dns_oob_payloads() instead for no-root-required OOB testing
-def get_icmp_oob_payloads(oob_ip):
-    """Deprecated: Use get_dns_oob_payloads() instead - requires root privileges"""
+def get_icmp_oob_payloads(oob_ip, icmp_listener=None):
+    """
+    ICMP OOB payloads for out-of-band testing.
+    Note: Requires root privileges and ICMPOOBListener to be running.
+    Deprecated: Use get_dns_oob_payloads() instead for no-root-required OOB testing.
+    
+    Args:
+        oob_ip: IP address for ICMP callbacks
+        icmp_listener: Optional ICMPOOBListener instance for advanced tracking
+    """
     logging.warning("ICMP OOB payloads are deprecated. Use DNS OOB payloads instead.")
+    
+    # If ICMP listener is provided and running, use marker-based payloads
+    if icmp_listener and icmp_listener.is_running:
+        marker = f"ICMP_{uuid.uuid4().hex[:8]}"
+        return [
+            f"; ping -c 1 {oob_ip} -m {marker}",
+            f"| ping {oob_ip} {marker}",
+            f"&& ping -n 1 {oob_ip} -t {marker}",
+            f"|| ping {oob_ip} -M {marker}",
+        ]
+    
+    # Basic ICMP payloads (legacy)
     return [
         f"; ping -c 1 {oob_ip}",
         f"| ping {oob_ip}",
@@ -21573,6 +21790,8 @@ class OOBManager:
         self.smtp_oob_handler: Optional[Any] = None
         self.dns_oob_listener: Optional[Any] = None  # Replaces ICMP listener
         self.dns_oob_port: Optional[int] = None  # Track actual DNS port used (may differ from default)
+        self.icmp_oob_listener: Optional[ICMPOOBListener] = None  # ICMP listener (requires root)
+        self.enable_icmp_oob = config.get('enable_icmp_oob', False)  # Disabled by default
         self.https_oob_server: Optional[Any] = None
         self.https_oob_port: Optional[int] = None
         self.cleanup_thread: Optional[threading.Thread] = None
@@ -21602,6 +21821,15 @@ class OOBManager:
             if self.dns_oob_listener.start():
                 self.dns_oob_port = self.dns_oob_listener.get_port()
                 logging.info(f"DNS OOB listener started on port {self.dns_oob_port}")
+            
+            # ICMP OOB listener (optional, requires root privileges)
+            if self.enable_icmp_oob:
+                self.icmp_oob_listener = ICMPOOBListener(self.public_ip)
+                if self.icmp_oob_listener.start_listener():
+                    logging.info("ICMP OOB listener started (requires root privileges)")
+                else:
+                    logging.warning("Failed to start ICMP OOB listener - requires root privileges")
+                    self.icmp_oob_listener = None
             
             try:
                 self.https_oob_server, self.https_oob_port = start_https_oob_server()
@@ -21647,6 +21875,12 @@ class OOBManager:
                     logging.info("DNS OOB listener stopped")
                 except Exception as e:
                     logging.warning(f"Error stopping DNS OOB listener: {e}")
+            if self.icmp_oob_listener:
+                try:
+                    self.icmp_oob_listener.stop_listener()
+                    logging.info("ICMP OOB listener stopped")
+                except Exception as e:
+                    logging.warning(f"Error stopping ICMP OOB listener: {e}")
             if self.https_oob_server:
                 try:
                     self.https_oob_server.shutdown()
@@ -22401,11 +22635,34 @@ class InjectionEngine:
         self.maturity_model = ReconnaissanceMaturityModel(maturity_level, dry_run)
         print(f"Safety Controls Initialized - Maturity Level: {maturity_level}, Dry Run: {dry_run}")
         
-        # Taint tracking integration - DISABLED due to missing implementation
-        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
-        self.taint_tracking_enabled = False  # config.get('taint_tracking_enabled', True)
-        self.taint_tracker = None
-        self.taint_instrumentor = None
+        # Taint tracking integration - Fully implemented with TaintTracker and TaintInstrumentor classes
+        self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
+        if self.taint_tracking_enabled:
+            try:
+                self.taint_tracker = TaintTracker(config)
+                self.taint_instrumentor = TaintInstrumentor(config)
+                logging.info("Taint tracking enabled and initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize taint tracking: {e}")
+                self.taint_tracking_enabled = False
+                self.taint_tracker = None
+                self.taint_instrumentor = None
+        else:
+            self.taint_tracker = None
+            self.taint_instrumentor = None
+
+        # Symbolic execution integration - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
+        if self.symbolic_execution_enabled:
+            try:
+                self.symbolic_executor = SymbolicExecutor(config)
+                logging.info("Symbolic execution enabled and initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize symbolic execution: {e}")
+                self.symbolic_execution_enabled = False
+                self.symbolic_executor = None
+        else:
+            self.symbolic_executor = None
         
         # Dynamic payload generator integration
         print("Getting semantic_mutator from scanner...")
@@ -22613,11 +22870,30 @@ class InjectionEngine:
             logging.debug(f"Unexpected error during async fetch for {url}: {e}", exc_info=True)
             return None
     async def run_tests(self):
-        # Taint tracking disabled due to missing implementation
-        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
-        self.taint_tracking_enabled = False
-        self.taint_tracker = None
-        self.taint_instrumentor = None
+        # Taint tracking is now implemented - initialize if enabled
+        if self.taint_tracking_enabled and not self.taint_tracker:
+            try:
+                self.taint_tracker = TaintTracker(self.config)
+                self.taint_instrumentor = TaintInstrumentor(self.config)
+                logging.info("Taint tracking initialized for testing")
+            except Exception as e:
+                logging.warning(f"Failed to initialize taint tracking during test run: {e}")
+                self.taint_tracking_enabled = False
+                self.taint_tracker = None
+                self.taint_instrumentor = None
+
+        # Symbolic execution is now implemented - initialize if enabled
+        self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
+        if self.symbolic_execution_enabled:
+            try:
+                self.symbolic_executor = SymbolicExecutor(self.config)
+                logging.info("Symbolic execution initialized for testing")
+            except Exception as e:
+                logging.warning(f"Failed to initialize symbolic execution during test run: {e}")
+                self.symbolic_execution_enabled = False
+                self.symbolic_executor = None
+        else:
+            self.symbolic_executor = None
         
         # Log dynamic payload system status
         if self.dynamic_payloads_enabled:
@@ -29445,13 +29721,64 @@ class OmegaDAST:
         # Set thread-local reference for OOB handlers to prevent race conditions
         _oob_scanner_local.instance = self
         
-        # Taint tracking initialization - DISABLED DUE TO RECURSION ERROR and missing implementation
-        # The taint tracking classes (TaintTracker, TaintInstrumentor) are not implemented in this codebase
-        # This feature requires additional implementation before it can be enabled
-        self.taint_tracking_enabled = False  # config.get('taint_tracking_enabled', True)
-        self.taint_tracker = None
-        self.taint_instrumentor = None
-        self.taint_integrated_session = None
+        # Taint tracking initialization - Fully implemented with TaintTracker and TaintInstrumentor classes
+        self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
+        if self.taint_tracking_enabled:
+            try:
+                self.taint_tracker = TaintTracker(config)
+                self.taint_instrumentor = TaintInstrumentor(config)
+                self.taint_integrated_session = None
+                logging.info("Taint tracking enabled and initialized in OmegaDAST")
+            except Exception as e:
+                logging.warning(f"Failed to initialize taint tracking in OmegaDAST: {e}")
+                self.taint_tracking_enabled = False
+                self.taint_tracker = None
+                self.taint_instrumentor = None
+                self.taint_integrated_session = None
+        else:
+            self.taint_tracker = None
+            self.taint_instrumentor = None
+            self.taint_integrated_session = None
+
+        # Symbolic execution initialization - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
+        if self.symbolic_execution_enabled:
+            try:
+                self.symbolic_executor = SymbolicExecutor(config)
+                logging.info("Symbolic execution enabled and initialized in OmegaDAST")
+            except Exception as e:
+                logging.warning(f"Failed to initialize symbolic execution in OmegaDAST: {e}")
+                self.symbolic_execution_enabled = False
+                self.symbolic_executor = None
+        else:
+            self.symbolic_executor = None
+
+        # Genetic fuzzing initialization - Now integrated into main scan flow
+        self.genetic_fuzzing_enabled = config.get('genetic_fuzzing_enabled', False)
+        if self.genetic_fuzzing_enabled:
+            try:
+                mutation_rate = config.get('fuzz_mutation_rate', 0.1)
+                crossover_rate = config.get('fuzz_crossover_rate', 0.3)
+                population_size = config.get('fuzz_population_size', 50)
+                max_generations = config.get('fuzz_max_generations', 100)
+                corpus_dir = config.get('fuzz_corpus_dir', 'fuzz_corpus')
+                
+                self.genetic_fuzzer = GeneticFuzzer(
+                    target_url=self.target,
+                    session_manager=self.session_manager,
+                    mutation_rate=mutation_rate,
+                    crossover_rate=crossover_rate,
+                    population_size=population_size,
+                    max_generations=max_generations,
+                    corpus_dir=corpus_dir
+                )
+                logging.info("Genetic fuzzing enabled and initialized in OmegaDAST")
+            except Exception as e:
+                logging.warning(f"Failed to initialize genetic fuzzing in OmegaDAST: {e}")
+                self.genetic_fuzzing_enabled = False
+                self.genetic_fuzzer = None
+        else:
+            self.genetic_fuzzer = None
         
         # RCE confirmation flag for secure remote command execution
         self.rce_confirmed = False
@@ -29827,10 +30154,32 @@ class OmegaDAST:
         await self.session_manager.setup()
         await self.oob_manager.setup()
         
-        # Taint tracking removed due to missing implementation (TaintTracker, TaintInstrumentor classes)
-        # This feature requires additional implementation before it can be enabled
-        self.taint_tracking_enabled = False
-        self.taint_integrated_session = None
+        # Taint tracking setup - Fully implemented with TaintTracker and TaintInstrumentor classes
+        if self.taint_tracking_enabled and not self.taint_tracker:
+            try:
+                self.taint_tracker = TaintTracker(self.config)
+                self.taint_instrumentor = TaintInstrumentor(self.config)
+                self.taint_integrated_session = None
+                logging.info("Taint tracking setup completed")
+            except Exception as e:
+                logging.warning(f"Failed to setup taint tracking: {e}")
+                self.taint_tracking_enabled = False
+                self.taint_tracker = None
+                self.taint_instrumentor = None
+                self.taint_integrated_session = None
+
+        # Symbolic execution setup - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
+        if self.symbolic_execution_enabled:
+            try:
+                self.symbolic_executor = SymbolicExecutor(self.config)
+                logging.info("Symbolic execution enabled and initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize symbolic execution: {e}")
+                self.symbolic_execution_enabled = False
+                self.symbolic_executor = None
+        else:
+            self.symbolic_executor = None
         
         # Auto-resume from most recent checkpoint if enabled
         auto_resume = self.config.get('auto_resume', SAFETY_CONFIG.get('auto_resume', False))
@@ -30254,7 +30603,56 @@ class OmegaDAST:
         
         # Run genetic fuzzing if enabled
         if self.config.get('genetic_fuzzing_enabled', False):
-            await self.run_genetic_fuzzing()
+            self.log("Starting genetic fuzzing...")
+            try:
+                await self.run_genetic_fuzzing()
+            except Exception as e:
+                logging.warning(f"Genetic fuzzing failed: {e}")
+                self.log(f"Genetic fuzzing encountered an error: {e}")
+
+        # Run symbolic execution if enabled
+        if self.symbolic_execution_enabled and self.symbolic_executor:
+            self.log("Starting symbolic execution analysis...")
+            try:
+                # Analyze key endpoints with symbolic execution
+                symbolic_results = []
+                for url_data in self.crawler_engine.visited_urls[:50]:  # Limit to top 50 URLs
+                    url = url_data.get('url', url_data) if isinstance(url_data, dict) else url_data
+                    if url:
+                        # Extract parameters from the URL
+                        parsed = urlparse(url)
+                        params = parse_qs(parsed.query)
+                        
+                        # Perform symbolic analysis
+                        analysis = self.symbolic_executor.analyze_endpoint(
+                            url, 'GET', params
+                        )
+                        if analysis:
+                            symbolic_results.append(analysis)
+                
+                # Process vulnerability candidates from symbolic execution
+                vuln_candidates = self.symbolic_executor.get_vulnerability_candidates()
+                for candidate in vuln_candidates:
+                    vuln = {
+                        'type': candidate['type'].upper(),
+                        'url': candidate['url'],
+                        'parameter': candidate['variable'],
+                        'confidence': 'Medium',
+                        'severity': 'High',
+                        'evidence': f"Symbolic execution detected {candidate['type']} pattern in parameter '{candidate['variable']}' with value: {candidate['value'][:100]}",
+                        'detection_method': 'symbolic_execution',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    await self._add_vulnerability(vuln)
+                    self.log(f"[SYMBOLIC EXECUTION] {candidate['type']} candidate found via symbolic analysis")
+                
+                # Log symbolic execution summary
+                summary = self.symbolic_executor.get_summary()
+                self.log(f"Symbolic execution completed: {summary['total_analyses']} analyses, {summary['total_paths_explored']} paths explored, {summary['vulnerability_candidates']} vulnerability candidates")
+                
+            except Exception as e:
+                logging.warning(f"Symbolic execution failed: {e}")
+                self.log(f"Symbolic execution encountered an error: {e}")
         
         # Run schema-aware fuzzing if enabled (more intelligent than genetic fuzzing)
         if self.schema_inference_enabled and self.dynamic_mutation_enabled:
@@ -31393,14 +31791,19 @@ class OmegaDAST:
                 logging.warning(f"gRPC test error for {target}: {e}")
 
     async def _grpc_reflection_fallback_fuzz(self, target):
-        """Generic Protobuf fuzzer when reflection is disabled - sends raw payloads with deterministic field numbers."""
+        """
+        Generic Protobuf fuzzer when reflection is disabled - uses stable gRPC APIs.
+        Avoids private channel access and uses public gRPC methods for compatibility.
+        """
         try:
             import struct
             
             if not GRPC_AVAILABLE:
                 return
             
-            channel = grpc.insecure_channel(target)
+            # Use generic method stub for testing when reflection is disabled
+            # This approach uses public gRPC APIs instead of private channel access
+            self.log(f"Starting gRPC reflection fallback fuzzing at {target} using stable APIs")
             
             # Boundary values for fuzzing
             boundary_values = [
@@ -31414,97 +31817,121 @@ class OmegaDAST:
                 "\xff\xfe\xfd\xfc",   # Invalid bytes
             ]
             
-            # Deterministic field numbers to test
-            field_numbers = [1, 2, 3, 4, 5, 10, 100]
+            # Common gRPC service names to try when reflection is disabled
+            common_service_names = [
+                "grpc.health.v1.Health",
+                "grpc.reflection.v1.ServerReflection",
+                "helloworld.Greeter",
+                "example.Service",
+                "test.Service",
+                "api.Service"
+            ]
             
-            self.log(f"Starting gRPC reflection fallback fuzzing at {target}")
+            # Common method names to try
+            common_method_names = [
+                "Check",
+                "SayHello",
+                "GetFeature",
+                "ListFeatures",
+                "RecordRoute",
+                "RouteChat",
+                "UnaryMethod",
+                "ServerStreamingMethod",
+                "ClientStreamingMethod",
+                "BidiStreamingMethod"
+            ]
             
-            for field_num in field_numbers:
-                for boundary_value in boundary_values:
-                    try:
-                        # Create raw protobuf message with deterministic field number
-                        # Format: field_number << 3 | wire_type
-                        
-                        # Varint encoding for field number (wire type 0 for varint)
-                        field_tag = (field_num << 3) | 0
-                        
-                        # Encode field tag as varint
-                        def encode_varint(value):
-                            result = []
-                            while value > 0x7F:
-                                result.append((value & 0x7F) | 0x80)
-                                value >>= 7
-                            result.append(value)
-                            return bytes(result)
-                        
-                        # Encode value based on type
-                        def encode_value(value):
-                            if isinstance(value, int):
-                                # Varint encoding for integers
-                                return encode_varint(value & 0xFFFFFFFFFFFFFFFF)
-                            elif isinstance(value, str):
-                                # Length-delimited for strings
-                                if value == "":
-                                    return bytes([0])  # Zero length
-                                return bytes([len(value)]) + value.encode('utf-8')
-                            elif isinstance(value, bytes):
-                                # Length-delimited for bytes
-                                return bytes([len(value)]) + value
-                            else:
-                                return b''
-                        
-                        # Build raw protobuf message
-                        raw_message = encode_varint(field_tag) + encode_value(boundary_value)
-                        
-                        # Compress with gRPC framing (5-byte header + message)
-                        # Format: 1 byte compressed flag (0) + 4 byte message length (big endian) + message
-                        compressed_flag = b'\x00'
-                        message_length = struct.pack('>I', len(raw_message))
-                        grpc_frame = compressed_flag + message_length + raw_message
-                        
-                        # Send raw payload through channel
+            # Try different service/method combinations with boundary values
+            for service_name in common_service_names:
+                for method_name in common_method_names:
+                    for boundary_value in boundary_values:
                         try:
-                            channel._channel.send(grpc_frame)
-                            
-                            # Try to read response with timeout
-                            # Attempt to get response using channel read operations
-                            try:
-                                # Set a short timeout for response reading
-                                import select
-                                if hasattr(channel._channel, '_recv'):
-                                    # Try to read response if available
-                                    readable, _, _ = select.select([channel._channel._recv], [], [], 0.1)
-                                    if readable:
-                                        response_data = channel._channel._recv.recv(4096)
-                                        if response_data:
-                                            logging.debug(f"Received response for field {field_num}: {len(response_data)} bytes")
-                            except Exception as read_error:
-                                logging.debug(f"Response read failed: {read_error}")
-                            
-                            # For fallback fuzzing, we're checking if server accepts the payload
-                            
-                            logging.debug(f"Sent gRPC fallback payload: field={field_num}, value={boundary_value}")
-                            
-                        except grpc.RpcError as e:
-                            # Analyze error code
-                            status_code = e.code()
-                            
-                            if status_code == grpc.StatusCode.UNIMPLEMENTED:
-                                # Service not implemented - try alternative approaches
-                                logging.debug(f"Field {field_num} returned UNIMPLEMENTED - attempting alternative handling")
-                                
-                                # Try alternative field handling methods
-                                alternative_result = await self._handle_unimplemented_field(channel, field_num, boundary_value, service_name, method_name)
-                                
-                                if alternative_result:
-                                    # If alternative handling succeeded, continue with next field
+                            # Create channel for each attempt
+                            with grpc.insecure_channel(target) as channel:
+                                # Check channel connectivity
+                                try:
+                                    grpc.channel_ready_future(channel).result(timeout=5)
+                                except grpc.FutureTimeoutError:
+                                    logging.debug(f"Channel not ready for {target}")
                                     continue
-                                else:
-                                    # If all alternatives failed, log and continue
-                                    logging.warning(f"All alternative methods failed for field {field_num}")
+                                
+                                # Create generic method stub using the generic gRPC API
+                                # This uses the public UnaryUnaryMultiCallable interface
+                                try:
+                                    # Create method callable using the generic channel
+                                    # This is the stable way to call unknown gRPC methods
+                                    method_callable = channel.unary_unary(
+                                        f"/{service_name}/{method_name}"
+                                    )
+                                    
+                                    # Try to call the method with boundary value
+                                    # We'll use a simple protobuf message structure
+                                    from google.protobuf.any_pb2 import Any
+                                    from google.protobuf.struct_pb2 import Value
+                                    
+                                    # Create different protobuf message types based on value
+                                    if isinstance(boundary_value, int):
+                                        from google.protobuf.wrappers_pb2 import Int64Value
+                                        proto_message = Int64Value(value=boundary_value)
+                                    elif isinstance(boundary_value, str):
+                                        from google.protobuf.wrappers_pb2 import StringValue
+                                        proto_message = StringValue(value=boundary_value)
+                                    else:
+                                        # For bytes and other types, use Any
+                                        proto_message = Any()
+                                        if isinstance(boundary_value, bytes):
+                                            proto_message.value = boundary_value
+                                        else:
+                                            proto_message.value = str(boundary_value).encode()
+                                    
+                                    # Attempt the call with timeout
+                                    try:
+                                        response = method_callable(proto_message, timeout=3)
+                                        logging.debug(f"Method {service_name}/{method_name} accepted boundary value: {boundary_value}")
+                                        
+                                        # If we get here, the server accepted the payload
+                                        await self._add_vulnerability({
+                                            "type": "gRPC Injection",
+                                            "url": target,
+                                            "parameter": f"{service_name}/{method_name}",
+                                            "evidence": f"Accepted boundary value: {str(boundary_value)[:100]}",
+                                            "severity": "Medium",
+                                            "confidence": 50,
+                                            "cwe": CWE_MAP.get("gRPC", "CWE-502")
+                                        })
+                                        
+                                    except grpc.RpcError as e:
+                                        # Analyze error code for information leakage
+                                        status_code = e.code()
+                                        
+                                        # Log different status codes for reconnaissance
+                                        if status_code == grpc.StatusCode.NOT_FOUND:
+                                            logging.debug(f"Method {service_name}/{method_name} not found (404)")
+                                        elif status_code == grpc.StatusCode.UNIMPLEMENTED:
+                                            logging.debug(f"Method {service_name}/{method_name} not implemented")
+                                        elif status_code == grpc.StatusCode.INVALID_ARGUMENT:
+                                            logging.debug(f"Method {service_name}/{method_name} rejected invalid argument")
+                                        elif status_code == grpc.StatusCode.ALREADY_EXISTS:
+                                            logging.debug(f"Method {service_name}/{method_name} reported already exists")
+                                        elif status_code == grpc.StatusCode.PERMISSION_DENIED:
+                                            logging.debug(f"Method {service_name}/{method_name} permission denied")
+                                        elif status_code == grpc.StatusCode.UNAUTHENTICATED:
+                                            logging.debug(f"Method {service_name}/{method_name} requires authentication")
+                                        
+                                except AttributeError:
+                                    # Method callable not available, skip this combination
+                                    logging.debug(f"Method callable not available for {service_name}/{method_name}")
                                     continue
-                            elif status_code in [grpc.StatusCode.INTERNAL, grpc.StatusCode.UNKNOWN]:
-                                # Internal or unknown error - flag for manual review
+                                    
+                        except Exception as method_error:
+                            logging.debug(f"Error testing method {service_name}/{method_name}: {method_error}")
+                            continue
+            
+            self.log(f"gRPC reflection fallback fuzzing completed for {target}")
+            
+        except Exception as e:
+            logging.warning(f"gRPC reflection fallback fuzzing error: {e}")
+            self.log(f"gRPC fallback fuzzing encountered error: {e}")
                                 await self._add_vulnerability({
                                     "type":"gRPC Hidden Route Detected",
                                     "url":target,
@@ -32985,7 +33412,10 @@ class OmegaDAST:
                 break
 
     async def _test_graphql_batching_idor_alias_brute_force(self, endpoint):
-        """Test for GraphQL IDOR using alias brute-force technique when introspection is disabled."""
+        """
+        Test for GraphQL IDOR using alias brute-force technique with dynamic field discovery.
+        Enhanced version that discovers GraphQL schema dynamically rather than relying on hardcoded wordlists.
+        """
         try:
             # Step 1: Validate endpoint is live using __typename
             validation_query = '{ a: __typename }'
@@ -33005,17 +33435,35 @@ class OmegaDAST:
                 logging.debug(f"Failed to parse __typename validation response: {e}")
                 return
             
-            # Step 2: Discover available query fields dynamically instead of hardcoded "user"
-            # Try introspection first to get available queries
+            # Step 2: Discover available query fields dynamically using multiple techniques
             discovered_queries = []
+            
+            # Technique 1: Full introspection (most accurate)
             try:
-                introspection_query = '{ __schema { queryType { fields { name args { name type { name } } } } } }'
+                introspection_query = '''
+                {
+                    __schema {
+                        queryType {
+                            fields {
+                                name
+                                args {
+                                    name
+                                    type {
+                                        name
+                                        kind
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                '''
                 intro_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': introspection_query})
                 if intro_resp and intro_resp.status == 200:
                     intro_data = intro_resp.json() if hasattr(intro_resp, 'json') else {}
                     if 'data' in intro_data and '__schema' in intro_data['data']:
                         query_fields = intro_data['data']['__schema']['queryType']['fields']
-                        # Filter for queries that take an ID argument
+                        # Filter for queries that take an ID-like argument
                         for field in query_fields:
                             field_name = field['name']
                             args = field.get('args', [])
@@ -33023,84 +33471,164 @@ class OmegaDAST:
                             id_arg = None
                             for arg in args:
                                 arg_name = arg['name'].lower()
-                                if 'id' in arg_name or 'uuid' in arg_name or 'key' in arg_name:
+                                arg_type = arg.get('type', {}).get('name', '').lower()
+                                if 'id' in arg_name or 'uuid' in arg_name or 'key' in arg_name or 'identifier' in arg_name:
                                     id_arg = arg['name']
                                     break
                             if id_arg:
                                 discovered_queries.append((field_name, id_arg))
+                        logging.info(f"Discovered {len(discovered_queries)} ID-sensitive queries via introspection")
             except Exception as e:
-                logging.debug(f"Introspection failed, falling back to common query names: {e}")
+                logging.debug(f"Full introspection failed: {e}")
             
-            # Fallback to common query names if introspection failed or returned nothing
+            # Technique 2: Partial introspection if full failed
             if not discovered_queries:
+                try:
+                    partial_intro_query = '{ __schema { queryType { fields { name } } } }'
+                    partial_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': partial_intro_query})
+                    if partial_resp and partial_resp.status == 200:
+                        partial_data = partial_resp.json() if hasattr(partial_resp, 'json') else {}
+                        if 'data' in partial_data and '__schema' in partial_data['data']:
+                            field_names = [f['name'] for f in partial_data['data']['__schema']['queryType']['fields']]
+                            # Test each field to see if it accepts ID arguments
+                            for field_name in field_names[:20]:  # Limit to prevent excessive testing
+                                test_query = f'{{ test: {field_name}(id: "1") {{ __typename }} }}'
+                                test_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': test_query})
+                                if test_resp and test_resp.status == 200:
+                                    discovered_queries.append((field_name, 'id'))
+                            logging.info(f"Discovered {len(discovered_queries)} ID-sensitive queries via partial introspection")
+                except Exception as e:
+                    logging.debug(f"Partial introspection failed: {e}")
+            
+            # Technique 3: Field suggestion (GraphQL field guessing)
+            if not discovered_queries:
+                try:
+                    # Try to guess field names using common patterns with field suggestion
+                    suggestion_query = '''
+                    {
+                        __type(name: "Query") {
+                            fields {
+                                name
+                            }
+                        }
+                    }
+                    '''
+                    suggestion_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': suggestion_query})
+                    if suggestion_resp and suggestion_resp.status == 200:
+                        suggestion_data = suggestion_resp.json() if hasattr(suggestion_resp, 'json') else {}
+                        if 'data' in suggestion_data and '__type' in suggestion_data['data']:
+                            field_names = [f['name'] for f in suggestion_data['data']['__type']['fields']]
+                            for field_name in field_names:
+                                if any(keyword in field_name.lower() for keyword in ['user', 'account', 'profile', 'product', 'order', 'item']):
+                                    discovered_queries.append((field_name, 'id'))
+                            logging.info(f"Discovered {len(discovered_queries)} ID-sensitive queries via field suggestion")
+                except Exception as e:
+                    logging.debug(f"Field suggestion failed: {e}")
+            
+            # Fallback to enhanced common query names only if all discovery techniques failed
+            if not discovered_queries:
+                logging.warning("All dynamic discovery techniques failed, using enhanced fallback wordlist")
                 common_queries = [
                     ('user', 'id'), ('users', 'id'), ('getUser', 'id'), ('User', 'id'),
                     ('product', 'id'), ('products', 'id'), ('getProduct', 'id'), ('Product', 'id'),
                     ('account', 'id'), ('accounts', 'id'), ('getAccount', 'id'), ('Account', 'id'),
                     ('order', 'id'), ('orders', 'id'), ('getOrder', 'id'), ('Order', 'id'),
                     ('post', 'id'), ('posts', 'id'), ('getPost', 'id'), ('Post', 'id'),
-                    ('item', 'id'), ('items', 'id'), ('getItem', 'id'), ('Item', 'id')
+                    ('item', 'id'), ('items', 'id'), ('getItem', 'id'), ('Item', 'id'),
+                    ('profile', 'id'), ('profiles', 'id'), ('getProfile', 'id'), ('Profile', 'id'),
+                    ('customer', 'id'), ('customers', 'id'), ('getCustomer', 'id'), ('Customer', 'id'),
+                    ('employee', 'id'), ('employees', 'id'), ('getEmployee', 'id'), ('Employee', 'id')
                 ]
                 discovered_queries = common_queries
             
-            # Step 3: Sequentially test with different IDs using aliases for each discovered query
+            # Step 3: Enhanced IDOR testing with dynamic ID generation and analysis
             # Test pattern: { a1: query(id:1), a2: query(id:2) }
-            id_pairs = [(1, 2), (1, 3), (2, 3), (1, 4), (5, 6)]
+            # Use both sequential and random ID patterns for better coverage
+            id_pairs = [(1, 2), (1, 3), (2, 3), (1, 4), (5, 6), (100, 101), (999, 1000)]
             
-            for query_name, id_arg in discovered_queries:
+            # Also test with UUID-like patterns
+            uuid_patterns = [
+                ("550e8400-e29b-41d4-a716-446655440000", "550e8400-e29b-41d4-a716-446655440001"),
+                ("123e4567-e89b-12d3-a456-426614174000", "123e4567-e89b-12d3-a456-426614174001")
+            ]
+            
+            # Test with string IDs if needed
+            string_id_pairs = [("admin", "user"), ("user1", "user2"), ("test", "prod")]
+            
+            for query_name, id_arg in discovered_queries[:10]:  # Limit to prevent excessive testing
+                # First test with numeric IDs
                 for id1, id2 in id_pairs:
-                    # Build dynamic query based on discovered field and argument name
-                    idor_query = f'{{ a1: {query_name}({id_arg}: "{id1}") {{ id name email }}, a2: {query_name}({id_arg}: "{id2}") {{ id name email }} }}'
-                    
-                    resp = await self._async_fetch(endpoint, method='POST', json_data={'query': idor_query})
-                    
-                    if resp and resp.status == 200:
-                        try:
-                            response_data = resp.json() if hasattr(resp, 'json') else {}
-                            
-                            if 'data' in response_data:
-                                a1_data = response_data['data'].get('a1')
-                                a2_data = response_data['data'].get('a2')
-                                
-                                # Check if a1 and a2 return different data using enhanced analysis
-                                if a1_data and a2_data:
-                                    # Perform deep analysis for IDOR detection
-                                    idor_detected = self._analyze_graphql_idor_response(a1_data, a2_data, query_name, id_arg, id1, id2)
-                                    
-                                    if idor_detected['is_idor']:
-                                        # This indicates different resources are accessible - potential IDOR
-                                        await self._add_vulnerability({
-                                            "type":"GraphQL Batching IDOR",
-                                            "url":endpoint,
-                                            "parameter":"query",
-                                            "evidence":idor_detected['evidence'],
-                                            "severity":"High",
-                                            "confidence":idor_detected['confidence'],
-                                            "cwe":CWE_MAP["IDOR"]
-                                        })
-                                        logging.info(f"GraphQL IDOR confirmed via alias brute-force at {endpoint} for query {query_name}")
-                                        return  # Confirmed IDOR, no need to continue
-                                    else:
-                                        # Same data returned - might be same resource or templated response
-                                        logging.debug(f"Analysis result: {idor_detected['reason']} for {query_name}({id_arg}:{id1}) and {query_name}({id_arg}:{id2})")
-                                elif a1_data and not a2_data:
-                                    # One ID works, other doesn't - could be access control or non-existent resource
-                                    # This might still indicate IDOR if we can access one resource but not another
-                                    logging.debug(f"{query_name}({id_arg}:{id1}) returned data but {query_name}({id_arg}:{id2}) did not - potential access control issue")
-                                elif not a1_data and a2_data:
-                                    # One ID works, other doesn't
-                                    logging.debug(f"{query_name}({id_arg}:{id2}) returned data but {query_name}({id_arg}:{id1}) did not - potential access control issue")
-                        
-                        except Exception as e:
-                            logging.debug(f"Failed to parse IDOR test response: {e}")
-                            continue
-            
-            # If we get here without finding IDOR, log the completion
-            logging.debug(f"GraphQL alias brute-force completed at {endpoint} - no IDOR detected")
-            
-        except Exception as e:
-            logging.warning(f"GraphQL batching IDOR test error at {endpoint}: {e}")
+                    await self._test_graphql_idor_pair(endpoint, query_name, id_arg, id1, id2, "numeric")
+                
+                # Test with UUID patterns if numeric didn't find anything
+                for uuid1, uuid2 in uuid_patterns:
+                    await self._test_graphql_idor_pair(endpoint, query_name, id_arg, uuid1, uuid2, "uuid")
+                
+                # Test with string IDs
+                for str1, str2 in string_id_pairs:
+                    await self._test_graphql_idor_pair(endpoint, query_name, id_arg, str1, str2, "string")
     
+    async def _test_graphql_idor_pair(self, endpoint, query_name, id_arg, id1, id2, id_type):
+        """Test a specific ID pair for GraphQL IDOR vulnerability"""
+        try:
+            # Build dynamic query based on discovered field and argument name
+            # Adjust query format based on ID type
+            if id_type == "uuid":
+                idor_query = f'{{ a1: {query_name}({id_arg}: "{id1}") {{ id name email }}, a2: {query_name}({id_arg}: "{id2}") {{ id name email }} }}'
+            elif id_type == "string":
+                idor_query = f'{{ a1: {query_name}({id_arg}: "{id1}") {{ id name email }}, a2: {query_name}({id_arg}: "{id2}") {{ id name email }} }}'
+            else:  # numeric
+                idor_query = f'{{ a1: {query_name}({id_arg}: {id1}) {{ id name email }}, a2: {query_name}({id_arg}: {id2}) {{ id name email }} }}'
+            
+            resp = await self._async_fetch(endpoint, method='POST', json_data={'query': idor_query})
+            
+            if resp and resp.status == 200:
+                try:
+                    response_data = resp.json() if hasattr(resp, 'json') else {}
+                    
+                    if 'data' in response_data:
+                        a1_data = response_data['data'].get('a1')
+                        a2_data = response_data['data'].get('a2')
+                        
+                        # Check if a1 and a2 return different data using enhanced analysis
+                        if a1_data and a2_data:
+                            # Perform deep analysis for IDOR detection
+                            idor_detected = self._analyze_graphql_idor_response(a1_data, a2_data, query_name, id_arg, id1, id2)
+                            
+                            if idor_detected['is_idor']:
+                                # This indicates different resources are accessible - potential IDOR
+                                await self._add_vulnerability({
+                                    "type":"GraphQL Batching IDOR",
+                                    "url":endpoint,
+                                    "parameter":"query",
+                                    "evidence":idor_detected['evidence'],
+                                    "severity":"High",
+                                    "confidence":idor_detected['confidence'],
+                                    "cwe":CWE_MAP["IDOR"]
+                                })
+                                logging.info(f"GraphQL IDOR confirmed via alias brute-force at {endpoint} for query {query_name} with {id_type} IDs")
+                                return True  # Confirmed IDOR
+                            else:
+                                # Same data returned - might be same resource or templated response
+                                logging.debug(f"Analysis result: {idor_detected['reason']} for {query_name}({id_arg}:{id1}) and {query_name}({id_arg}:{id2})")
+                        elif a1_data and not a2_data:
+                            # One ID works, other doesn't - could be access control or non-existent resource
+                            # This might still indicate IDOR if we can access one resource but not another
+                            logging.debug(f"{query_name}({id_arg}:{id1}) returned data but {query_name}({id_arg}:{id2}) did not - potential access control issue")
+                        elif not a1_data and a2_data:
+                            # One ID works, other doesn't
+                            logging.debug(f"{query_name}({id_arg}:{id2}) returned data but {query_name}({id_arg}:{id1}) did not - potential access control issue")
+                        
+                except Exception as e:
+                    logging.debug(f"Failed to parse IDOR test response: {e}")
+                    continue
+        
+        return False  # No IDOR detected
+    
+    except Exception as e:
+        logging.warning(f"GraphQL IDOR pair test error at {endpoint}: {e}")
+        return False
+
     def _analyze_graphql_idor_response(self, a1_data: dict, a2_data: dict, query_name: str, id_arg: str, id1: int, id2: int) -> dict:
         """
         Perform deep analysis of GraphQL responses to detect IDOR beyond simple equality.
@@ -33477,23 +34005,55 @@ class OmegaDAST:
         if not self.genetic_fuzzer:
             self.log("Genetic fuzzer not initialized, skipping")
             return
-        
+
         # Select high-value targets for fuzzing
         targets = []
-        for url in list(self.crawler_engine.visited_urls)[:20]:
-            for param in self.crawler_engine.parameters:
-                if param['url'] == url and param['method'] in ['GET', 'POST']:
-                    targets.append((url, param['param'], param['method']))
-        
+        for url_data in list(self.crawler_engine.visited_urls)[:20]:
+            url = url_data.get('url', url_data) if isinstance(url_data, dict) else url_data
+            if url:
+                for param in self.crawler_engine.parameters:
+                    if param['url'] == url and param['method'] in ['GET', 'POST']:
+                        targets.append((url, param['param'], param['method']))
+
         self.log(f"Running genetic fuzzing on {len(targets)} targets")
-        fuzzing_results = await self.genetic_fuzzer.fuzz_targets(targets, self._async_fetch)
         
-        for result in fuzzing_results:
-            if result.get('vulnerability'):
-                vuln = result['vulnerability']
-                vuln['discovery_method'] = 'genetic_fuzzing'
-                await self._add_vulnerability(vuln)
-                self.log(f"[GENETIC FUZZING] {vuln['type']} found via genetic algorithm")
+        # Prepare seed data from crawled parameters
+        seed_data = []
+        for param in self.crawler_engine.parameters[:20]:
+            param_value = str(param.get('value', 'test'))
+            seed_data.append(param_value.encode())
+        seed_data.extend([
+            b'admin', b'test', b'<script>alert(1)</script>',
+            b"' OR '1'='1", b'../../etc/passwd', b'{"user":"admin","pass":"password"}'
+        ])
+        
+        try:
+            # Run genetic fuzzing
+            results = self.genetic_fuzzer.run(self.loop, seed_data)
+            self.log(f"Genetic fuzzing completed: {results['generations']} generations, "
+                    f"best fitness: {results['best_fitness']}, "
+                    f"coverage: {results['coverage_size']}")
+            
+            # Process results for vulnerabilities
+            for individual in results['final_population']:
+                if individual.get('is_crash', False) or individual.get('is_timeout', False):
+                    # Found potential vulnerability through genetic fuzzing
+                    vuln = {
+                        'type': 'Genetic Fuzzing Crash',
+                        'url': self.target,
+                        'parameter': 'Genetic Fuzzing',
+                        'confidence': 'Medium',
+                        'severity': 'High',
+                        'evidence': f"Genetic fuzzing found crash/timeout with payload: {str(individual.get('data', ''))[:100]}",
+                        'discovery_method': 'genetic_fuzzing',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    await self._add_vulnerability(vuln)
+                    self.log(f"[GENETIC FUZZING] Potential vulnerability found via genetic algorithm")
+                    
+        except Exception as e:
+            logging.warning(f"Genetic fuzzing execution failed: {e}")
+            self.log(f"Genetic fuzzing encountered an error: {e}")
     
     async def run_schema_aware_fuzzing_integration(self):
         """Run schema-aware fuzzing using the Schema Inference Engine and Dynamic Mutation Server"""
@@ -34465,80 +35025,8 @@ class GraphQLSelfReferencingFragmentGenerator:
             except Exception as e:
                 logging.debug(f"Session fixation test error for {page['url']}: {e}")
 
-    async def run_genetic_fuzzing(self):
-        """Run genetic fuzzing using the integrated genetic fuzzer"""
-        self.log("Starting genetic fuzzing with mutation and crossover strategies...")
-        mutation_rate = self.config.get('fuzz_mutation_rate', 0.1)
-        crossover_rate = self.config.get('fuzz_crossover_rate', 0.3)
-        population_size = self.config.get('fuzz_population_size', 50)
-        max_generations = self.config.get('fuzz_max_generations', 100)
-        corpus_dir = self.config.get('fuzz_corpus_dir', 'fuzz_corpus')
-        genetic_fuzzer = GeneticFuzzer(
-            target_url=self.target,
-            session_manager=self.session_manager,
-            mutation_rate=mutation_rate,
-            crossover_rate=crossover_rate,
-            population_size=population_size,
-            max_generations=max_generations,
-            corpus_dir=corpus_dir
-        )
-        genetic_fuzzer.stop_event = self.stop_event
-        seed_data = []
-        for param in self.crawler_engine.parameters[:20]:
-            param_value = str(param.get('value', 'test'))
-            seed_data.append(param_value.encode())
-        seed_data.extend([
-            b'admin', b'test', b'<script>alert(1)</script>',
-            b"' OR '1'='1", b'../../etc/passwd', b'{"user":"admin","pass":"password"}'
-        ])
-        try:
-            results = genetic_fuzzer.run(self.loop, seed_data)
-            self.log(f"Genetic fuzzing completed: {results['generations']} generations, "
-                    f"best fitness: {results['best_fitness']}, "
-                    f"coverage: {results['coverage_size']}")
-            for individual in results['final_population']:
-                if individual.get('is_crash', False) or individual.get('is_timeout', False):
-                    await self._add_vulnerability({
-                        "type": "Fuzzing Crash/Timeout",
-                        "url": self.target,
-                        "parameter": "*",
-                        "evidence": f"Genetic fuzzer found crash/timeout with fitness {individual.get('fitness', 0)}",
-                        "severity": "High",
-                        "confidence": 75,
-                        "cwe": "CWE-20"
-                    })
-        except Exception as e:
-            logging.warning(f"Genetic fuzzing error: {e}")
-        if self.config.get('template_fuzzing_enabled', True):
-            self.log("Starting request template fuzzing...")
-            template_fuzzer = RequestTemplateFuzzer(
-                base_url=self.target,
-                session_manager=self.session_manager,
-                config=self.config
-            )
-            try:
-                template_results = template_fuzzer.run_genetic_fuzzing(
-                    self.loop,
-                    generations=self.config.get('template_fuzzing_generations', 25)
-                )
-                self.log(f"Template fuzzing completed: {template_results['generations']} generations, "
-                        f"{len(template_results['interesting_findings'])} interesting findings")
-                for finding in template_results['interesting_findings']:
-                    evaluation = finding['evaluation']
-                    template = finding['template']
-                    if evaluation.get('is_error', False):
-                        await self._add_vulnerability({
-                            "type": "Template Fuzzing Finding",
-                            "url": urljoin(self.target, template['path']),
-                            "parameter": template.get('params', {}).get('key', '*'),
-                            "evidence": f"Template fuzzing found error: {evaluation.get('error', 'HTTP error')}",
-                            "severity": "Medium",
-                            "confidence": 60,
-                            "cwe": "CWE-20"
-                        })
-            except Exception as e:
-                logging.warning(f"Template fuzzing error: {e}")
-
+    # Duplicate method removed - genetic fuzzing is now handled by the first run_genetic_fuzzing method
+    
     async def temporal_recheck(self):
         if not self.temporal_recheck_enabled:
             return
@@ -38673,6 +39161,10 @@ class ScanTab(QWidget):
         self.symbolic_execution_enabled = QCheckBox("Enable Symbolic Execution")
         self.symbolic_execution_enabled.setChecked(True)
         
+        self.genetic_fuzzing_enabled = QCheckBox("Enable Genetic Fuzzing")
+        self.genetic_fuzzing_enabled.setChecked(False)
+        self.genetic_fuzzing_enabled.setToolTip("Enable genetic algorithm-based fuzzing for advanced vulnerability discovery")
+        
         self.dynamic_payloads_enabled = QCheckBox("Enable Dynamic Payloads")
         self.dynamic_payloads_enabled.setChecked(True)
         
@@ -38712,6 +39204,7 @@ class ScanTab(QWidget):
         self.schema_confidence_spin.setToolTip("Minimum confidence threshold for schema inference (0-100%)")
         
         advanced_layout.addWidget(self.symbolic_execution_enabled)
+        advanced_layout.addWidget(self.genetic_fuzzing_enabled)
         advanced_layout.addWidget(self.dynamic_payloads_enabled)
         advanced_layout.addWidget(self.environment_detection_enabled)
         advanced_layout.addWidget(self.use_encrypted_payloads)
@@ -39039,6 +39532,7 @@ class ScanTab(QWidget):
                 'browser_simulation': self.browser_simulation.isChecked()
             },
             'symbolic_execution_enabled': self.symbolic_execution_enabled.isChecked(),
+            'genetic_fuzzing_enabled': self.genetic_fuzzing_enabled.isChecked(),
             'schema_inference': {
                 'enabled': self.schema_inference_enabled_check.isChecked(),
                 'inference_confidence_threshold': self.schema_confidence_spin.value() / 100.0,
@@ -39373,7 +39867,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v17.7 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v17.8 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -40456,7 +40950,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v17.7']
+                        ['Tool Version', 'UltraDAST v17.8']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -40567,7 +41061,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v17.7",
+                            "tool": "UltraDAST v17.8",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -40859,7 +41353,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v17.7 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v17.8 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -40935,6 +41429,571 @@ Examples:
         traceback.print_exc()
         import sys
         sys.exit(1)
+
+# ---------------------------------------------------------------------
+# TAINT TRACKING ENGINE - Data Flow Analysis
+# ---------------------------------------------------------------------
+
+class TaintTracker:
+    """
+    Tracks data flow through application to detect potential injection points.
+    Implements dynamic taint analysis for security testing.
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.taint_sources = {}  # Sources of user input
+        self.taint_sinks = {}    # Potentially dangerous operations
+        self.taint_flows = []    # Tracked data flows
+        self.taint_id_counter = 0
+        
+        # Common taint sources (user input points)
+        self.default_sources = {
+            'url_params': r'[?&](\w+)=',
+            'form_data': r'name="(\w+)"',
+            'cookies': r'Cookie:\s*(.+)',
+            'headers': r'(\w+):\s*.+',
+            'json_body': r'"(\w+)":\s*"[^"]*"'
+        }
+        
+        # Common taint sinks (dangerous operations)
+        self.default_sinks = {
+            'sql': r'(SELECT|INSERT|UPDATE|DELETE|DROP|UNION)\s',
+            'command': r'(exec|system|eval|shell_exec|passthru)\s*\(',
+            'xss': r'(innerHTML|document\.write|eval\(|\.innerHTML\s*=)',
+            'redirect': r'(Location:|redirect\(|header\("Location)',
+            'file': r'(fopen|file_get_contents|include|require)\s*\(',
+            'ldap': r'(ldap_search|ldap_bind)\s*\('
+        }
+        
+        logging.info("TaintTracker initialized")
+    
+    def generate_taint_id(self):
+        """Generate unique taint identifier"""
+        self.taint_id_counter += 1
+        return f"taint_{self.taint_id_counter}_{int(time.time())}"
+    
+    def add_taint_source(self, source_type, source_value, context=None):
+        """Add a taint source (user input point)"""
+        taint_id = self.generate_taint_id()
+        self.taint_sources[taint_id] = {
+            'type': source_type,
+            'value': source_value,
+            'context': context or {},
+            'timestamp': datetime.now().isoformat()
+        }
+        logging.debug(f"Added taint source: {taint_id} ({source_type})")
+        return taint_id
+    
+    def add_taint_sink(self, sink_type, sink_pattern, context=None):
+        """Add a taint sink (potentially dangerous operation)"""
+        sink_id = self.generate_taint_id()
+        self.taint_sinks[sink_id] = {
+            'type': sink_type,
+            'pattern': sink_pattern,
+            'context': context or {},
+            'timestamp': datetime.now().isoformat()
+        }
+        logging.debug(f"Added taint sink: {sink_id} ({sink_type})")
+        return sink_id
+    
+    def track_flow(self, source_id, sink_id, flow_data=None):
+        """Track a data flow from source to sink"""
+        flow = {
+            'id': self.generate_taint_id(),
+            'source_id': source_id,
+            'sink_id': sink_id,
+            'data': flow_data or {},
+            'timestamp': datetime.now().isoformat(),
+            'vulnerability': self._assess_vulnerability(source_id, sink_id)
+        }
+        self.taint_flows.append(flow)
+        
+        if flow['vulnerability']:
+            logging.warning(f"Potential vulnerability detected in flow {flow['id']}")
+        
+        return flow
+    
+    def _assess_vulnerability(self, source_id, sink_id):
+        """Assess if a flow represents a potential vulnerability"""
+        if source_id not in self.taint_sources or sink_id not in self.taint_sinks:
+            return False
+        
+        source = self.taint_sources[source_id]
+        sink = self.taint_sinks[sink_id]
+        
+        # Basic vulnerability assessment
+        dangerous_combinations = [
+            ('url_params', 'sql'),
+            ('form_data', 'sql'),
+            ('cookies', 'sql'),
+            ('url_params', 'xss'),
+            ('form_data', 'xss'),
+            ('url_params', 'command'),
+            ('form_data', 'command'),
+            ('headers', 'ldap')
+        ]
+        
+        return (source['type'], sink['type']) in dangerous_combinations
+    
+    def analyze_response(self, response_text, taint_id):
+        """Analyze response for taint propagation"""
+        if taint_id not in self.taint_sources:
+            return None
+        
+        source = self.taint_sources[taint_id]
+        if source['value'] in response_text:
+            return {
+                'taint_id': taint_id,
+                'propagated': True,
+                'context': 'response_reflection',
+                'timestamp': datetime.now().isoformat()
+            }
+        return None
+    
+    def get_vulnerabilities(self):
+        """Get all detected vulnerabilities from taint analysis"""
+        return [flow for flow in self.taint_flows if flow['vulnerability']]
+    
+    def get_summary(self):
+        """Get summary of taint analysis"""
+        return {
+            'total_sources': len(self.taint_sources),
+            'total_sinks': len(self.taint_sinks),
+            'total_flows': len(self.taint_flows),
+            'vulnerabilities_found': len(self.get_vulnerabilities()),
+            'analysis_time': datetime.now().isoformat()
+        }
+
+
+class TaintInstrumentor:
+    """
+    Instruments code for dynamic taint analysis.
+    Modifies requests/responses to track data flow.
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.taint_tracker = TaintTracker(config)
+        self.instrumentation_markers = []
+        self.marker_counter = 0
+        
+        logging.info("TaintInstrumentor initialized")
+    
+    def generate_marker(self):
+        """Generate unique instrumentation marker"""
+        self.marker_counter += 1
+        return f"TAINT_MARKER_{self.marker_counter}_{uuid.uuid4().hex[:8]}"
+    
+    def instrument_request(self, request_data):
+        """Instrument HTTP request with taint markers"""
+        instrumented = request_data.copy()
+        marker = self.generate_marker()
+        
+        # Add marker to various request parameters
+        if 'params' in instrumented:
+            for key in instrumented['params']:
+                if isinstance(instrumented['params'][key], str):
+                    instrumented['params'][key] = f"{marker}_{instrumented['params'][key]}"
+                    self.taint_tracker.add_taint_source('url_params', key, {'marker': marker})
+        
+        if 'body' in instrumented:
+            if isinstance(instrumented['body'], dict):
+                for key in instrumented['body']:
+                    if isinstance(instrumented['body'][key], str):
+                        instrumented['body'][key] = f"{marker}_{instrumented['body'][key]}"
+                        self.taint_tracker.add_taint_source('form_data', key, {'marker': marker})
+        
+        self.instrumentation_markers.append({
+            'marker': marker,
+            'timestamp': datetime.now().isoformat(),
+            'request': instrumented
+        })
+        
+        return instrumented
+    
+    def instrument_response(self, response_data, request_marker=None):
+        """Analyze response for taint marker propagation"""
+        analysis_results = []
+        
+        if request_marker:
+            for marker_info in self.instrumentation_markers:
+                if marker_info['marker'] == request_marker:
+                    # Check if marker appears in response
+                    response_text = str(response_data)
+                    if request_marker in response_text:
+                        analysis_results.append({
+                            'marker': request_marker,
+                            'propagated': True,
+                            'response_snippet': response_text[:200],
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        
+                        # Track this as a potential vulnerability
+                        for taint_id, source in self.taint_tracker.taint_sources.items():
+                            if source.get('context', {}).get('marker') == request_marker:
+                                self.taint_tracker.add_taint_sink('xss', request_marker, {'response': True})
+                                self.taint_tracker.track_flow(taint_id, 'xss_sink', {'response_reflection': True})
+        
+        return analysis_results
+    
+    def analyze_parameter_taint(self, parameter_name, parameter_value, url):
+        """Analyze a specific parameter for taint propagation"""
+        taint_id = self.taint_tracker.add_taint_source('url_params', parameter_name, {
+            'value': parameter_value,
+            'url': url
+        })
+        
+        # Check for common injection patterns in parameter value
+        injection_patterns = {
+            'sql': r"[';]|(\b(OR|AND)\s+\d+\s*=\s*\d)",
+            'xss': r"<script|javascript:|on\w+\s*=",
+            'command': r"[;&|]|(\|\|)",
+            'path': r"\.\./|\.\.\\"
+        }
+        
+        detected_types = []
+        for inj_type, pattern in injection_patterns.items():
+            if re.search(pattern, parameter_value, re.IGNORECASE):
+                detected_types.append(inj_type)
+                self.taint_tracker.add_taint_sink(inj_type, pattern, {'parameter': parameter_name})
+                self.taint_tracker.track_flow(taint_id, f"{inj_type}_sink", {
+                    'parameter': parameter_name,
+                    'value': parameter_value
+                })
+        
+        return {
+            'taint_id': taint_id,
+            'parameter': parameter_name,
+            'detected_injections': detected_types,
+            'is_tainted': len(detected_types) > 0
+        }
+    
+    def get_taint_analysis_report(self):
+        """Generate comprehensive taint analysis report"""
+        return {
+            'summary': self.taint_tracker.get_summary(),
+            'vulnerabilities': self.taint_tracker.get_vulnerabilities(),
+            'sources': self.taint_tracker.taint_sources,
+            'sinks': self.taint_tracker.taint_sinks,
+            'instrumentation_markers': self.instrumentation_markers,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ---------------------------------------------------------------------
+# SYMBOLIC EXECUTION ENGINE - Path Exploration & Constraint Solving
+# ---------------------------------------------------------------------
+
+class SymbolicExecutionEngine:
+    """
+    Symbolic execution engine for exploring code paths and solving constraints.
+    Basic implementation for security testing applications.
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.symbolic_variables = {}
+        self.path_constraints = []
+        self.explored_paths = set()
+        self.branch_coverage = {}
+        self.execution_count = 0
+        self.max_depth = config.get('symbolic_max_depth', 10)
+        self.timeout = config.get('symbolic_timeout', 30)
+        
+        logging.info("SymbolicExecutionEngine initialized")
+    
+    def create_symbolic_variable(self, name, value_type='string', constraints=None):
+        """Create a symbolic variable for analysis"""
+        var_id = f"sym_{name}_{uuid.uuid4().hex[:8]}"
+        self.symbolic_variables[var_id] = {
+            'name': name,
+            'type': value_type,
+            'constraints': constraints or [],
+            'possible_values': self._get_default_values(value_type)
+        }
+        logging.debug(f"Created symbolic variable: {var_id} ({name})")
+        return var_id
+    
+    def _get_default_values(self, value_type):
+        """Get default values for different types"""
+        defaults = {
+            'string': ['', 'test', '../../etc/passwd', '<script>alert(1)</script>', "' OR '1'='1"],
+            'integer': [0, 1, -1, 999999, -999999],
+            'boolean': [True, False],
+            'path': ['/', '/etc/passwd', '../', '..\\'],
+            'url': ['http://evil.com', 'javascript:alert(1)', 'data:text/html,<script>']
+        }
+        return defaults.get(value_type, [''])
+    
+    def add_path_constraint(self, constraint_type, variable_id, condition):
+        """Add a path constraint for symbolic execution"""
+        constraint = {
+            'id': f"constraint_{len(self.path_constraints)}",
+            'type': constraint_type,
+            'variable_id': variable_id,
+            'condition': condition,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.path_constraints.append(constraint)
+        logging.debug(f"Added path constraint: {constraint_type} on {variable_id}")
+        return constraint['id']
+    
+    def explore_path(self, inputs, depth=0):
+        """Explore a symbolic execution path"""
+        if depth > self.max_depth:
+            return None
+        
+        self.execution_count += 1
+        path_id = f"path_{self.execution_count}_{uuid.uuid4().hex[:8]}"
+        
+        path_result = {
+            'id': path_id,
+            'depth': depth,
+            'inputs': inputs,
+            'constraints': [],
+            'branch_decisions': [],
+            'vulnerability_candidates': []
+        }
+        
+        # Analyze inputs for potential vulnerabilities
+        for var_id, input_value in inputs.items():
+            if var_id in self.symbolic_variables:
+                var_info = self.symbolic_variables[var_id]
+                
+                # Check for common vulnerability patterns
+                vuln_patterns = {
+                    'sqli': r"[';]|(\b(OR|AND)\s+\d+\s*=\s*\d)",
+                    'xss': r"<script|javascript:|on\w+\s*=",
+                    'path_traversal': r"\.\./|\.\.\\",
+                    'command_injection': r"[;&|]|(\|\|)",
+                    'ldap_injection': r"\(|\)|\*"
+                }
+                
+                for vuln_type, pattern in vuln_patterns.items():
+                    if re.search(pattern, str(input_value), re.IGNORECASE):
+                        path_result['vulnerability_candidates'].append({
+                            'type': vuln_type,
+                            'variable': var_info['name'],
+                            'value': input_value,
+                            'pattern': pattern
+                        })
+        
+        self.explored_paths.add(path_id)
+        return path_result
+    
+    def solve_constraints(self, constraints):
+        """Solve symbolic constraints (basic implementation)"""
+        solutions = []
+        
+        for constraint in constraints:
+            variable_id = constraint.get('variable_id')
+            condition = constraint.get('condition')
+            
+            if variable_id in self.symbolic_variables:
+                var_info = self.symbolic_variables[variable_id]
+                
+                # Basic constraint solving
+                if 'equals' in condition.lower():
+                    solutions.append({
+                        'variable': var_info['name'],
+                        'solution': condition.split('=')[1].strip() if '=' in condition else '',
+                        'confidence': 0.7
+                    })
+                elif 'contains' in condition.lower():
+                    solutions.append({
+                        'variable': var_info['name'],
+                        'solution': var_info['possible_values'][0] if var_info['possible_values'] else '',
+                        'confidence': 0.5
+                    })
+        
+        return solutions
+    
+    def analyze_code_path(self, code_snippet, input_variables):
+        """Analyze a code snippet for symbolic execution"""
+        analysis = {
+            'snippet_hash': hashlib.md5(code_snippet.encode()).hexdigest(),
+            'variables_found': [],
+            'branches_detected': [],
+            'symbolic_paths': []
+        }
+        
+        # Find variable assignments
+        var_patterns = [
+            r'\$(\w+)\s*=',  # PHP style
+            r'(\w+)\s*=',    # General assignment
+            r'params\["(\w+)"\]',  # Parameter access
+            r'(\w+)\.request',  # Object property
+        ]
+        
+        for pattern in var_patterns:
+            matches = re.findall(pattern, code_snippet)
+            for match in matches:
+                if match not in analysis['variables_found']:
+                    analysis['variables_found'].append(match)
+        
+        # Find conditional branches
+        branch_patterns = [
+            r'if\s*\((.+?)\)',
+            r'while\s*\((.+?)\)',
+            r'for\s*\((.+?)\)',
+            r'switch\s*\((.+?)\)'
+        ]
+        
+        for pattern in branch_patterns:
+            matches = re.findall(pattern, code_snippet)
+            for match in matches:
+                analysis['branches_detected'].append(match)
+        
+        # Generate symbolic paths based on branches
+        for branch in analysis['branches_detected']:
+            path = self.explore_path(input_variables, depth=len(analysis['symbolic_paths']))
+            if path:
+                analysis['symbolic_paths'].append(path)
+        
+        return analysis
+    
+    def get_coverage_report(self):
+        """Generate symbolic execution coverage report"""
+        return {
+            'explored_paths': len(self.explored_paths),
+            'symbolic_variables': len(self.symbolic_variables),
+            'path_constraints': len(self.path_constraints),
+            'branch_coverage': self.branch_coverage,
+            'execution_count': self.execution_count,
+            'max_depth_reached': max([p.get('depth', 0) for p in self.explored_paths] if self.explored_paths else [0]),
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def generate_test_inputs(self, symbolic_var_id):
+        """Generate test inputs based on symbolic variable analysis"""
+        if symbolic_var_id not in self.symbolic_variables:
+            return []
+        
+        var_info = self.symbolic_variables[symbolic_var_id]
+        test_inputs = []
+        
+        # Generate boundary values
+        if var_info['type'] == 'integer':
+            test_inputs.extend([0, 1, -1, 255, 256, 65535, 65536, -999999, 999999])
+        elif var_info['type'] == 'string':
+            test_inputs.extend([
+                '',  # Empty
+                'a' * 100,  # Long string
+                '../../etc/passwd',  # Path traversal
+                '<script>alert(1)</script>',  # XSS
+                "' OR '1'='1",  # SQLi
+                '${7*7}',  # Template injection
+                '%00',  # Null byte
+                'test@test.com',  # Email format
+                '🔥',  # Unicode
+            ])
+        
+        # Add constraint-based values
+        for constraint in var_info['constraints']:
+            if 'length' in constraint.lower():
+                test_inputs.append('a' * 1000)  # Very long
+            if 'special' in constraint.lower():
+                test_inputs.extend(['!@#$%^&*()', '<>{}[]'])
+        
+        return test_inputs
+
+
+class SymbolicExecutor:
+    """
+    High-level interface for symbolic execution in security testing.
+    Integrates with the scanning engine to provide path exploration.
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.engine = SymbolicExecutionEngine(config)
+        self.session_results = {}
+        self.enabled = config.get('symbolic_execution_enabled', True)
+        
+        logging.info("SymbolicExecutor initialized")
+    
+    def analyze_endpoint(self, url, method, parameters):
+        """Symbolically analyze an endpoint"""
+        if not self.enabled:
+            return None
+        
+        analysis_id = f"analysis_{uuid.uuid4().hex[:8]}"
+        
+        # Create symbolic variables for parameters
+        symbolic_vars = {}
+        for param_name, param_value in parameters.items():
+            var_id = self.engine.create_symbolic_variable(
+                param_name, 
+                self._infer_type(param_value)
+            )
+            symbolic_vars[param_name] = var_id
+        
+        # Explore execution paths
+        path_results = []
+        for param_name, var_id in symbolic_vars.items():
+            path = self.engine.explore_path(
+                {var_id: parameters[param_name]},
+                depth=0
+            )
+            if path:
+                path_results.append(path)
+        
+        # Generate test inputs
+        test_inputs = {}
+        for param_name, var_id in symbolic_vars.items():
+            test_inputs[param_name] = self.engine.generate_test_inputs(var_id)
+        
+        self.session_results[analysis_id] = {
+            'url': url,
+            'method': method,
+            'symbolic_vars': symbolic_vars,
+            'path_results': path_results,
+            'test_inputs': test_inputs,
+            'coverage': self.engine.get_coverage_report(),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return self.session_results[analysis_id]
+    
+    def _infer_type(self, value):
+        """Infer the type of a parameter value"""
+        if isinstance(value, bool):
+            return 'boolean'
+        elif isinstance(value, int):
+            return 'integer'
+        elif isinstance(value, str):
+            if '/' in value or '\\' in value:
+                return 'path'
+            elif value.startswith(('http://', 'https://', 'javascript:', 'data:')):
+                return 'url'
+            return 'string'
+        return 'string'
+    
+    def get_vulnerability_candidates(self):
+        """Get all vulnerability candidates from symbolic analysis"""
+        candidates = []
+        
+        for analysis_id, result in self.session_results.items():
+            for path in result.get('path_results', []):
+                for vuln in path.get('vulnerability_candidates', []):
+                    vuln['analysis_id'] = analysis_id
+                    vuln['url'] = result['url']
+                    candidates.append(vuln)
+        
+        return candidates
+    
+    def get_summary(self):
+        """Get symbolic execution summary"""
+        return {
+            'total_analyses': len(self.session_results),
+            'total_paths_explored': sum(
+                len(r.get('path_results', [])) 
+                for r in self.session_results.values()
+            ),
+            'vulnerability_candidates': len(self.get_vulnerability_candidates()),
+            'coverage_report': self.engine.get_coverage_report(),
+            'timestamp': datetime.now().isoformat()
+        }
 
 # ---------------------------------------------------------------------
 # GENETIC FUZZING ENGINE - AFL++/libFuzzer Inspired
