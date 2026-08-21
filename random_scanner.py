@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.0 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.1 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -267,7 +267,11 @@ GLOBAL REQUEST CACHE CONFIGURATION EXAMPLE:
     "request_cache": {
         "enabled": true,
         "max_size": 1000,
-        "default_ttl": 300
+        "default_ttl": 300,
+        "use_disk_storage": false,
+        "db_path": "baseline_cache.db",
+        "cleanup_interval_hours": 24,
+        "max_db_size_bytes": 104857600
     }
 }
 
@@ -280,6 +284,27 @@ GLOBAL REQUEST CACHE FEATURES:
 - Reduces network jitter and improves scan performance
 - Cache statistics tracking (hits, misses, hit rate)
 - Automatic expired entry cleanup
+- Disk-based storage option for large scans (prevents memory bloat)
+- Periodic cleanup with configurable intervals and size limits
+- Automatic database size management to prevent disk overflow
+
+VULNERABILITY STORAGE CONFIGURATION EXAMPLE:
+{
+    "vulnerability_storage": {
+        "db_path": "vulnerability_storage.db",
+        "cleanup_old_vulnerabilities": true,
+        "max_age_hours": 720
+    }
+}
+
+VULNERABILITY STORAGE FEATURES:
+- Disk-based SQLite storage for vulnerabilities (prevents memory bloat during long scans)
+- Pagination support for efficient retrieval of large vulnerability sets
+- Severity-based filtering and querying
+- Automatic storage statistics tracking
+- Configurable database path for persistence
+- Optional cleanup of old vulnerabilities based on age
+- Thread-safe operations for concurrent access
 
 REMOTE OS FINGERPRINTING CONFIGURATION EXAMPLE:
 {
@@ -478,6 +503,14 @@ import hmac
 import secrets
 import multiprocessing
 from multiprocessing import Queue, Manager, Process
+
+# Configure multiprocessing for Windows compatibility
+if multiprocessing.get_start_method() is None:
+    if sys.platform == 'win32':
+        multiprocessing.set_start_method('spawn')
+    else:
+        multiprocessing.set_start_method('fork')
+
 import aiohttp
 from aiohttp import ClientTimeout
 import glob
@@ -1238,6 +1271,29 @@ class AsyncTaskManager:
             logging.error(f"Error waiting for background tasks: {e}", exc_info=True)
     
     async def cancel_all(self):
+        """
+        Cancel all tracked background tasks.
+        Ensures proper cleanup and prevents orphaned tasks.
+        """
+        if not self.background_tasks:
+            return
+        
+        logging.info(f"Cancelling {len(self.background_tasks)} background tasks")
+        
+        async with self._lock:
+            for task in self.background_tasks:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logging.warning(f"Error during task cancellation: {e}")
+            
+            self.background_tasks.clear()
+    
+    async def cancel_all(self):
         """Cancel all tracked background tasks"""
         async with self._lock:
             for task in self.background_tasks:
@@ -1245,8 +1301,103 @@ class AsyncTaskManager:
                     task.cancel()
             self.background_tasks.clear()
 
+class BackgroundTaskManager:
+    """
+    Manager for background async tasks with proper lifecycle management.
+    Provides add_task and cancel_all methods for managing background tasks.
+    """
+    
+    def __init__(self):
+        self.background_tasks = set()
+        self._lock = asyncio.Lock()
+    
+    def add_task(self, coro, task_name="unnamed"):
+        """
+        Add a background task with proper exception handling.
+        
+        Args:
+            coro: The coroutine to execute
+            task_name: Descriptive name for the task (for logging)
+        
+        Returns:
+            The created task object
+        """
+        async def wrapped_coro():
+            try:
+                return await coro
+            except Exception as e:
+                logging.error(f"Background task '{task_name}' failed: {e}", exc_info=True)
+                raise
+        
+        task = asyncio.create_task(wrapped_coro())
+        
+        # Add proper exception handling callback
+        def handle_completion(t):
+            try:
+                if t.exception():
+                    logging.error(f"Background task '{task_name}' exception: {t.exception()}", exc_info=True)
+            except Exception as e:
+                logging.error(f"Error in background task completion callback for '{task_name}': {e}", exc_info=True)
+            finally:
+                # Clean up task from tracking set
+                asyncio.create_task(self._remove_task(task))
+        
+        task.add_done_callback(handle_completion)
+        
+        # Track the task (synchronously)
+        self.background_tasks.add(task)
+        
+        return task
+    
+    async def _remove_task(self, task):
+        """Remove a completed task from tracking set"""
+        async with self._lock:
+            self.background_tasks.discard(task)
+    
+    async def cancel_all(self):
+        """Cancel all tracked background tasks."""
+        if not self.background_tasks:
+            return
+        
+        logging.info(f"Cancelling {len(self.background_tasks)} background tasks")
+        
+        try:
+            # Cancel all tasks
+            for task in self.background_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for tasks to be cancelled (with timeout)
+            if self.background_tasks:
+                await asyncio.wait(self.background_tasks, timeout=5.0, return_when=asyncio.ALL_COMPLETED)
+            
+            self.background_tasks.clear()
+            logging.info("All background tasks cancelled successfully")
+        except asyncio.TimeoutError:
+            logging.warning(f"Timeout waiting for {len(self.background_tasks)} background tasks to cancel")
+            self.background_tasks.clear()
+        except Exception as e:
+            logging.error(f"Error cancelling background tasks: {e}", exc_info=True)
+            self.background_tasks.clear()
+
 # Global async task manager instance
 async_task_manager = AsyncTaskManager()
+
+# Security utility functions
+def validate_checkpoint_filename(filename):
+    """Validate checkpoint filename to prevent path traversal attacks"""
+    import re
+    # Allow only checkpoint_<timestamp>.json pattern
+    # timestamp should be digits only
+    pattern = r'^checkpoint_\d+\.json$'
+    if not re.match(pattern, filename):
+        return False
+    
+    # Ensure no path traversal characters
+    if '..' in filename or '/' in filename or '\\' in filename:
+        return False
+    
+    return True
 
 # PyQt5 imports for GUI components
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, 
@@ -1258,6 +1409,195 @@ from PyQt5.QtCore import Qt, QThread
 from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextDocument, QPalette
 
 # Multiprocessing Support for GIL Overcome
+# Module-level worker functions for Windows multiprocessing compatibility
+def _scan_url_worker(task_data):
+    """Module-level worker function for URL scanning"""
+    import asyncio
+    import aiohttp
+    from aiohttp import ClientTimeout
+    from datetime import datetime
+    
+    url = task_data['url']
+    config = task_data.get('config', {})
+    
+    try:
+        # Create isolated async loop for this process
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def scan():
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                    headers = dict(resp.headers)
+                    content = await resp.text()
+                    return {
+                        'url': url,
+                        'status': resp.status,
+                        'headers': headers,
+                        'content_length': len(content),
+                        'success': True
+                    }
+        
+        result = loop.run_until_complete(scan())
+        loop.close()
+        return result
+
+    except Exception as e:
+        import traceback
+        return {
+            'url': url,
+            'error': str(e),
+            'success': False,
+            'exception_type': type(e).__name__,
+            'timestamp': datetime.now().isoformat(),
+            'stack_trace': traceback.format_exc()
+        }
+
+def _test_payload_worker(task_data):
+    """Module-level worker function for payload testing"""
+    import asyncio
+    import aiohttp
+    from aiohttp import ClientTimeout
+    from datetime import datetime
+    
+    url = task_data['url']
+    payload = task_data['payload']
+    method = task_data.get('method', 'GET')
+    headers = task_data.get('headers', {})
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def test():
+            async with aiohttp.ClientSession() as session:
+                if method == 'GET':
+                    async with session.get(url, params=payload, headers=headers, 
+                                         timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                        content = await resp.text()
+                        return {
+                            'url': url,
+                            'payload': payload,
+                            'status': resp.status,
+                            'content_length': len(content),
+                            'success': True
+                        }
+                else:
+                    async with session.post(url, data=payload, headers=headers,
+                                          timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                        content = await resp.text()
+                        return {
+                            'url': url,
+                            'payload': payload,
+                            'status': resp.status,
+                            'content_length': len(content),
+                            'success': True
+                        }
+        
+        result = loop.run_until_complete(test())
+        loop.close()
+        return result
+
+    except Exception as e:
+        import traceback
+        return {
+            'url': url,
+            'payload': payload,
+            'error': str(e),
+            'success': False,
+            'exception_type': type(e).__name__,
+            'timestamp': datetime.now().isoformat(),
+            'stack_trace': traceback.format_exc()
+        }
+
+def _check_vulnerability_worker(task_data):
+    """Module-level worker function for vulnerability checking"""
+    import asyncio
+    import aiohttp
+    from aiohttp import ClientTimeout
+    from datetime import datetime
+    import re
+    
+    url = task_data['url']
+    check_type = task_data['check_type']
+    patterns = task_data.get('patterns', [])
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def check():
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
+                    content = await resp.text()
+                    
+                    vulnerabilities = []
+                    for pattern in patterns:
+                        if re.search(pattern, content, re.IGNORECASE):
+                            vulnerabilities.append({
+                                'pattern': pattern,
+                                'check_type': check_type
+                            })
+                    
+                    return {
+                        'url': url,
+                        'check_type': check_type,
+                        'vulnerabilities': vulnerabilities,
+                        'vulnerability': len(vulnerabilities) > 0,
+                        'success': True
+                    }
+        
+        result = loop.run_until_complete(check())
+        loop.close()
+        return result
+
+    except Exception as e:
+        import traceback
+        return {
+            'url': url,
+            'error': str(e),
+            'success': False,
+            'exception_type': type(e).__name__,
+            'timestamp': datetime.now().isoformat(),
+            'stack_trace': traceback.format_exc()
+        }
+
+def _worker_process_impl(task_queue, result_queue, shared_state):
+    """Module-level worker process implementation for Windows compatibility"""
+    import asyncio
+    import aiohttp
+    
+    while True:
+        try:
+            task = task_queue.get(timeout=TASK_QUEUE_TIMEOUT)
+            if task is None:  # Poison pill
+                break
+                
+            task_type = task.get('type')
+            task_data = task.get('data')
+            
+            if task_type == 'url_scan':
+                result = _scan_url_worker(task_data)
+            elif task_type == 'payload_test':
+                result = _test_payload_worker(task_data)
+            elif task_type == 'vulnerability_check':
+                result = _check_vulnerability_worker(task_data)
+            else:
+                result = {'error': f'Unknown task type: {task_type}'}
+            
+            result_queue.put(result)
+            
+            if result.get('success'):
+                shared_state['completed'] += 1
+                if result.get('vulnerability'):
+                    shared_state['vulnerabilities_found'] += 1
+            else:
+                shared_state['errors'] += 1
+                
+        except Exception as e:
+            result_queue.put({'error': str(e), 'task': task})
+            shared_state['errors'] += 1
+
 class MultiprocessingScanner:
     """
     Multiprocessing scanner to overcome Python GIL limitations.
@@ -1275,186 +1615,15 @@ class MultiprocessingScanner:
         self.shared_state['errors'] = 0
         self.shared_state['vulnerabilities_found'] = 0
         
-    def _worker_process(self, task_queue, result_queue, shared_state):
-        """Worker process that executes scanning tasks"""
-        import asyncio
-        import aiohttp
-        
-        while True:
-            try:
-                task = task_queue.get(timeout=TASK_QUEUE_TIMEOUT)
-                if task is None:  # Poison pill
-                    break
-                    
-                task_type = task.get('type')
-                task_data = task.get('data')
-                
-                if task_type == 'url_scan':
-                    result = self._scan_url_worker(task_data)
-                elif task_type == 'payload_test':
-                    result = self._test_payload_worker(task_data)
-                elif task_type == 'vulnerability_check':
-                    result = self._check_vulnerability_worker(task_data)
-                else:
-                    result = {'error': f'Unknown task type: {task_type}'}
-                
-                result_queue.put(result)
-                
-                if result.get('success'):
-                    shared_state['completed'] += 1
-                    if result.get('vulnerability'):
-                        shared_state['vulnerabilities_found'] += 1
-                else:
-                    shared_state['errors'] += 1
-                    
-            except Exception as e:
-                result_queue.put({'error': str(e), 'task': task})
-                shared_state['errors'] += 1
-                
-    def _scan_url_worker(self, task_data):
-        """Worker function for URL scanning"""
-        url = task_data['url']
-        config = task_data.get('config', {})
-        
-        try:
-            # Create isolated async loop for this process
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            async def scan():
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
-                        headers = dict(resp.headers)
-                        content = await resp.text()
-                        return {
-                            'url': url,
-                            'status': resp.status,
-                            'headers': headers,
-                            'content_length': len(content),
-                            'success': True
-                        }
-            
-            result = loop.run_until_complete(scan())
-            loop.close()
-            return result
-
-        except Exception as e:
-            import traceback
-            return {
-                'url': url,
-                'error': str(e),
-                'success': False,
-                'exception_type': type(e).__name__,
-                'timestamp': datetime.now().isoformat(),
-                'stack_trace': traceback.format_exc()
-            }
-    
-    def _test_payload_worker(self, task_data):
-        """Worker function for payload testing"""
-        url = task_data['url']
-        payload = task_data['payload']
-        method = task_data.get('method', 'GET')
-        headers = task_data.get('headers', {})
-        
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            async def test():
-                async with aiohttp.ClientSession() as session:
-                    if method == 'GET':
-                        async with session.get(url, params=payload, headers=headers, 
-                                             timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
-                            content = await resp.text()
-                            return {
-                                'url': url,
-                                'payload': payload,
-                                'status': resp.status,
-                                'content_length': len(content),
-                                'success': True
-                            }
-                    else:
-                        async with session.post(url, data=payload, headers=headers,
-                                              timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
-                            content = await resp.text()
-                            return {
-                                'url': url,
-                                'payload': payload,
-                                'status': resp.status,
-                                'content_length': len(content),
-                                'success': True
-                            }
-            
-            result = loop.run_until_complete(test())
-            loop.close()
-            return result
-
-        except Exception as e:
-            import traceback
-            return {
-                'url': url,
-                'payload': payload,
-                'error': str(e),
-                'success': False,
-                'exception_type': type(e).__name__,
-                'timestamp': datetime.now().isoformat(),
-                'stack_trace': traceback.format_exc()
-            }
-    
-    def _check_vulnerability_worker(self, task_data):
-        """Worker function for vulnerability checking"""
-        url = task_data['url']
-        check_type = task_data['check_type']
-        patterns = task_data.get('patterns', [])
-        
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            async def check():
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)) as resp:
-                        content = await resp.text()
-                        
-                        vulnerabilities = []
-                        for pattern in patterns:
-                            if re.search(pattern, content, re.IGNORECASE):
-                                vulnerabilities.append({
-                                    'pattern': pattern,
-                                    'check_type': check_type
-                                })
-                        
-                        return {
-                            'url': url,
-                            'check_type': check_type,
-                            'vulnerabilities': vulnerabilities,
-                            'vulnerability': len(vulnerabilities) > 0,
-                            'success': True
-                        }
-            
-            result = loop.run_until_complete(check())
-            loop.close()
-            return result
-
-        except Exception as e:
-            import traceback
-            return {
-                'url': url,
-                'error': str(e),
-                'success': False,
-                'exception_type': type(e).__name__,
-                'timestamp': datetime.now().isoformat(),
-                'stack_trace': traceback.format_exc()
-            }
-    
     def start_workers(self):
         """Start worker processes"""
         self.processes = []
         for _ in range(self.num_processes):
-            p = Process(target=self._worker_process, 
+            p = Process(target=_worker_process_impl, 
                        args=(self.task_queue, self.result_queue, self.shared_state))
             p.start()
             self.processes.append(p)
+
     
     def add_task(self, task_type, task_data):
         """Add a task to the queue"""
@@ -5923,11 +6092,9 @@ COMMAND_PATTERN = re.compile(
 )
 AWS_META_PATTERN = re.compile(r"(ami-id|instance-id|public-keys|security-credentials)", re.I)
 
-# Simple dict cache with size limit to prevent unbounded memory growth (fix for issue #21)
-_obfuscation_cache = {}
-_obfuscation_cache_max_size = 1000
-_obfuscation_cache_lock = threading.Lock()
+from functools import lru_cache
 
+@lru_cache(maxsize=1000)
 def obfuscate(payload, context="param"):
     """
     Context-aware payload obfuscation for different injection contexts.
@@ -5941,10 +6108,6 @@ def obfuscate(payload, context="param"):
     - css: CSS injection
     - sql: SQL injection context
     """
-    cache_key = (payload, context)
-    with _obfuscation_cache_lock:
-        if cache_key in _obfuscation_cache:
-            return _obfuscation_cache[cache_key]
     
     def generate_variants():
         yield payload
@@ -6081,16 +6244,7 @@ def obfuscate(payload, context="param"):
                     yield fullwidth.replace(keyword.upper(), keyword.upper()[0] + "\u200B" + keyword.upper()[1:])  # Zero-width space instead of %09
                     break
     
-    variants = list(set(generate_variants()))
-    
-    # Cache with size limit
-    with _obfuscation_cache_lock:
-        if len(_obfuscation_cache) >= _obfuscation_cache_max_size:
-            # Remove oldest entry (simple FIFO)
-            _obfuscation_cache.pop(next(iter(_obfuscation_cache)))
-        _obfuscation_cache[cache_key] = variants
-    
-    return variants
+    return list(set(generate_variants()))
 
 # Context-specific obfuscation functions
 def json_escape(payload):
@@ -8696,8 +8850,11 @@ def validate_ip_address(ip_str):
 def validate_domain(domain_str):
     if not domain_str:
         return False
+    # Relaxed domain regex to allow hyphens anywhere in labels
+    # Allows alphanumeric, hyphens, and underscores in labels
+    # More permissive for modern subdomain patterns
     domain_pattern = re.compile(
-        r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        r'^([a-zA-Z0-9\-_]+\.)*[a-zA-Z0-9\-_]+\.[a-zA-Z]{2,}$'
     )
     return bool(domain_pattern.match(domain_str))
 
@@ -9016,13 +9173,21 @@ async def wait_for_oob_callback_async(marker, timeout_seconds=60, check_interval
     smtp_oob_results = oob_lists['smtp_oob_results']
     
     try:
-        # Use event-based waiting with extended timeout to catch late arrivals
+        # Use event-based waiting with timeout loop for periodic checks
         # Wait for both normal timeout + history TTL to catch late-arriving callbacks
         extended_timeout = timeout_seconds + OOB_MARKER_HISTORY_TTL
-        try:
-            await asyncio.wait_for(callback_event.wait(), timeout=extended_timeout)
-        except asyncio.TimeoutError:
-            pass
+        check_interval = 1.0  # Check every second for better responsiveness
+        
+        # Loop with periodic checks instead of one long wait
+        while time.time() < end_time + OOB_MARKER_HISTORY_TTL:
+            try:
+                # Wait for the event with a small timeout to allow periodic checks
+                await asyncio.wait_for(callback_event.wait(), timeout=check_interval)
+                # Event was set, break out of the loop
+                break
+            except asyncio.TimeoutError:
+                # Timeout for this interval, continue the loop
+                continue
         
         # Event was triggered or timeout occurred - check for actual results
         async with oob_unified_lock:
@@ -11952,17 +12117,30 @@ class BaselineCache:
     This prevents redundant requests to the same baseline URLs,
     reducing network jitter and improving scan performance.
     """
-    def __init__(self, max_size=1000, default_ttl=300):
+    def __init__(self, max_size=1000, default_ttl=300, use_disk_storage=False, db_path='baseline_cache.db'):
         """
         Initialize the LRU cache with SQLite disk cache to prevent memory bloat.
         
         Args:
             max_size: Maximum number of entries to store (default: 1000)
             default_ttl: Default time-to-live in seconds (default: 300 = 5 minutes)
+            use_disk_storage: Use file-based SQLite instead of in-memory (default: False)
+            db_path: Path to database file when use_disk_storage is True (default: 'baseline_cache.db')
         """
         # Use SQLite disk cache to prevent memory bloat
         import sqlite3
-        self.conn = sqlite3.connect(':memory:')  # or ':memory:' for speed, or file for persistence
+        self.use_disk_storage = use_disk_storage
+        self.db_path = db_path
+        
+        if use_disk_storage:
+            # Use file-based SQLite for large scans to prevent memory bloat
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            logging.info(f"BaselineCache: Using disk-based storage at {db_path}")
+        else:
+            # Use in-memory SQLite for speed (default for backward compatibility)
+            self.conn = sqlite3.connect(':memory:')
+            logging.info("BaselineCache: Using in-memory storage")
+            
         self.cursor = self.conn.cursor()
         self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
         self.conn.commit()
@@ -12090,6 +12268,60 @@ class BaselineCache:
                 self.conn.close()
         except Exception as e:
             logging.warning(f"Error closing BaselineCache: {e}")
+
+    async def periodic_cleanup(self, max_age_hours=24, max_size_limit=None):
+        """
+        Perform periodic cleanup of expired entries and size management.
+        
+        Args:
+            max_age_hours: Remove entries older than this many hours (default: 24)
+            max_size_limit: Optional maximum database size in bytes, enforce if provided
+            
+        Returns:
+            dict: Cleanup statistics including number of entries removed
+        """
+        async with self.lock:
+            import time
+            current_time = time.time()
+            cleanup_stats = {
+                'expired_removed': 0,
+                'size_enforced': False,
+                'total_removed': 0
+            }
+            
+            try:
+                # Remove expired entries
+                cutoff_time = current_time - (max_age_hours * 3600)
+                self.cursor.execute('DELETE FROM cache WHERE expiry < ?', (cutoff_time,))
+                expired_count = self.cursor.rowcount
+                self.conn.commit()
+                cleanup_stats['expired_removed'] = expired_count
+                
+                # Enforce size limit if specified
+                if max_size_limit and self.use_disk_storage:
+                    # Check current database size
+                    import os
+                    if os.path.exists(self.db_path):
+                        current_size = os.path.getsize(self.db_path)
+                        if current_size > max_size_limit:
+                            # Remove oldest entries until under limit
+                            while current_size > max_size_limit:
+                                self.cursor.execute('DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY expiry LIMIT 100)')
+                                self.conn.commit()
+                                if os.path.exists(self.db_path):
+                                    current_size = os.path.getsize(self.db_path)
+                                else:
+                                    break
+                            cleanup_stats['size_enforced'] = True
+                
+                cleanup_stats['total_removed'] = cleanup_stats['expired_removed']
+                logging.info(f"BaselineCache periodic cleanup: {cleanup_stats['total_removed']} entries removed")
+                
+                return cleanup_stats
+                
+            except Exception as e:
+                logging.warning(f"BaselineCache periodic cleanup error: {e}")
+                return cleanup_stats
     
     def get_stats(self):
         """Get cache statistics."""
@@ -17277,12 +17509,32 @@ class ScanStateManager:
         if not checkpoint_files:
             return None
         
+        # Filter and validate checkpoint files
+        valid_files = []
+        for filename in checkpoint_files:
+            if self._validate_checkpoint_filename(filename):
+                valid_files.append(filename)
+            else:
+                logging.warning(f"Skipping invalid checkpoint file: {filename}")
+        
+        if not valid_files:
+            return None
+        
         # Sort by timestamp (extracted from filename)
-        checkpoint_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]), reverse=True)
-        return checkpoint_files[0] if checkpoint_files else None
+        valid_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]), reverse=True)
+        return valid_files[0] if valid_files else None
+    
+    def _validate_checkpoint_filename(self, filename):
+        """Validate checkpoint filename to prevent path traversal attacks"""
+        return validate_checkpoint_filename(filename)
     
     def load_checkpoint_file(self, checkpoint_file):
-        """Load checkpoint from a specific file"""
+        """Load checkpoint from a specific file with filename validation"""
+        # Validate filename before opening
+        if not self._validate_checkpoint_filename(checkpoint_file):
+            logging.error(f"Security: Rejecting unsafe checkpoint filename: {checkpoint_file}")
+            return None
+        
         try:
             with open(checkpoint_file, 'r') as f:
                 checkpoint = json.load(f)
@@ -17485,6 +17737,152 @@ class CWE_RemediationGuide:
         return cls.REMEDIATION_GUIDES.get(cwe_id, {"name": "Unknown", "mitigation": "No remediation guide available."})
 
 # ---------------------------------------------------------------------
+# JSRENDER DRIVER MANAGER
+# ---------------------------------------------------------------------
+class JSRenderDriverManager:
+    """
+    Manages Selenium WebDriver lifecycle with proper cleanup and zombie process prevention.
+    Handles driver restart, cleanup, and ensures no orphaned Chrome processes.
+    """
+    
+    def __init__(self):
+        self.driver = None
+        self.driver_lock = asyncio.Lock()
+        self.restart_attempts = 0
+        self.max_restart_attempts = 3
+        self._driver_process = None
+        
+    async def initialize(self, selenium_driver):
+        """Initialize the driver manager with an existing Selenium driver"""
+        async with self.driver_lock:
+            self.driver = selenium_driver
+            if hasattr(selenium_driver, 'driver') and selenium_driver.driver:
+                # Track the underlying Chrome process for cleanup
+                try:
+                    if hasattr(selenium_driver.driver, 'service') and hasattr(selenium_driver.driver.service, 'process'):
+                        self._driver_process = selenium_driver.driver.service.process
+                except Exception as e:
+                    logging.warning(f"Could not track driver process: {e}")
+            self.restart_attempts = 0
+    
+    async def restart_driver(self, selenium_driver):
+        """
+        Safely restart the Selenium driver with proper cleanup.
+        Returns True if restart succeeded, False otherwise.
+        """
+        async with self.driver_lock:
+            if self.restart_attempts >= self.max_restart_attempts:
+                logging.error(f"Max restart attempts ({self.max_restart_attempts}) reached, giving up")
+                return False
+            
+            self.restart_attempts += 1
+            logging.warning(f"Attempting Selenium driver restart (attempt {self.restart_attempts}/{self.max_restart_attempts})")
+            
+            try:
+                # Clean up existing driver properly
+                await self._cleanup_driver()
+                
+                # Restart the driver
+                try:
+                    selenium_driver.__exit__(None, None, None)
+                    selenium_driver.__enter__()
+                    
+                    if selenium_driver.driver:
+                        self.driver = selenium_driver
+                        self.selenium_ready = True
+                        
+                        # Track the new process
+                        try:
+                            if hasattr(selenium_driver.driver, 'service') and hasattr(selenium_driver.driver.service, 'process'):
+                                self._driver_process = selenium_driver.driver.service.process
+                        except Exception as e:
+                            logging.warning(f"Could not track new driver process: {e}")
+                        
+                        # Reset restart attempts on success
+                        self.restart_attempts = 0
+                        logging.info("Selenium driver restart successful")
+                        return True
+                    else:
+                        logging.error("Selenium driver restart failed - no driver after restart")
+                        return False
+                        
+                except Exception as restart_error:
+                    logging.error(f"Selenium driver restart failed: {restart_error}", exc_info=True)
+                    await self._cleanup_driver()
+                    return False
+                    
+            except Exception as e:
+                logging.error(f"Error during driver restart: {e}", exc_info=True)
+                await self._cleanup_driver()
+                return False
+    
+    async def _cleanup_driver(self):
+        """Clean up driver resources and kill zombie processes"""
+        # Kill the tracked process if it exists
+        if self._driver_process:
+            try:
+                import psutil
+                try:
+                    process = psutil.Process(self._driver_process.pid)
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    logging.info(f"Terminated driver process {self._driver_process.pid}")
+                except psutil.NoSuchProcess:
+                    logging.debug(f"Driver process {self._driver_process.pid} already terminated")
+                except Exception as e:
+                    logging.warning(f"Could not terminate driver process: {e}")
+            except ImportError:
+                # Fallback if psutil not available
+                try:
+                    self._driver_process.terminate()
+                    self._driver_process.wait(timeout=5)
+                except Exception as e:
+                    logging.warning(f"Could not terminate driver process (psutil not available): {e}")
+            except Exception as e:
+                logging.warning(f"Error during driver process cleanup: {e}")
+            finally:
+                self._driver_process = None
+        
+        # Kill any orphaned Chrome processes
+        await self._kill_orphaned_chrome_processes()
+    
+    async def _kill_orphaned_chrome_processes(self):
+        """Kill orphaned Chrome processes that may be left behind"""
+        try:
+            import psutil
+            import signal
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['name'] and 'chrome' in proc.info['name'].lower():
+                        # Check if it's a Chrome driver process (has chromedriver in parent or args)
+                        cmdline = proc.info['cmdline'] or []
+                        if any('chromedriver' in str(arg).lower() for arg in cmdline):
+                            logging.info(f"Killing orphaned Chrome process {proc.info['pid']}")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=3)
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                proc.wait()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except ImportError:
+            logging.debug("psutil not available, skipping orphaned Chrome process cleanup")
+        except Exception as e:
+            logging.warning(f"Error killing orphaned Chrome processes: {e}")
+    
+    async def cleanup(self):
+        """Final cleanup when shutting down"""
+        async with self.driver_lock:
+            await self._cleanup_driver()
+            self.driver = None
+
+# ---------------------------------------------------------------------
 # SAFE ASYNC WAIT HELPER
 # ---------------------------------------------------------------------
 async def safe_async_wait(tasks, timeout=None, return_when=asyncio.ALL_COMPLETED):
@@ -17492,7 +17890,36 @@ async def safe_async_wait(tasks, timeout=None, return_when=asyncio.ALL_COMPLETED
         return set(), set()
     # Convert coroutines to tasks to avoid deprecation warning
     task_list = [asyncio.create_task(task) if asyncio.iscoroutine(task) else task for task in tasks]
-    return await asyncio.wait(task_list, timeout=timeout, return_when=return_when)
+    
+    try:
+        if timeout is not None:
+            async with asyncio.timeout(timeout):
+                done, pending = await asyncio.wait(task_list, return_when=return_when)
+        else:
+            done, pending = await asyncio.wait(task_list, return_when=return_when)
+        
+        # Cancel pending tasks to ensure cleanup
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logging.warning(f"Error during task cancellation: {e}")
+        
+        return done, pending
+    except TimeoutError:
+        # Cancel all tasks on timeout
+        for task in task_list:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logging.warning(f"Error during task cancellation on timeout: {e}")
+        return set(), set(task_list)
 
 # ---------------------------------------------------------------------
 # VALIDATION ENGINE - 3x Validation & Remediation Testing
@@ -22047,6 +22474,367 @@ class DiskBasedURLStorage:
             self.conn.close()
 
 
+class DiskBasedVulnerabilityStorage:
+    """
+    Disk-based vulnerability storage with pagination for large-scale scanning.
+    Replaces in-memory vulnerability lists with SQLite database for scalability.
+    """
+
+    def __init__(self, db_path='vulnerability_storage.db'):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock = threading.Lock()
+        self._init_tables()
+
+    def _init_tables(self):
+        """Initialize database tables for vulnerability storage"""
+        with self.lock:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS vulnerabilities
+                             (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                              type TEXT, url TEXT, parameter TEXT, 
+                              evidence TEXT, severity TEXT, confidence INTEGER,
+                              cwe TEXT, timestamp TEXT, payload TEXT)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_type ON vulnerabilities(type)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_url ON vulnerabilities(url)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_severity ON vulnerabilities(severity)''')
+            self.conn.commit()
+
+    def add_vulnerability(self, vulnerability: Dict[str, Any]) -> int:
+        """Add vulnerability to database"""
+        with self.lock:
+            cursor = self.conn.execute(
+                """INSERT INTO vulnerabilities 
+                   (type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    vulnerability.get('type', ''),
+                    vulnerability.get('url', ''),
+                    vulnerability.get('parameter', ''),
+                    vulnerability.get('evidence', ''),
+                    vulnerability.get('severity', ''),
+                    vulnerability.get('confidence', 0),
+                    vulnerability.get('cwe', ''),
+                    datetime.now().isoformat(),
+                    vulnerability.get('payload', '')
+                )
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    def get_vulnerabilities_paginated(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get vulnerabilities with pagination for memory efficiency"""
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                   FROM vulnerabilities ORDER BY timestamp DESC LIMIT ? OFFSET ?""",
+                (limit, offset)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'type': row[0],
+                    'url': row[1],
+                    'parameter': row[2],
+                    'evidence': row[3],
+                    'severity': row[4],
+                    'confidence': row[5],
+                    'cwe': row[6],
+                    'timestamp': row[7],
+                    'payload': row[8]
+                }
+                for row in rows
+            ]
+
+    def get_vulnerabilities_by_severity(self, severity: str) -> List[Dict[str, Any]]:
+        """Get all vulnerabilities of a specific severity"""
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                   FROM vulnerabilities WHERE severity = ? ORDER BY timestamp DESC""",
+                (severity,)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'type': row[0],
+                    'url': row[1],
+                    'parameter': row[2],
+                    'evidence': row[3],
+                    'severity': row[4],
+                    'confidence': row[5],
+                    'cwe': row[6],
+                    'timestamp': row[7],
+                    'payload': row[8]
+                }
+                for row in rows
+            ]
+
+    def get_vulnerabilities_by_type(self, vuln_type: str) -> List[Dict[str, Any]]:
+        """Get all vulnerabilities of a specific type"""
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                   FROM vulnerabilities WHERE type = ? ORDER BY timestamp DESC""",
+                (vuln_type,)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'type': row[0],
+                    'url': row[1],
+                    'parameter': row[2],
+                    'evidence': row[3],
+                    'severity': row[4],
+                    'confidence': row[5],
+                    'cwe': row[6],
+                    'timestamp': row[7],
+                    'payload': row[8]
+                }
+                for row in rows
+            ]
+
+    def get_vulnerability_count(self) -> int:
+        """Get total count of vulnerabilities"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities")
+            return cursor.fetchone()[0]
+
+    def get_vulnerability_count_by_severity(self, severity: str) -> int:
+        """Get count of vulnerabilities by severity"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities WHERE severity = ?", (severity,))
+            return cursor.fetchone()[0]
+
+    def cleanup_old_vulnerabilities(self, max_age_hours: int = 24):
+        """Remove vulnerabilities older than specified hours"""
+        with self.lock:
+            cutoff_time = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+            cursor = self.conn.execute(
+                "DELETE FROM vulnerabilities WHERE timestamp < ?",
+                (cutoff_time,)
+            )
+            self.conn.commit()
+            return cursor.rowcount
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Get storage statistics"""
+        with self.lock:
+            total_count = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities").fetchone()[0]
+            
+            # Get counts by severity
+            severity_counts = {}
+            for severity in ['Critical', 'High', 'Medium', 'Low', 'Info']:
+                count = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities WHERE severity = ?", (severity,)).fetchone()[0]
+                if count > 0:
+                    severity_counts[severity] = count
+            
+            # Get database file size
+            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            
+            return {
+                'total_vulnerabilities': total_count,
+                'by_severity': severity_counts,
+                'db_size_bytes': db_size,
+                'db_size_mb': round(db_size / (1024 * 1024), 2)
+            }
+
+    def get_all_vulnerabilities(self) -> List[Dict[str, Any]]:
+        """Get all vulnerabilities (use with caution for large datasets)"""
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                   FROM vulnerabilities ORDER BY timestamp DESC"""
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'type': row[0],
+                    'url': row[1],
+                    'parameter': row[2],
+                    'evidence': row[3],
+                    'severity': row[4],
+                    'confidence': row[5],
+                    'cwe': row[6],
+                    'timestamp': row[7],
+                    'payload': row[8]
+                }
+                for row in rows
+            ]
+
+    def clear_all_vulnerabilities(self):
+        """Clear all vulnerabilities from database"""
+        with self.lock:
+            self.conn.execute("DELETE FROM vulnerabilities")
+            self.conn.commit()
+
+    def close(self):
+        """Close database connection"""
+        with self.lock:
+            self.conn.close()
+
+
+class SecondOrderInjectionQueue:
+    """
+    Persistent queue for delayed second-order injection verification.
+    Stores injection points with TTL and supports background retry processing.
+    """
+
+    def __init__(self, db_path='second_order_queue.db', default_ttl=300):
+        self.db_path = db_path
+        self.default_ttl = default_ttl
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock = threading.Lock()
+        self._init_tables()
+
+    def _init_tables(self):
+        """Initialize database tables for injection point queue"""
+        with self.lock:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS injection_queue
+                             (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                              url TEXT, 
+                              referrer TEXT, 
+                              cookies TEXT, 
+                              headers TEXT, 
+                              data TEXT, 
+                              timestamp TEXT, 
+                              ttl INTEGER,
+                              retry_count INTEGER DEFAULT 0,
+                              max_retries INTEGER DEFAULT 10,
+                              status TEXT DEFAULT 'pending',
+                              last_retry TEXT)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_queue_status ON injection_queue(status)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_queue_timestamp ON injection_queue(timestamp)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS idx_queue_status_timestamp ON injection_queue(status, timestamp)''')
+            self.conn.commit()
+
+    def add_injection_point(self, injection_point: Dict[str, Any], ttl: int = None) -> int:
+        """Add injection point to queue for delayed verification"""
+        with self.lock:
+            ttl = ttl or self.default_ttl
+            cursor = self.conn.execute(
+                """INSERT INTO injection_queue 
+                   (url, referrer, cookies, headers, data, timestamp, ttl, retry_count, max_retries, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    injection_point.get('url', ''),
+                    injection_point.get('referrer', ''),
+                    json.dumps(injection_point.get('cookies', {})),
+                    json.dumps(injection_point.get('headers', {})),
+                    json.dumps(injection_point.get('data', {})),
+                    datetime.fromtimestamp(injection_point.get('timestamp', time.time())).isoformat(),
+                    ttl,
+                    0,
+                    10,  # Default max retries
+                    'pending'
+                )
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_injection_points(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get pending injection points for verification"""
+        with self.lock:
+            current_time = datetime.now()
+            cursor = self.conn.execute(
+                """SELECT id, url, referrer, cookies, headers, data, timestamp, ttl, retry_count, max_retries, last_retry
+                   FROM injection_queue 
+                   WHERE status = 'pending' AND retry_count < max_retries
+                   ORDER BY timestamp ASC 
+                   LIMIT ?""",
+                (limit,)
+            )
+            rows = cursor.fetchall()
+            injection_points = []
+            for row in rows:
+                try:
+                    injection_points.append({
+                        'id': row[0],
+                        'url': row[1],
+                        'referrer': row[2],
+                        'cookies': json.loads(row[3]) if row[3] else {},
+                        'headers': json.loads(row[4]) if row[4] else {},
+                        'data': json.loads(row[5]) if row[5] else {},
+                        'timestamp': row[6],
+                        'ttl': row[7],
+                        'retry_count': row[8],
+                        'max_retries': row[9],
+                        'last_retry': row[10]
+                    })
+                except json.JSONDecodeError:
+                    logging.warning(f"Failed to parse injection point data for ID {row[0]}")
+                    continue
+            return injection_points
+
+    def update_retry_count(self, injection_id: int, success: bool = False):
+        """Update retry count and status for an injection point"""
+        with self.lock:
+            if success:
+                self.conn.execute(
+                    "UPDATE injection_queue SET status = 'verified', last_retry = ? WHERE id = ?",
+                    (datetime.now().isoformat(), injection_id)
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE injection_queue SET retry_count = retry_count + 1, last_retry = ? WHERE id = ?",
+                    (datetime.now().isoformat(), injection_id)
+                )
+            self.conn.commit()
+
+    def cleanup_expired_injection_points(self):
+        """Remove expired injection points based on TTL"""
+        with self.lock:
+            current_time = datetime.now()
+            cursor = self.conn.execute(
+                """SELECT id, timestamp, ttl FROM injection_queue WHERE status = 'pending'"""
+            )
+            rows = cursor.fetchall()
+            expired_ids = []
+            for row in rows:
+                try:
+                    injection_time = datetime.fromisoformat(row[1])
+                    ttl_seconds = row[2]
+                    if (current_time - injection_time).total_seconds() > ttl_seconds:
+                        expired_ids.append(row[0])
+                except (ValueError, TypeError):
+                    continue
+            
+            if expired_ids:
+                cursor = self.conn.execute(
+                    f"DELETE FROM injection_queue WHERE id IN ({','.join(['?'] * len(expired_ids))})",
+                    expired_ids
+                )
+                self.conn.commit()
+                logging.info(f"Cleaned up {len(expired_ids)} expired injection points from queue")
+                return len(expired_ids)
+            return 0
+
+    def get_queue_stats(self) -> Dict[str, Any]:
+        """Get queue statistics"""
+        with self.lock:
+            total_count = self.conn.execute("SELECT COUNT(*) FROM injection_queue").fetchone()[0]
+            pending_count = self.conn.execute("SELECT COUNT(*) FROM injection_queue WHERE status = 'pending'").fetchone()[0]
+            verified_count = self.conn.execute("SELECT COUNT(*) FROM injection_queue WHERE status = 'verified'").fetchone()[0]
+            failed_count = self.conn.execute("SELECT COUNT(*) FROM injection_queue WHERE retry_count >= max_retries").fetchone()[0]
+            
+            return {
+                'total_injection_points': total_count,
+                'pending': pending_count,
+                'verified': verified_count,
+                'failed': failed_count
+            }
+
+    def clear_queue(self):
+        """Clear all injection points from queue"""
+        with self.lock:
+            self.conn.execute("DELETE FROM injection_queue")
+            self.conn.commit()
+
+    def close(self):
+        """Close database connection"""
+        with self.lock:
+            self.conn.close()
+
+
 class CrawlerEngine:
     def __init__(self, target: str, config: Dict[str, Any], base_domain: str, exclusion_patterns: List[str], circuit_breaker: CircuitBreaker) -> None:
         self.target = target
@@ -22396,7 +23184,9 @@ class SessionManager:
         cache_config = config.get('request_cache', {})
         self.request_cache = BaselineCache(
             max_size=cache_config.get('max_size', 1000),
-            default_ttl=cache_config.get('default_ttl', 300)  # 5 minutes default
+            default_ttl=cache_config.get('default_ttl', 300),  # 5 minutes default
+            use_disk_storage=cache_config.get('use_disk_storage', False),
+            db_path=cache_config.get('db_path', 'baseline_cache.db')
         )
         self.cache_enabled = cache_config.get('enabled', True)
         
@@ -22850,7 +23640,15 @@ class ReportingEngine:
     def __init__(self, config, signals, session_manager=None, cve_template_engine=None, fp_db=None):
         self.config = config
         self.signals = signals
+        
+        # Use disk-based vulnerability storage to prevent memory bloat during long scans
+        vuln_storage_config = config.get('vulnerability_storage', {})
+        db_path = vuln_storage_config.get('db_path', 'vulnerability_storage.db')
+        self.vulnerability_storage = DiskBasedVulnerabilityStorage(db_path)
+        
+        # Keep in-memory list for backward compatibility and quick access
         self.vulnerabilities = []
+        
         # Use shared FP_Database instance if provided, otherwise create new one
         self.fp_db = fp_db if fp_db is not None else FP_Database(config=config)
         self.session_manager = session_manager
@@ -22863,8 +23661,14 @@ class ReportingEngine:
         else:
             logging.info(msg)
     def add_finding(self, vuln):
-        # Add to vulnerabilities list for export purposes
+        # Add to vulnerabilities list for export purposes (maintain backward compatibility)
         self.vulnerabilities.append(vuln)
+        
+        # Also store in disk-based database to prevent memory bloat during long scans
+        try:
+            self.vulnerability_storage.add_vulnerability(vuln)
+        except Exception as e:
+            logging.warning(f"Failed to store vulnerability in database: {e}")
         
         # Use CVE template engine if available to enhance vulnerability data
         if self.cve_template_engine:
@@ -23025,6 +23829,14 @@ class ReportingEngine:
                 await self.fp_db.close()
             except Exception as e:
                 logging.warning(f"Error closing FP database: {e}")
+        
+        # Close vulnerability storage to prevent resource leaks
+        if hasattr(self, 'vulnerability_storage'):
+            try:
+                self.vulnerability_storage.close()
+                logging.info("ReportingEngine: Vulnerability storage closed")
+            except Exception as e:
+                logging.warning(f"Error closing vulnerability storage: {e}")
     
     def format_taint_vulnerability(self, taint_vuln: Dict) -> Dict:
         """Format taint tracking vulnerability for standard reporting"""
@@ -23568,6 +24380,8 @@ class InjectionEngine:
         self.selenium_driver = None
         self.selenium_ready = False
         self.stop_event = asyncio.Event()
+        self.js_driver_manager = JSRenderDriverManager()
+        self.background_task_manager = BackgroundTaskManager()
         self.concurrency_limit = config.get('concurrency_limit', 100)
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
         self.current_task = 0
@@ -23601,7 +24415,7 @@ class InjectionEngine:
         self.http3_client = HTTP3Client(config)
         if self.taint_tracking_enabled:
             try:
-                self.taint_tracker = TaintTracker(config)
+                self.taint_tracker = AdvancedTaintTracker(config)
                 self.taint_instrumentor = TaintInstrumentor(config)
                 logging.info("Taint tracking enabled and initialized")
             except Exception as e:
@@ -23679,6 +24493,10 @@ class InjectionEngine:
         self.injection_points = []
         self.injection_points_ttl = 300  # 5 minutes TTL for injection points context
         
+        # Initialize persistent queue for delayed second-order injection verification
+        queue_db_path = config.get('second_order_queue_db', 'second_order_queue.db')
+        self.second_order_queue = SecondOrderInjectionQueue(queue_db_path, self.injection_points_ttl)
+        
         # Initialize FSM-aware testing components
         self.business_logic_fsm = getattr(scanner, 'business_logic_fsm', None)
         self.fsm_aware_testing_enabled = getattr(scanner, 'fsm_aware_testing_enabled', True)
@@ -23713,7 +24531,7 @@ class InjectionEngine:
     def update_progress(self, current, total):
         self.reporting_engine.update_progress(current, total)
     async def close(self):
-        """Clean up resources including fp_db, heuristic oracle, and scan state manager"""
+        """Clean up resources including fp_db, heuristic oracle, scan state manager, and second-order queue"""
         if self.fp_db:
             try:
                 await self.fp_db.close()
@@ -23740,6 +24558,15 @@ class InjectionEngine:
                 self.scan_state_manager.close()
             except Exception as e:
                 logging.warning(f"Error closing scan state manager in InjectionEngine: {e}")
+        
+        # Close second-order injection queue
+        if hasattr(self, 'second_order_queue') and self.second_order_queue:
+            try:
+                queue_stats = self.second_order_queue.get_queue_stats()
+                logging.info(f"Second-order injection queue stats: {queue_stats}")
+                self.second_order_queue.close()
+            except Exception as e:
+                logging.warning(f"Error closing second-order injection queue in InjectionEngine: {e}")
     async def _safe_request(self, method, url, **kwargs):
         """Make HTTP request using session manager with deduplication and HTTP/2/3 support"""
         try:
@@ -23791,9 +24618,9 @@ class InjectionEngine:
         
         raw_request = f"{method} {path} HTTP/1.1\r\n"
         
-        # Use custom Host header if provided, otherwise use parsed URL netloc
+        # Use custom Host header if provided, otherwise use parsed URL hostname (without port)
         # This preserves virtual host scanning capabilities
-        host_header = headers.get('Host', parsed_url.netloc)
+        host_header = headers.get('Host', parsed_url.hostname)
         raw_request += f"Host: {host_header}\r\n"
         
         # Add remaining headers, excluding Host since we already added it
@@ -23867,7 +24694,7 @@ class InjectionEngine:
         # Taint tracking is now implemented - initialize if enabled
         if self.taint_tracking_enabled and not self.taint_tracker:
             try:
-                self.taint_tracker = TaintTracker(self.config)
+                self.taint_tracker = AdvancedTaintTracker(self.config)
                 self.taint_instrumentor = TaintInstrumentor(self.config)
                 logging.info("Taint tracking initialized for testing")
             except Exception as e:
@@ -25363,16 +26190,10 @@ class InjectionEngine:
                 return await self._async_fetch(test_url)
             except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                 logging.warning(f"Network error during GET injection - attempting recovery: {e}")
-                if self.selenium_driver:
-                    try:
-                        logging.warning("Restarting Selenium driver")
-                        self.selenium_driver.__exit__(None, None, None)
-                        self.selenium_driver.__enter__()
-                        if self.selenium_driver.driver:
-                            self.selenium_ready = True
-                            return await self._async_fetch(test_url)
-                    except Exception as recovery_error:
-                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
+                if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                    restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                    if restart_success:
+                        return await self._async_fetch(test_url)
                 raise
             except Exception as e:
                 logging.warning(f"Unexpected error during GET injection: {e}", exc_info=True)
@@ -25402,18 +26223,11 @@ class InjectionEngine:
                                 resp = await self._async_fetch(url, method='POST', json_data=mutated_json)
                             except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                                 logging.warning(f"Network error during JSON mutation - attempting recovery: {e}")
-                                if self.selenium_driver:
-                                    try:
-                                        logging.warning("Restarting Selenium driver")
-                                        self.selenium_driver.__exit__(None, None, None)
-                                        self.selenium_driver.__enter__()
-                                        if self.selenium_driver.driver:
-                                            self.selenium_ready = True
-                                            resp = await self._async_fetch(url, method='POST', json_data=mutated_json)
-                                        else:
-                                            raise
-                                    except Exception as recovery_error:
-                                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
+                                if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                                    restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                                    if restart_success:
+                                        resp = await self._async_fetch(url, method='POST', json_data=mutated_json)
+                                    else:
                                         raise
                                 else:
                                     raise
@@ -25439,25 +26253,18 @@ class InjectionEngine:
                         return await self._async_fetch(url, method='POST', json_data=json_data)
                     except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                         logging.warning(f"Network error during JSON fallback - attempting recovery: {e}")
-                        if self.selenium_driver:
-                            try:
-                                logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.__exit__(None, None, None)
-                                self.selenium_driver.__enter__()
-                                if self.selenium_driver.driver:
-                                    self.selenium_ready = True
-                                    # Check if payload is already a JSON object (NoSQL injection)
-                                    try:
-                                        # If payload is already valid JSON, use it directly
-                                        parsed_payload = json.loads(payload)
-                                        json_data = {pname: parsed_payload}
-                                    except (json.JSONDecodeError, TypeError):
-                                        # If payload is not JSON, wrap it as a string
-                                        json_data = {pname: payload}
-                                    return await self._async_fetch(url, method='POST', json_data=json_data)
-                            except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
-                                raise
+                        if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                            restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                            if restart_success:
+                                # Check if payload is already a JSON object (NoSQL injection)
+                                try:
+                                    # If payload is already valid JSON, use it directly
+                                    parsed_payload = json.loads(payload)
+                                    json_data = {pname: parsed_payload}
+                                except (json.JSONDecodeError, TypeError):
+                                    # If payload is not JSON, wrap it as a string
+                                    json_data = {pname: payload}
+                                return await self._async_fetch(url, method='POST', json_data=json_data)
                         raise
                 except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                     logging.debug(f"Network error during JSON grammar fuzzing, using standard: {e}")
@@ -25505,19 +26312,12 @@ class InjectionEngine:
                                                               headers={'Content-Type': 'application/xml'})
                             except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                                 logging.warning(f"Network error during XML mutation - attempting recovery: {e}")
-                                if self.selenium_driver:
-                                    try:
-                                        logging.warning("Restarting Selenium driver")
-                                        self.selenium_driver.__exit__(None, None, None)
-                                        self.selenium_driver.__enter__()
-                                        if self.selenium_driver.driver:
-                                            self.selenium_ready = True
-                                            resp = await self._async_fetch(url, method='POST', data=mutated_xml,
+                                if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                                    restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                                    if restart_success:
+                                        resp = await self._async_fetch(url, method='POST', data=mutated_xml,
                                                                           headers={'Content-Type': 'application/xml'})
-                                        else:
-                                            raise
-                                    except Exception as recovery_error:
-                                        logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
+                                    else:
                                         raise
                                 else:
                                     raise
@@ -25535,17 +26335,10 @@ class InjectionEngine:
                         return await self._async_fetch(url, method='POST', data={pname: payload})
                     except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                         logging.warning(f"Network error during XML fallback - attempting recovery: {e}")
-                        if self.selenium_driver:
-                            try:
-                                logging.warning("Restarting Selenium driver")
-                                self.selenium_driver.__exit__(None, None, None)
-                                self.selenium_driver.__enter__()
-                                if self.selenium_driver.driver:
-                                    self.selenium_ready = True
-                                    return await self._async_fetch(url, method='POST', data={pname: payload})
-                            except Exception as recovery_error:
-                                logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
-                                raise
+                        if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                            restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                            if restart_success:
+                                return await self._async_fetch(url, method='POST', data={pname: payload})
                         raise
                 except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                     logging.debug(f"Network error during XML grammar fuzzing, using standard: {e}")
@@ -25566,21 +26359,30 @@ class InjectionEngine:
                     return await self._async_fetch(url, method='POST', data={pname: payload})
                 except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                     logging.warning(f"Network error during POST injection - attempting recovery: {e}")
-                    if self.selenium_driver:
-                        try:
-                            logging.warning("Restarting Selenium driver")
-                            self.selenium_driver.__exit__(None, None, None)
-                            self.selenium_driver.__enter__()
-                            if self.selenium_driver.driver:
-                                self.selenium_ready = True
-                                return await self._async_fetch(url, method='POST', data={pname: payload})
-                        except Exception as recovery_error:
-                            logging.error(f"Selenium recovery failed: {recovery_error}", exc_info=True)
-                            raise
+                    if self.selenium_driver and hasattr(self, 'js_driver_manager'):
+                        restart_success = await self.js_driver_manager.restart_driver(self.selenium_driver)
+                        if restart_success:
+                            return await self._async_fetch(url, method='POST', data={pname: payload})
                     raise
                 except Exception as e:
                     logging.warning(f"Unexpected error during POST injection: {e}", exc_info=True)
                     raise
+    
+    async def close(self):
+        """Clean up resources to prevent resource leaks."""
+        # Cancel all background tasks
+        if hasattr(self, 'background_task_manager'):
+            await self.background_task_manager.cancel_all()
+        
+        # Cleanup JSRenderDriver manager
+        if hasattr(self, 'js_driver_manager'):
+            await self.js_driver_manager.cleanup()
+        
+        # Set stop event to ensure ongoing operations stop
+        if hasattr(self, 'stop_event'):
+            self.stop_event.set()
+        
+        logging.info("InjectionEngine: Resources cleaned up")
     async def second_order_injection_tests(self):
         self.log("Second-order injection tests...")
         stored_xss_payload = f"<img src=http://{self.public_ip}:{self.oob_port}/DAST_STORED_XSS_{self.oob_marker_base}>"
@@ -25615,14 +26417,17 @@ class InjectionEngine:
                     try:
                         resp = await self._async_fetch(action, method='POST', data=data)
                         if resp:
-                            self.injection_points.append({
+                            injection_point = {
                                 'url': action,
                                 'referrer': page['url'],
                                 'cookies': dict(resp.cookies) if resp.cookies else {},
                                 'headers': dict(resp.headers) if resp.headers else {},
                                 'data': data,
                                 'timestamp': time.time()
-                            })
+                            }
+                            self.injection_points.append(injection_point)
+                            # Add to persistent queue for background retry processing
+                            self.second_order_queue.add_injection_point(injection_point, self.injection_points_ttl)
                             self.log(f"Stored payload submitted to {action} with full context")
                     except Exception as e:
                         logging.warning(f"Error storing payload with context at {action}: {e}")
@@ -25632,6 +26437,12 @@ class InjectionEngine:
             return
         
         self.log(f"Submitted payloads to {len(self.injection_points)} injection points")
+        
+        # Start background retry processing for delayed verification
+        self.background_task_manager.add_task(
+            self._background_second_order_verification(stored_sqli_payload),
+            "second_order_background_verification"
+        )
         
         # Enhanced delayed verification with multiple intervals
         verification_intervals = [5, 15.0, 30, 60, 120]  # Progressive delays
@@ -25698,6 +26509,98 @@ class InjectionEngine:
                 await asyncio.sleep(10)  # Less frequent later
         
         self.log(f"Second-order injection testing completed after {max_total_timeout}s with no OOB callbacks")
+    
+    async def _background_second_order_verification(self, sqli_payload):
+        """Background task for persistent retry of delayed second-order injection verification."""
+        self.log("Starting background second-order injection verification...")
+        
+        while not self.stop_event.is_set():
+            try:
+                # Clean up expired injection points
+                self.second_order_queue.cleanup_expired_injection_points()
+                
+                # Get pending injection points for retry
+                pending_points = self.second_order_queue.get_pending_injection_points(limit=50)
+                
+                if pending_points:
+                    self.log(f"Retrying verification for {len(pending_points)} pending injection points")
+                    
+                    # Discover high-priority targets
+                    high_priority_urls = self._discover_high_priority_targets()
+                    all_urls = list(self.crawler_engine.visited_urls) if self.crawler_engine else []
+                    
+                    for injection_point in pending_points:
+                        try:
+                            # Verify with context replay
+                            url = injection_point['url']
+                            
+                            # Try context-aware verification first
+                            if injection_point['cookies'] and injection_point['headers']:
+                                headers = {
+                                    'Referer': injection_point['referrer']
+                                }
+                                headers.update(injection_point['headers'])
+                                
+                                resp = await self._async_fetch(url, headers=headers, cookies=injection_point['cookies'])
+                                if resp:
+                                    html = resp._body
+                                    validation_result = validate_sqli_error_message(html)
+                                    if validation_result['is_valid_sqli']:
+                                        confidence = calculate_evidence_based_confidence(
+                                            evidence_strength='critical',
+                                            baseline_excluded=True,
+                                            multiple_confirmations=True,
+                                            specificity='high',
+                                            false_positive_resistance='high'
+                                        )
+                                        await self._add_vulnerability({
+                                            "type":"Second-order SQLi","url":url,"parameter":"*",
+                                            "evidence":f"Marker found with background retry: {sqli_payload}",
+                                            "severity":"Critical","confidence":confidence,"cwe":CWE_MAP["SQLi"]
+                                        })
+                                        self.log(f"Second-order SQLi confirmed at {url} via background retry")
+                                        self.second_order_queue.update_retry_count(injection_point['id'], success=True)
+                                        continue
+                            
+                            # Try normal verification if context-aware failed
+                            resp = await self._async_fetch(url)
+                            if resp:
+                                html = resp._body
+                                validation_result = validate_sqli_error_message(html)
+                                if validation_result['is_valid_sqli']:
+                                    confidence = calculate_evidence_based_confidence(
+                                        evidence_strength='moderate',
+                                        baseline_excluded=True,
+                                        multiple_confirmations=False,
+                                        specificity='medium',
+                                        false_positive_resistance='medium'
+                                    )
+                                    await self._add_vulnerability({
+                                        "type":"Second-order SQLi","url":url,"parameter":"*",
+                                        "evidence":f"Marker found via background retry: {sqli_payload}",
+                                        "severity":"High","confidence":confidence,"cwe":CWE_MAP["SQLi"]
+                                    })
+                                    self.log(f"Second-order SQLi confirmed at {url} via background retry (no context)")
+                                    self.second_order_queue.update_retry_count(injection_point['id'], success=True)
+                                    continue
+                            
+                            # Update retry count if verification failed
+                            self.second_order_queue.update_retry_count(injection_point['id'], success=False)
+                            
+                        except Exception as e:
+                            logging.debug(f"Background verification error for {injection_point['url']}: {e}")
+                            self.second_order_queue.update_retry_count(injection_point['id'], success=False)
+                
+                # Get queue statistics
+                queue_stats = self.second_order_queue.get_queue_stats()
+                self.log(f"Background verification queue stats: {queue_stats}")
+                
+                # Wait before next retry cycle (exponential backoff)
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logging.error(f"Error in background second-order verification: {e}")
+                await asyncio.sleep(120)  # Wait longer on error
     
     def _discover_high_priority_targets(self):
         """Discover high-priority URLs likely to trigger second-order vulnerabilities."""
@@ -30693,6 +31596,7 @@ class OmegaDAST:
         self.validation_engine = None
         self.selenium_driver = None
         self.selenium_ready = False
+        self.js_driver_manager = JSRenderDriverManager()
         
         # Replace global OOB lists with instance state
         self.oob_results = []
@@ -30719,7 +31623,7 @@ class OmegaDAST:
         self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
         if self.taint_tracking_enabled:
             try:
-                self.taint_tracker = TaintTracker(config)
+                self.taint_tracker = AdvancedTaintTracker(config)
                 self.taint_instrumentor = TaintInstrumentor(config)
                 self.taint_integrated_session = None
                 logging.info("Taint tracking enabled and initialized in OmegaDAST")
@@ -30751,24 +31655,18 @@ class OmegaDAST:
         self.genetic_fuzzing_enabled = config.get('genetic_fuzzing_enabled', False)
         if self.genetic_fuzzing_enabled:
             try:
-                mutation_rate = config.get('fuzz_mutation_rate', 0.1)
-                crossover_rate = config.get('fuzz_crossover_rate', 0.3)
-                population_size = config.get('fuzz_population_size', 50)
-                max_generations = config.get('fuzz_max_generations', 100)
-                corpus_dir = config.get('fuzz_corpus_dir', 'fuzz_corpus')
+                max_requests = config.get('fuzz_max_requests', 1000)
+                wordlist = config.get('fuzz_wordlist', None)
                 
-                self.genetic_fuzzer = GeneticFuzzer(
+                self.genetic_fuzzer = SimpleMutationFuzzer(
                     target_url=self.target,
                     session_manager=self.session_manager,
-                    mutation_rate=mutation_rate,
-                    crossover_rate=crossover_rate,
-                    population_size=population_size,
-                    max_generations=max_generations,
-                    corpus_dir=corpus_dir
+                    wordlist=wordlist,
+                    max_requests=max_requests
                 )
-                logging.info("Genetic fuzzing enabled and initialized in OmegaDAST")
+                logging.info("Simple mutation fuzzing enabled and initialized in OmegaDAST")
             except Exception as e:
-                logging.warning(f"Failed to initialize genetic fuzzing in OmegaDAST: {e}")
+                logging.warning(f"Failed to initialize simple mutation fuzzing in OmegaDAST: {e}")
                 self.genetic_fuzzing_enabled = False
                 self.genetic_fuzzer = None
         else:
@@ -30883,8 +31781,19 @@ class OmegaDAST:
                 encoding='utf-8'
             )
             log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            
+            # Use WARNING level in GUI mode to reduce excessive logging
+            # Check if QApplication exists (indicates GUI mode)
+            try:
+                from PyQt5.QtWidgets import QApplication
+                gui_mode = QApplication.instance() is not None
+            except (ImportError, RuntimeError):
+                gui_mode = False
+            
+            log_level = logging.WARNING if gui_mode else logging.INFO
+            
             logging.basicConfig(
-                level=logging.INFO,
+                level=log_level,
                 handlers=[log_handler, logging.StreamHandler()],
                 format='%(asctime)s - %(levelname)s - %(message)s'
             )
@@ -31151,7 +32060,7 @@ class OmegaDAST:
         # Taint tracking setup - Fully implemented with TaintTracker and TaintInstrumentor classes
         if self.taint_tracking_enabled and not self.taint_tracker:
             try:
-                self.taint_tracker = TaintTracker(self.config)
+                self.taint_tracker = AdvancedTaintTracker(self.config)
                 self.taint_instrumentor = TaintInstrumentor(self.config)
                 self.taint_integrated_session = None
                 logging.info("Taint tracking setup completed")
@@ -31320,6 +32229,10 @@ class OmegaDAST:
                 self.selenium_ready = True
                 self.injection_engine.selenium_driver = self.selenium_driver
                 self.injection_engine.selenium_ready = True
+                
+                # Initialize JSRenderDriverManager for proper lifecycle management
+                asyncio.create_task(self.js_driver_manager.initialize(self.selenium_driver))
+                asyncio.create_task(self.injection_engine.js_driver_manager.initialize(self.selenium_driver))
                 
                 # Enable enhanced SPA route discovery if configured
                 if self.spa_route_discovery_enabled and self.selenium_driver.passive_route_monitoring:
@@ -31698,6 +32611,13 @@ class OmegaDAST:
             # Use context manager exit for guaranteed cleanup
             self.selenium_driver.__exit__(None, None, None)
             self.selenium_driver = None
+        
+        # Cleanup JSRenderDriverManager
+        if hasattr(self, 'js_driver_manager'):
+            asyncio.create_task(self.js_driver_manager.cleanup())
+        
+        if hasattr(self.injection_engine, 'js_driver_manager'):
+            asyncio.create_task(self.injection_engine.js_driver_manager.cleanup())
     async def finalize(self):
         self.log("Finalizing scan...")
         
@@ -35295,53 +36215,45 @@ class OmegaDAST:
         """Run genetic algorithm-based fuzzing on discovered endpoints"""
         self.log("Starting genetic fuzzing...")
         if not self.genetic_fuzzer:
-            self.log("Genetic fuzzer not initialized, skipping")
+            self.log("Simple mutation fuzzer not initialized, skipping")
             return
 
-        # Select high-value targets for fuzzing
-        targets = []
-        for url_data in list(self.crawler_engine.visited_urls)[:20]:
-            url = url_data.get('url', url_data) if isinstance(url_data, dict) else url_data
-            if url:
-                for param in self.crawler_engine.parameters:
-                    if param['url'] == url and param['method'] in ['GET', 'POST']:
-                        targets.append((url, param['param'], param['method']))
-
-        self.log(f"Running genetic fuzzing on {len(targets)} targets")
-        
-        # Prepare seed data from crawled parameters
-        seed_data = []
+        # Select parameters for fuzzing
+        parameters = []
         for param in self.crawler_engine.parameters[:20]:
-            param_value = str(param.get('value', 'test'))
-            seed_data.append(param_value.encode())
-        seed_data.extend([
-            b'admin', b'test', b'<script>alert(1)</script>',
-            b"' OR '1'='1", b'../../etc/passwd', b'{"user":"admin","pass":"password"}'
-        ])
+            if param.get('param'):
+                parameters.append(param['param'])
+        
+        # Add common parameters if none found
+        if not parameters:
+            parameters = ['id', 'user', 'search', 'file', 'page', 'action', 'submit']
+        
+        self.log(f"Running simple mutation fuzzing on {len(parameters)} parameters")
         
         try:
-            # Run genetic fuzzing
-            results = self.genetic_fuzzer.run(self.loop, seed_data)
-            self.log(f"Genetic fuzzing completed: {results['generations']} generations, "
-                    f"best fitness: {results['best_fitness']}, "
-                    f"coverage: {results['coverage_size']}")
+            # Run simple mutation fuzzing
+            results = await self.genetic_fuzzer.run(parameters)
+            self.log(f"Simple mutation fuzzing completed: {results['total_requests']} requests, "
+                    f"unique responses: {results['unique_responses']}, "
+                    f"errors: {results['errors_found']}, "
+                    f"interesting results: {results['interesting_results']}")
             
-            # Process results for vulnerabilities
-            for individual in results['final_population']:
-                if individual.get('is_crash', False) or individual.get('is_timeout', False):
-                    # Found potential vulnerability through genetic fuzzing
+            # Process interesting results for vulnerabilities
+            for result in results['results']:
+                if result.get('analysis', {}).get('interesting', False):
+                    # Found potential vulnerability through fuzzing
                     vuln = {
-                        'type': 'Genetic Fuzzing Crash',
+                        'type': 'Fuzzing Anomaly',
                         'url': self.target,
-                        'parameter': 'Genetic Fuzzing',
+                        'parameter': result.get('parameter', 'Unknown'),
                         'confidence': 'Medium',
-                        'severity': 'High',
-                        'evidence': f"Genetic fuzzing found crash/timeout with payload: {str(individual.get('data', ''))[:100]}",
-                        'discovery_method': 'genetic_fuzzing',
+                        'severity': 'Medium',
+                        'evidence': f"Fuzzing found interesting response: {result.get('analysis', {}).get('reason', 'Unknown')} with payload: {str(result.get('payload', ''))[:100]}",
+                        'discovery_method': 'mutation_fuzzing',
                         'timestamp': datetime.now().isoformat()
                     }
                     await self._add_vulnerability(vuln)
-                    self.log(f"[GENETIC FUZZING] Potential vulnerability found via genetic algorithm")
+                    self.log(f"[MUTATION FUZZING] Potential vulnerability found: {result.get('analysis', {}).get('reason', 'Unknown')}")
                     
         except Exception as e:
             logging.warning(f"Genetic fuzzing execution failed: {e}")
@@ -35563,7 +36475,8 @@ class OmegaDAST:
             path += '?' + parsed_url.query
         
         raw_request = f"{method} {path} HTTP/1.1\r\n"
-        raw_request += f"Host: {parsed_url.netloc}\r\n"
+        # Use hostname instead of netloc to strip port
+        raw_request += f"Host: {parsed_url.hostname}\r\n"
         
         for header_name, header_value in headers.items():
             raw_request += f"{header_name}: {header_value}\r\n"
@@ -39550,6 +40463,21 @@ class ScannerWorker(QThread):
 
     def stop(self):
         self.scanner.stop_event.set()
+        
+        # Cancel any pending validation tasks
+        if hasattr(self.scanner, 'validation_tasks'):
+            for task in self.scanner.validation_tasks:
+                if not task.done():
+                    task.cancel()
+            self.scanner.validation_tasks.clear()
+        
+        # Cancel injection engine tasks
+        if hasattr(self.scanner, 'injection_engine') and hasattr(self.scanner.injection_engine, 'stop_event'):
+            self.scanner.injection_engine.stop_event.set()
+        
+        # Cancel crawler engine tasks
+        if hasattr(self.scanner, 'crawler_engine') and hasattr(self.scanner.crawler_engine, 'stop_event'):
+            self.scanner.crawler_engine.stop_event.set()
     
     def pause(self):
         self.paused = True
@@ -39563,6 +40491,10 @@ class ScannerWorker(QThread):
             self.config['checkpoint_data'] = checkpoint
         self.status.emit("Resumed")
     
+    def _validate_checkpoint_filename(self, filename):
+        """Validate checkpoint filename to prevent path traversal attacks"""
+        return validate_checkpoint_filename(filename)
+    
     def save_checkpoint(self):
         if self.scanner:
             checkpoint = {
@@ -39573,7 +40505,14 @@ class ScannerWorker(QThread):
                 'parameters_count': len(self.scanner.crawler_engine.parameters),
                 'timestamp': datetime.now().isoformat()
             }
+            # Generate safe filename using timestamp only
             self.checkpoint_file = f"checkpoint_{int(time.time())}.json"
+            
+            # Validate the generated filename before saving
+            if not self._validate_checkpoint_filename(self.checkpoint_file):
+                self.log.emit(f"Security: Generated invalid checkpoint filename: {self.checkpoint_file}")
+                return
+            
             try:
                 with open(self.checkpoint_file, 'w') as f:
                     json.dump(checkpoint, f, indent=2)
@@ -39583,6 +40522,11 @@ class ScannerWorker(QThread):
     
     def load_checkpoint(self):
         if self.checkpoint_file and os.path.exists(self.checkpoint_file):
+            # Validate filename before loading
+            if not self._validate_checkpoint_filename(self.checkpoint_file):
+                self.log.emit(f"Security: Rejecting unsafe checkpoint filename: {self.checkpoint_file}")
+                return None
+            
             try:
                 with open(self.checkpoint_file, 'r') as f:
                     checkpoint = json.load(f)
@@ -41675,7 +42619,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.0 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.1 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -42758,7 +43702,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.0']
+                        ['Tool Version', 'UltraDAST v18.1']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -42869,7 +43813,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.0",
+                            "tool": "UltraDAST v18.1",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -43161,7 +44105,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.0 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.1 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -43239,14 +44183,14 @@ Examples:
         sys.exit(1)
 
 # ---------------------------------------------------------------------
-# TAINT TRACKING ENGINE - Data Flow Analysis
+# ADVANCED TAINT TRACKING ENGINE - Robust Data Flow Analysis
 # ---------------------------------------------------------------------
 
-class TaintTracker:
+class AdvancedTaintTracker:
     """
-    Enhanced taint propagation engine with automatic data-flow analysis.
-    Implements dynamic taint analysis with automatic propagation through transformations
-    and sanitization detection in complex code paths.
+    Advanced taint propagation engine with robust data-flow analysis.
+    Implements sophisticated dynamic taint analysis with transformation analysis,
+    complex data flow tracking, and advanced reflection detection.
     """
     
     def __init__(self, config=None):
@@ -43258,7 +44202,9 @@ class TaintTracker:
         self.taint_labels = {}   # Taint labels for tracking specific taint instances
         self.sanitization_functions = set()  # Known sanitization functions
         self.propagation_rules = {}  # Custom propagation rules
-        self.data_flow_graph = {}  # Automatic data-flow graph
+        self.data_flow_graph = {}  # Advanced data-flow graph with transformation tracking
+        self.transformation_history = {}  # Track all transformations applied to taint
+        self.reflection_detector = AdvancedReflectionDetector(config)  # Advanced reflection detection
         
         # Common taint sources (user input points)
         self.default_sources = {
@@ -43268,7 +44214,9 @@ class TaintTracker:
             'headers': r'(\w+):\s*.+',
             'json_body': r'"(\w+)":\s*"[^"]*"',
             'path_params': r'/(\w+)/[^/]+',
-            'xml_data': r'<(\w+)>[^<]+</\1>'
+            'xml_data': r'<(\w+)>[^<]+</\1>',
+            'graphql_query': r'query\s*\{',
+            'websocket_message': r'websocket\.message'
         }
         
         # Common taint sinks (dangerous operations)
@@ -43287,28 +44235,35 @@ class TaintTracker:
         
         # Known sanitization functions (break taint)
         self.default_sanitization = {
-            'sql': ['mysql_real_escape_string', 'pg_escape_string', 'sqlite_escape_string', 'param', '?'],
-            'xss': ['htmlspecialchars', 'htmlentities', 'escape', 'sanitize', 'filter_var'],
+            'sql': ['mysql_real_escape_string', 'pg_escape_string', 'sqlite_escape_string', 'param', '?', 'prepared', 'bind'],
+            'xss': ['htmlspecialchars', 'htmlentities', 'escape', 'sanitize', 'filter_var', 'strip_tags', 'purify'],
             'command': ['escapeshellarg', 'escapeshellcmd'],
-            'redirect': ['filter_var', 'validate_url'],
-            'path': ['basename', 'realpath', 'normalize_path']
+            'redirect': ['filter_var', 'validate_url', 'whitelist'],
+            'path': ['basename', 'realpath', 'normalize_path', 'pathinfo']
         }
         
-        # Automatic propagation rules for common transformations
-        self.propagation_transformations = {
-            'preserve_taint': [
-                r'\.to_string\(\)', r'\.str\(\)', r'str\(', r'String\(',
-                r'\.toString\(\)', r'\.valueOf\(\)'
+        # Advanced transformation analysis with confidence scores
+        self.advanced_transformations = {
+            'preserve_taint_high_confidence': [
+                (r'\.to_string\(\)', 0.95), (r'\.str\(\)', 0.95), (r'str\(', 0.95), (r'String\(', 0.95),
+                (r'\.toString\(\)', 0.95), (r'\.valueOf\(\)', 0.95), (r'\.concat\(', 0.90),
+                (r'\.substring\(', 0.85), (r'\.substr\(', 0.85), (r'\.slice\(', 0.85)
             ],
-            'possibly_break_taint': [
-                r'base64_decode\(', r'base64\.decode\(', r'atob\(',
-                r'json_decode\(', r'JSON\.parse\(', r'unserialize\(',
-                r'decrypt\(', r'decipher\('
+            'possibly_break_taint_medium_confidence': [
+                (r'base64_decode\(', 0.70), (r'base64\.decode\(', 0.70), (r'atob\(', 0.70),
+                (r'json_decode\(', 0.65), (r'JSON\.parse\(', 0.65), (r'unserialize\(', 0.75),
+                (r'decrypt\(', 0.60), (r'decipher\(', 0.60), (r'cipher\.decrypt\(', 0.60)
             ],
-            'encoding_maintains_taint': [
-                r'base64_encode\(', r'base64\.encode\(', r'btoa\(',
-                r'json_encode\(', r'JSON\.stringify\(', r'serialize\(',
-                r'urlencode\(', r'encodeURI\(', r'encodeURIComponent\('
+            'encoding_maintains_taint_high_confidence': [
+                (r'base64_encode\(', 0.95), (r'base64\.encode\(', 0.95), (r'btoa\(', 0.95),
+                (r'json_encode\(', 0.95), (r'JSON\.stringify\(', 0.95), (r'serialize\(', 0.95),
+                (r'urlencode\(', 0.90), (r'encodeURI\(', 0.90), (r'encodeURIComponent\(', 0.90),
+                (r'hex_encode\(', 0.85), (r'bin2hex\(', 0.85)
+            ],
+            'complex_transformations': [
+                (r'hash\(', 0.30), (r'md5\(', 0.30), (r'sha1\(', 0.30), (r'sha256\(', 0.30),
+                (r'crypt\(', 0.35), (r'password_hash\(', 0.25), (r'bcrypt\(', 0.25),
+                (r'random\(', 0.10), (r'rand\(', 0.10), (r'mt_rand\(', 0.10)
             ]
         }
         
@@ -43316,7 +44271,7 @@ class TaintTracker:
         for category, functions in self.default_sanitization.items():
             self.sanitization_functions.update(functions)
         
-        logging.info("Enhanced TaintTracker initialized with automatic data-flow analysis")
+        logging.info("Advanced TaintTracker initialized with robust data-flow analysis")
     
     def generate_taint_id(self):
         """Generate unique taint identifier"""
@@ -43333,9 +44288,12 @@ class TaintTracker:
             'timestamp': datetime.now().isoformat(),
             'taint_labels': [f"{source_type}_{self.taint_id_counter}"],
             'propagation_count': 0,
-            'sanitized': False
+            'sanitized': False,
+            'transformation_chain': [],
+            'integrity_score': 1.0  # Track how much taint integrity remains
         }
         self.taint_labels[taint_id] = set(self.taint_sources[taint_id]['taint_labels'])
+        self.transformation_history[taint_id] = []
         logging.debug(f"Added taint source: {taint_id} ({source_type})")
         return taint_id
     
@@ -43352,13 +44310,13 @@ class TaintTracker:
         return sink_id
     
     def track_flow(self, source_id, sink_id, flow_data=None):
-        """Track a data flow from source to sink with automatic propagation analysis"""
+        """Track a data flow from source to sink with advanced propagation analysis"""
         if source_id not in self.taint_sources:
             return None
             
         source = self.taint_sources[source_id]
         
-        # Perform automatic data-flow analysis
+        # Perform advanced data-flow analysis
         self._analyze_data_flow(source_id, flow_data)
         
         # Check if taint was sanitized
@@ -43372,22 +44330,27 @@ class TaintTracker:
                 'vulnerability': False,
                 'sanitized': True,
                 'sanitization_function': source.get('sanitization_function', 'unknown'),
-                'propagation_path': self._trace_propagation_path(source_id)
+                'propagation_path': self._trace_propagation_path(source_id),
+                'integrity_score': source.get('integrity_score', 0.0)
             }
             self.taint_flows.append(flow)
             logging.debug(f"Taint flow {flow['id']} was sanitized, no vulnerability")
             return flow
         
+        # Calculate vulnerability based on integrity score
+        integrity_score = source.get('integrity_score', 1.0)
         flow = {
             'id': self.generate_taint_id(),
             'source_id': source_id,
             'sink_id': sink_id,
             'data': flow_data or {},
             'timestamp': datetime.now().isoformat(),
-            'vulnerability': self._assess_vulnerability(source_id, sink_id),
+            'vulnerability': self._assess_vulnerability(source_id, sink_id, integrity_score),
             'propagation_path': self._trace_propagation_path(source_id),
             'sanitized': False,
-            'transformations_detected': self._detect_transformations(flow_data)
+            'transformations_detected': self._detect_advanced_transformations(flow_data),
+            'integrity_score': integrity_score,
+            'transformation_chain': source.get('transformation_chain', [])
         }
         self.taint_flows.append(flow)
         
@@ -43395,18 +44358,18 @@ class TaintTracker:
         source['propagation_count'] += 1
         
         if flow['vulnerability']:
-            logging.warning(f"Potential vulnerability detected in flow {flow['id']}")
+            logging.warning(f"Potential vulnerability detected in flow {flow['id']} with integrity score: {integrity_score}")
         
         return flow
     
     def _analyze_data_flow(self, source_id, flow_data):
-        """Perform automatic data-flow analysis for a source"""
+        """Perform advanced data-flow analysis for a source"""
         if source_id not in self.taint_sources:
             return
         
         source = self.taint_sources[source_id]
         
-        # Build data-flow graph entry
+        # Build advanced data-flow graph entry
         flow_key = f"{source_id}_{source.get('type', 'unknown')}"
         if flow_key not in self.data_flow_graph:
             self.data_flow_graph[flow_key] = {
@@ -43414,16 +44377,20 @@ class TaintTracker:
                 'source_type': source.get('type'),
                 'transformations': [],
                 'sanitization_points': [],
-                'sink_reached': False
+                'sink_reached': False,
+                'integrity_history': [1.0]  # Track integrity over time
             }
         
         # Analyze flow data for transformations
         if flow_data:
-            transformations = self._detect_transformations(flow_data)
+            transformations = self._detect_advanced_transformations(flow_data)
             self.data_flow_graph[flow_key]['transformations'].extend(transformations)
+            
+            # Update integrity score based on transformations
+            self._update_integrity_score(source_id, transformations)
     
-    def _detect_transformations(self, flow_data):
-        """Detect data transformations that might affect taint propagation"""
+    def _detect_advanced_transformations(self, flow_data):
+        """Detect data transformations with confidence scores"""
         transformations = []
         
         if not flow_data:
@@ -43431,34 +44398,79 @@ class TaintTracker:
         
         flow_str = str(flow_data)
         
-        # Check for preservation transformations
-        for pattern in self.propagation_transformations['preserve_taint']:
+        # Check for high-confidence preservation transformations
+        for pattern, confidence in self.advanced_transformations['preserve_taint_high_confidence']:
             if re.search(pattern, flow_str, re.IGNORECASE):
                 transformations.append({
                     'type': 'preserve_taint',
                     'pattern': pattern,
-                    'confidence': 0.9
+                    'confidence': confidence,
+                    'integrity_impact': 0.0  # No impact on taint integrity
                 })
         
-        # Check for possibly breaking transformations
-        for pattern in self.propagation_transformations['possibly_break_taint']:
+        # Check for medium-confidence breaking transformations
+        for pattern, confidence in self.advanced_transformations['possibly_break_taint_medium_confidence']:
             if re.search(pattern, flow_str, re.IGNORECASE):
                 transformations.append({
                     'type': 'possibly_break_taint',
                     'pattern': pattern,
-                    'confidence': 0.7
+                    'confidence': confidence,
+                    'integrity_impact': -0.3  # Moderate impact on taint integrity
                 })
         
-        # Check for encoding that maintains taint
-        for pattern in self.propagation_transformations['encoding_maintains_taint']:
+        # Check for high-confidence encoding that maintains taint
+        for pattern, confidence in self.advanced_transformations['encoding_maintains_taint_high_confidence']:
             if re.search(pattern, flow_str, re.IGNORECASE):
                 transformations.append({
                     'type': 'encoding_maintains_taint',
                     'pattern': pattern,
-                    'confidence': 0.8
+                    'confidence': confidence,
+                    'integrity_impact': 0.0  # No impact on taint integrity
+                })
+        
+        # Check for complex transformations that likely break taint
+        for pattern, confidence in self.advanced_transformations['complex_transformations']:
+            if re.search(pattern, flow_str, re.IGNORECASE):
+                transformations.append({
+                    'type': 'complex_transformation',
+                    'pattern': pattern,
+                    'confidence': confidence,
+                    'integrity_impact': -0.8  # High impact on taint integrity
                 })
         
         return transformations
+    
+    def _update_integrity_score(self, source_id, transformations):
+        """Update taint integrity score based on transformations"""
+        if source_id not in self.taint_sources:
+            return
+        
+        source = self.taint_sources[source_id]
+        current_integrity = source.get('integrity_score', 1.0)
+        
+        for transformation in transformations:
+            impact = transformation.get('integrity_impact', 0.0)
+            confidence = transformation.get('confidence', 0.5)
+            
+            # Apply impact weighted by confidence
+            adjusted_impact = impact * confidence
+            current_integrity = max(0.0, min(1.0, current_integrity + adjusted_impact))
+            
+            # Track transformation in chain
+            source['transformation_chain'].append({
+                'transformation': transformation,
+                'integrity_before': current_integrity,
+                'integrity_after': current_integrity + adjusted_impact,
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        source['integrity_score'] = current_integrity
+        
+        # Update integrity history in data flow graph
+        flow_key = f"{source_id}_{source.get('type', 'unknown')}"
+        if flow_key in self.data_flow_graph:
+            self.data_flow_graph[flow_key]['integrity_history'].append(current_integrity)
+
     
     def _trace_propagation_path(self, source_id):
         """Trace the propagation path from source to current point"""
@@ -43512,8 +44524,8 @@ class TaintTracker:
         
         return False
     
-    def _assess_vulnerability(self, source_id, sink_id):
-        """Assess if a flow represents a potential vulnerability with enhanced analysis"""
+    def _assess_vulnerability(self, source_id, sink_id, integrity_score=1.0):
+        """Assess if a flow represents a potential vulnerability with integrity-based analysis"""
         if source_id not in self.taint_sources or sink_id not in self.taint_sinks:
             return False
         
@@ -43522,6 +44534,11 @@ class TaintTracker:
         
         # Check if source is sanitized
         if source['sanitized']:
+            return False
+        
+        # Check if integrity score is too low (taint likely broken)
+        if integrity_score < 0.3:
+            logging.debug(f"Taint integrity too low ({integrity_score}) for source {source_id}")
             return False
         
         # Enhanced vulnerability assessment with more combinations
@@ -43550,10 +44567,22 @@ class TaintTracker:
             ('form_data', 'xpath'),
             ('url_params', 'file'),
             ('form_data', 'file'),
-            ('cookies', 'redirect')
+            ('cookies', 'redirect'),
+            ('graphql_query', 'sql'),
+            ('graphql_query', 'xss'),
+            ('websocket_message', 'xss')
         ]
         
-        return (source['type'], sink['type']) in dangerous_combinations
+        is_dangerous = (source['type'], sink['type']) in dangerous_combinations
+        
+        # Adjust vulnerability assessment based on integrity score
+        if is_dangerous and integrity_score > 0.7:
+            return True
+        elif is_dangerous and integrity_score > 0.5:
+            # Medium confidence for medium integrity
+            return True
+        else:
+            return False
     
     def _trace_propagation_path(self, source_id):
         """Trace the propagation path of taint from source"""
@@ -43588,8 +44617,8 @@ class TaintTracker:
         
         return False
     
-    def propagate_taint(self, source_id, new_context):
-        """Propagate taint to new context with label tracking"""
+    def propagate_taint(self, source_id, new_context, transformation_applied=None):
+        """Propagate taint to new context with advanced tracking and integrity updates"""
         if source_id not in self.taint_sources:
             return None
         
@@ -43600,6 +44629,14 @@ class TaintTracker:
         new_labels = set(self.taint_labels.get(source_id, set()))
         new_labels.add(f"{new_context}_{self.taint_id_counter}")
         
+        # Calculate new integrity based on transformation
+        new_integrity = source.get('integrity_score', 1.0)
+        if transformation_applied:
+            # This is handled by _update_integrity_score, but we can apply direct impact here
+            impact = transformation_applied.get('integrity_impact', 0.0)
+            confidence = transformation_applied.get('confidence', 0.5)
+            new_integrity = max(0.0, min(1.0, new_integrity + (impact * confidence)))
+        
         self.taint_sources[new_taint_id] = {
             'type': source['type'],
             'value': source['value'],
@@ -43609,37 +44646,63 @@ class TaintTracker:
             'propagation_count': source['propagation_count'] + 1,
             'sanitized': source['sanitized'],
             'sanitization_function': source.get('sanitization_function'),
-            'parent_source': source_id
+            'parent_source': source_id,
+            'integrity_score': new_integrity,
+            'transformation_chain': source.get('transformation_chain', []).copy()
         }
         
-        self.taint_labels[new_taint_id] = new_labels
+        # Add transformation to chain if provided
+        if transformation_applied:
+            self.taint_sources[new_taint_id]['transformation_chain'].append({
+                'transformation': transformation_applied,
+                'integrity_before': source.get('integrity_score', 1.0),
+                'integrity_after': new_integrity,
+                'timestamp': datetime.now().isoformat()
+            })
         
-        logging.debug(f"Propagated taint from {source_id} to {new_taint_id} in context {new_context}")
+        self.taint_labels[new_taint_id] = new_labels
+        self.transformation_history[new_taint_id] = self.transformation_history.get(source_id, []).copy()
+        
+        logging.debug(f"Propagated taint from {source_id} to {new_taint_id} in context {new_context} with integrity {new_integrity}")
         return new_taint_id
     
-    def analyze_response(self, response_text, taint_id):
-        """Analyze response for taint propagation"""
+    def analyze_response(self, response_text, taint_id, input_context=None):
+        """Analyze response for taint propagation with advanced reflection detection"""
         if taint_id not in self.taint_sources:
             return None
         
         source = self.taint_sources[taint_id]
-        if source['value'] in response_text:
+        reflection_result = self.reflection_detector.detect_reflection(
+            response_text, source['value'], input_context
+        )
+        
+        if reflection_result['reflected']:
             return {
                 'taint_id': taint_id,
                 'propagated': True,
                 'context': 'response_reflection',
+                'reflection_details': reflection_result,
+                'integrity_score': source.get('integrity_score', 1.0),
                 'timestamp': datetime.now().isoformat()
             }
         return None
+
     
     def get_vulnerabilities(self):
         """Get all detected vulnerabilities from taint analysis"""
         return [flow for flow in self.taint_flows if flow['vulnerability']]
     
     def get_summary(self):
-        """Get enhanced summary of taint analysis with propagation statistics"""
+        """Get enhanced summary of taint analysis with advanced statistics"""
         sanitized_count = sum(1 for source in self.taint_sources.values() if source.get('sanitized', False))
         total_propagations = sum(source.get('propagation_count', 0) for source in self.taint_sources.values())
+        
+        # Calculate average integrity score
+        integrity_scores = [source.get('integrity_score', 1.0) for source in self.taint_sources.values()]
+        avg_integrity = sum(integrity_scores) / len(integrity_scores) if integrity_scores else 1.0
+        
+        # Count transformations
+        total_transformations = sum(len(source.get('transformation_chain', [])) for source in self.taint_sources.values())
         
         return {
             'total_sources': len(self.taint_sources),
@@ -43649,6 +44712,9 @@ class TaintTracker:
             'sanitized_flows': sanitized_count,
             'total_propagations': total_propagations,
             'unique_taint_labels': len(set().union(*self.taint_labels.values())) if self.taint_labels else 0,
+            'average_integrity_score': avg_integrity,
+            'total_transformations_tracked': total_transformations,
+            'data_flow_graph_size': len(self.data_flow_graph),
             'analysis_time': datetime.now().isoformat()
         }
 
@@ -43661,11 +44727,447 @@ class TaintInstrumentor:
     
     def __init__(self, config=None):
         self.config = config or {}
-        self.taint_tracker = TaintTracker(config)
+        self.taint_tracker = AdvancedTaintTracker(config)
         self.instrumentation_markers = []
         self.marker_counter = 0
         
-        logging.info("TaintInstrumentor initialized")
+        logging.info("TaintInstrumentor initialized with AdvancedTaintTracker")
+
+
+class AdvancedReflectionDetector:
+    """
+    Advanced reflection detector for comprehensive taint analysis.
+    Detects reflection patterns in responses with context analysis and confidence scoring.
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.reflection_patterns = {
+            'exact_match': 1.0,
+            'case_insensitive': 0.6,
+            'partial_match': 0.7,
+            'encoded_match': 0.8,
+            'fragmented_match': 0.5,
+            'context_aware': 0.9
+        }
+        self.context_signatures = {
+            'html_tag': r'<[^>]*{value}[^>]*>',
+            'javascript': r'(var|let|const)\s+\w+\s*=\s*["\']?{value}["\']?',
+            'json': r'["\']?{value}["\']?\s*:',
+            'url_parameter': r'[?&][^=]*={value}',
+            'css': r'[{value}]\s*\{{',
+            'comment': r'<!--.*{value}.*-->|/\*.*{value}.*\*/'
+        }
+        logging.info("AdvancedReflectionDetector initialized")
+    
+    def detect_reflection(self, response_text, input_value, input_context=None):
+        """
+        Comprehensive reflection detection with context analysis
+        Returns detailed reflection information with confidence scores
+        """
+        if not response_text or not input_value:
+            return self._empty_result()
+        
+        result = {
+            'reflected': False,
+            'confidence': 0.0,
+            'detection_methods': [],
+            'contexts': [],
+            'transformations': [],
+            'security_implications': []
+        }
+        
+        # Exact match detection
+        exact_match = self._detect_exact_match(response_text, input_value)
+        if exact_match['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], exact_match['confidence'])
+            result['detection_methods'].append(exact_match)
+            result['contexts'].extend(exact_match['contexts'])
+        
+        # Case-insensitive match
+        case_match = self._detect_case_insensitive(response_text, input_value)
+        if case_match['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], case_match['confidence'])
+            result['detection_methods'].append(case_match)
+            result['contexts'].extend(case_match['contexts'])
+        
+        # Partial match detection
+        partial_match = self._detect_partial_match(response_text, input_value)
+        if partial_match['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], partial_match['confidence'])
+            result['detection_methods'].append(partial_match)
+            result['contexts'].extend(partial_match['contexts'])
+        
+        # Encoded match detection
+        encoded_matches = self._detect_encoded_matches(response_text, input_value)
+        if encoded_matches['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], encoded_matches['confidence'])
+            result['detection_methods'].append(encoded_matches)
+            result['contexts'].extend(encoded_matches['contexts'])
+            result['transformations'].extend(encoded_matches['transformations'])
+        
+        # Fragmented match detection
+        fragmented_match = self._detect_fragmented_match(response_text, input_value)
+        if fragmented_match['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], fragmented_match['confidence'])
+            result['detection_methods'].append(fragmented_match)
+            result['contexts'].extend(fragmented_match['contexts'])
+        
+        # Context-aware detection
+        context_results = self._detect_context_aware(response_text, input_value)
+        if context_results['found']:
+            result['reflected'] = True
+            result['confidence'] = max(result['confidence'], context_results['confidence'])
+            result['detection_methods'].append(context_results)
+            result['contexts'].extend(context_results['contexts'])
+        
+        # Security implications analysis
+        if result['reflected']:
+            result['security_implications'] = self._analyze_security_implications(
+                result, input_context
+            )
+        
+        return result
+    
+    def _empty_result(self):
+        """Return empty result structure"""
+        return {
+            'reflected': False,
+            'confidence': 0.0,
+            'detection_methods': [],
+            'contexts': [],
+            'transformations': [],
+            'security_implications': []
+        }
+    
+    def _detect_exact_match(self, response_text, input_value):
+        """Detect exact string matches"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': []}
+        
+        if input_value in response_text:
+            result['found'] = True
+            result['confidence'] = self.reflection_patterns['exact_match']
+            
+            # Find all occurrences
+            positions = []
+            start = 0
+            while True:
+                pos = response_text.find(input_value, start)
+                if pos == -1:
+                    break
+                positions.append(pos)
+                start = pos + 1
+            
+            # Analyze context for each occurrence
+            for pos in positions:
+                context = self._extract_context(response_text, pos, len(input_value))
+                result['contexts'].append({
+                    'type': 'exact_match',
+                    'position': pos,
+                    'context': context,
+                    'confidence': 1.0
+                })
+        
+        return result
+    
+    def _detect_case_insensitive(self, response_text, input_value):
+        """Detect case-insensitive matches"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': []}
+        
+        lower_response = response_text.lower()
+        lower_input = input_value.lower()
+        
+        if lower_input in lower_response:
+            result['found'] = True
+            result['confidence'] = self.reflection_patterns['case_insensitive']
+            
+            # Find positions
+            positions = []
+            start = 0
+            while True:
+                pos = lower_response.find(lower_input, start)
+                if pos == -1:
+                    break
+                positions.append(pos)
+                start = pos + 1
+            
+            for pos in positions:
+                context = self._extract_context(response_text, pos, len(input_value))
+                result['contexts'].append({
+                    'type': 'case_insensitive',
+                    'position': pos,
+                    'context': context,
+                    'confidence': 0.6
+                })
+        
+        return result
+    
+    def _detect_partial_match(self, response_text, input_value):
+        """Detect partial matches (substrings)"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': []}
+        
+        if len(input_value) < 4:
+            return result  # Too short for meaningful partial matches
+        
+        # Check for 4+ character substrings
+        found_substrings = set()
+        for i in range(len(input_value) - 3):
+            substring = input_value[i:i+4]
+            if substring in response_text:
+                found_substrings.add(substring)
+        
+        if found_substrings:
+            result['found'] = True
+            result['confidence'] = self.reflection_patterns['partial_match']
+            
+            for substring in found_substrings:
+                positions = []
+                start = 0
+                while True:
+                    pos = response_text.find(substring, start)
+                    if pos == -1:
+                        break
+                    positions.append(pos)
+                    start = pos + 1
+                
+                for pos in positions:
+                    context = self._extract_context(response_text, pos, len(substring))
+                    result['contexts'].append({
+                        'type': 'partial_match',
+                        'substring': substring,
+                        'position': pos,
+                        'context': context,
+                        'confidence': 0.7
+                    })
+        
+        return result
+    
+    def _detect_encoded_matches(self, response_text, input_value):
+        """Detect various encoded forms of the input"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': [], 'transformations': []}
+        
+        encoded_variants = self._generate_all_encodings(input_value)
+        
+        for encoded_value, encoding_type in encoded_variants:
+            if encoded_value in response_text:
+                result['found'] = True
+                result['confidence'] = max(result['confidence'], self.reflection_patterns['encoded_match'])
+                result['transformations'].append({
+                    'type': encoding_type,
+                    'original': input_value[:50],
+                    'encoded': encoded_value[:50]
+                })
+                
+                positions = []
+                start = 0
+                while True:
+                    pos = response_text.find(encoded_value, start)
+                    if pos == -1:
+                        break
+                    positions.append(pos)
+                    start = pos + 1
+                
+                for pos in positions:
+                    context = self._extract_context(response_text, pos, len(encoded_value))
+                    result['contexts'].append({
+                        'type': 'encoded_match',
+                        'encoding': encoding_type,
+                        'position': pos,
+                        'context': context,
+                        'confidence': 0.8
+                    })
+        
+        return result
+    
+    def _detect_fragmented_match(self, response_text, input_value):
+        """Detect fragmented matches (input split across response)"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': []}
+        
+        if len(input_value) < 6:
+            return result
+        
+        # Split input into fragments and check if all fragments exist
+        fragment_size = max(2, len(input_value) // 3)
+        fragments = [input_value[i:i+fragment_size] for i in range(0, len(input_value), fragment_size)]
+        
+        found_fragments = []
+        for fragment in fragments:
+            if fragment in response_text:
+                found_fragments.append(fragment)
+        
+        # If most fragments are found, consider it fragmented match
+        if len(found_fragments) >= len(fragments) * 0.7:
+            result['found'] = True
+            result['confidence'] = self.reflection_patterns['fragmented_match']
+            
+            for fragment in found_fragments:
+                positions = []
+                start = 0
+                while True:
+                    pos = response_text.find(fragment, start)
+                    if pos == -1:
+                        break
+                    positions.append(pos)
+                    start = pos + 1
+                
+                for pos in positions:
+                    context = self._extract_context(response_text, pos, len(fragment))
+                    result['contexts'].append({
+                        'type': 'fragmented_match',
+                        'fragment': fragment,
+                        'position': pos,
+                        'context': context,
+                        'confidence': 0.5
+                    })
+        
+        return result
+    
+    def _detect_context_aware(self, response_text, input_value):
+        """Detect reflection in specific contexts (HTML, JS, JSON, etc.)"""
+        result = {'found': False, 'confidence': 0.0, 'contexts': []}
+        
+        for context_type, pattern_template in self.context_signatures.items():
+            try:
+                # Escape special regex characters in input value
+                escaped_value = re.escape(input_value)
+                pattern = pattern_template.replace('{value}', escaped_value)
+                
+                matches = re.finditer(pattern, response_text, re.IGNORECASE)
+                for match in matches:
+                    result['found'] = True
+                    result['confidence'] = max(result['confidence'], self.reflection_patterns['context_aware'])
+                    
+                    context = self._extract_context(response_text, match.start(), len(match.group()))
+                    result['contexts'].append({
+                        'type': 'context_aware',
+                        'context_type': context_type,
+                        'position': match.start(),
+                        'context': context,
+                        'confidence': 0.9
+                    })
+            except re.error:
+                continue
+        
+        return result
+    
+    def _generate_all_encodings(self, value):
+        """Generate various encoded forms of the input value"""
+        variants = []
+        
+        try:
+            # URL encoding
+            import urllib.parse
+            url_encoded = urllib.parse.quote(value)
+            if url_encoded != value:
+                variants.append((url_encoded, 'url_encoding'))
+            
+            # URL encoding plus
+            url_encoded_plus = urllib.parse.quote_plus(value)
+            if url_encoded_plus != value:
+                variants.append((url_encoded_plus, 'url_encoding_plus'))
+            
+            # HTML entity encoding
+            html_encoded = value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+            if html_encoded != value:
+                variants.append((html_encoded, 'html_encoding'))
+            
+            # Base64 encoding
+            import base64
+            try:
+                base64_encoded = base64.b64encode(value.encode()).decode()
+                variants.append((base64_encoded, 'base64'))
+            except:
+                pass
+            
+            # Hex encoding
+            try:
+                hex_encoded = value.encode().hex()
+                variants.append((hex_encoded, 'hex'))
+            except:
+                pass
+            
+            # Unicode escape
+            try:
+                unicode_encoded = ''.join(f'\\u{ord(c):04x}' for c in value)
+                variants.append((unicode_encoded, 'unicode_escape'))
+            except:
+                pass
+            
+            # Double encoding
+            try:
+                double_encoded = urllib.parse.quote(urllib.parse.quote(value))
+                variants.append((double_encoded, 'double_url_encoding'))
+            except:
+                pass
+                
+        except Exception as e:
+            logging.debug(f"Error generating encodings: {e}")
+        
+        return variants
+    
+    def _extract_context(self, text, position, length, context_size=50):
+        """Extract context around a match"""
+        start = max(0, position - context_size)
+        end = min(len(text), position + length + context_size)
+        
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(text) else ""
+        
+        return f"{prefix}{text[start:end]}{suffix}"
+    
+    def _analyze_security_implications(self, reflection_result, input_context):
+        """Analyze security implications of detected reflection"""
+        implications = []
+        
+        if not reflection_result['reflected']:
+            return implications
+        
+        # Check for XSS potential
+        has_html_context = any(ctx.get('context_type') == 'html_tag' for ctx in reflection_result['contexts'])
+        has_javascript_context = any(ctx.get('context_type') == 'javascript' for ctx in reflection_result['contexts'])
+        
+        if has_html_context or has_javascript_context:
+            implications.append({
+                'type': 'xss',
+                'severity': 'High',
+                'description': 'Input reflected in HTML/JavaScript context - potential XSS vulnerability',
+                'confidence': reflection_result['confidence']
+            })
+        
+        # Check for information disclosure
+        if reflection_result['confidence'] > 0.8:
+            implications.append({
+                'type': 'information_disclosure',
+                'severity': 'Medium',
+                'description': 'High-confidence reflection indicates potential information disclosure',
+                'confidence': reflection_result['confidence']
+            })
+        
+        # Check for encoding transformations
+        if reflection_result['transformations']:
+            implications.append({
+                'type': 'encoding_analysis',
+                'severity': 'Low',
+                'description': f'Input underwent {len(reflection_result["transformations"])} transformation(s)',
+                'transformations': reflection_result['transformations']
+            })
+        
+        # Context-specific implications
+        if input_context:
+            if input_context.get('sensitive', False):
+                implications.append({
+                    'type': 'sensitive_data_reflection',
+                    'severity': 'High',
+                    'description': 'Sensitive data reflected in response',
+                    'confidence': reflection_result['confidence']
+                })
+        
+        return implications
     
     def generate_marker(self):
         """Generate unique instrumentation marker"""
@@ -44396,8 +45898,8 @@ class SymbolicExecutor:
         
         logging.info("SymbolicExecutor initialized")
     
-    def analyze_endpoint(self, url, method, parameters):
-        """Symbolically analyze an endpoint"""
+    def analyze_endpoint(self, url, method, parameters, request_headers=None, response_data=None):
+        """Symbolically analyze an endpoint with web request/response integration"""
         if not self.enabled:
             return None
         
@@ -44412,6 +45914,16 @@ class SymbolicExecutor:
             )
             symbolic_vars[param_name] = var_id
         
+        # Analyze request headers if provided
+        header_analysis = {}
+        if request_headers:
+            for header_name, header_value in request_headers.items():
+                header_var_id = self.engine.create_symbolic_variable(
+                    f"header_{header_name}",
+                    self._infer_type(header_value)
+                )
+                header_analysis[header_name] = header_var_id
+        
         # Explore execution paths
         path_results = []
         for param_name, var_id in symbolic_vars.items():
@@ -44422,17 +45934,28 @@ class SymbolicExecutor:
             if path:
                 path_results.append(path)
         
+        # Analyze response data if provided for constraint extraction
+        response_constraints = []
+        if response_data:
+            response_constraints = self._analyze_response_for_constraints(response_data)
+        
         # Generate test inputs
         test_inputs = {}
         for param_name, var_id in symbolic_vars.items():
             test_inputs[param_name] = self.engine.generate_test_inputs(var_id)
         
+        # Apply response-based constraints to refine test inputs
+        if response_constraints:
+            test_inputs = self._refine_test_inputs_with_constraints(test_inputs, response_constraints)
+        
         self.session_results[analysis_id] = {
             'url': url,
             'method': method,
             'symbolic_vars': symbolic_vars,
+            'header_analysis': header_analysis,
             'path_results': path_results,
             'test_inputs': test_inputs,
+            'response_constraints': response_constraints,
             'coverage': self.engine.get_coverage_report(),
             'timestamp': datetime.now().isoformat()
         }
@@ -44466,6 +45989,171 @@ class SymbolicExecutor:
         
         return candidates
     
+    def _analyze_response_for_constraints(self, response_data):
+        """Analyze HTTP response data to extract constraints for symbolic execution"""
+        constraints = []
+        
+        try:
+            # Analyze response status codes
+            if 'status_code' in response_data:
+                status = response_data['status_code']
+                if status >= 400:
+                    constraints.append({
+                        'type': 'status_error',
+                        'condition': f'status >= 400',
+                        'severity': 'high' if status >= 500 else 'medium'
+                    })
+            
+            # Analyze response headers for security constraints
+            if 'headers' in response_data:
+                headers = response_data['headers']
+                security_headers = ['Content-Security-Policy', 'X-Frame-Options', 
+                                   'X-Content-Type-Options', 'Strict-Transport-Security']
+                for header in security_headers:
+                    if header not in headers:
+                        constraints.append({
+                            'type': 'missing_security_header',
+                            'condition': f'header_{header} == None',
+                            'severity': 'medium'
+                        })
+            
+            # Analyze response body for input validation patterns
+            if 'body' in response_data:
+                body = response_data['body']
+                if isinstance(body, str):
+                    # Check for error messages that might reveal validation logic
+                    if 'error' in body.lower() or 'invalid' in body.lower():
+                        constraints.append({
+                            'type': 'validation_error',
+                            'condition': 'response contains error message',
+                            'severity': 'low'
+                        })
+                    
+                    # Check for SQL injection indicators
+                    sql_errors = ['syntax error', 'mysql', 'oracle', 'postgresql', 'sqlite']
+                    for error in sql_errors:
+                        if error in body.lower():
+                            constraints.append({
+                                'type': 'sql_error_indication',
+                                'condition': f'response contains "{error}"',
+                                'severity': 'high'
+                            })
+                            break
+            
+            # Analyze response time for timing attack constraints
+            if 'response_time' in response_data:
+                response_time = response_data['response_time']
+                if response_time > 1.0:  # Slow response might indicate heavy processing
+                    constraints.append({
+                        'type': 'timing_constraint',
+                        'condition': f'response_time > {response_time}',
+                        'severity': 'low'
+                    })
+        
+        except Exception as e:
+            logging.warning(f"Response constraint analysis failed: {e}")
+        
+        return constraints
+    
+    def _refine_test_inputs_with_constraints(self, test_inputs, constraints):
+        """Refine test inputs based on response constraints"""
+        refined_inputs = test_inputs.copy()
+        
+        for constraint in constraints:
+            constraint_type = constraint.get('type')
+            
+            if constraint_type == 'sql_error_indication':
+                # Add more SQL injection payloads
+                for param in refined_inputs:
+                    if isinstance(refined_inputs[param], list):
+                        refined_inputs[param].extend([
+                            "' UNION SELECT NULL--",
+                            "1' OR 1=1--",
+                            "'; DROP TABLE users--",
+                            "' OR '1'='1' /*"
+                        ])
+            
+            elif constraint_type == 'validation_error':
+                # Add boundary testing payloads
+                for param in refined_inputs:
+                    if isinstance(refined_inputs[param], list):
+                        refined_inputs[param].extend([
+                            'A' * 1000,  # Buffer overflow attempt
+                            '<script>alert(document.cookie)</script>',  # XSS
+                            '../../../etc/passwd',  # Path traversal
+                            '{{7*7}}',  # Template injection
+                            '%00'  # Null byte injection
+                        ])
+            
+            elif constraint_type == 'missing_security_header':
+                # Add header-based attack payloads
+                for param in refined_inputs:
+                    if isinstance(refined_inputs[param], list):
+                        refined_inputs[param].extend([
+                            '<iframe src="javascript:alert(1)"></iframe>',
+                            '<meta http-equiv="refresh" content="0;url=data:text/html,<script>alert(1)</script>">'
+                        ])
+        
+        return refined_inputs
+    
+    def analyze_web_application_flow(self, base_url, endpoints):
+        """Analyze complete web application flow with request/response integration"""
+        flow_analysis = {
+            'base_url': base_url,
+            'endpoints_analyzed': 0,
+            'total_constraints': 0,
+            'vulnerability_candidates': [],
+            'cross_endpoint_flows': []
+        }
+        
+        for endpoint in endpoints:
+            url = f"{base_url}{endpoint['path']}"
+            method = endpoint.get('method', 'GET')
+            parameters = endpoint.get('parameters', {})
+            headers = endpoint.get('headers', {})
+            
+            # Analyze individual endpoint
+            result = self.analyze_endpoint(url, method, parameters, headers)
+            
+            if result:
+                flow_analysis['endpoints_analyzed'] += 1
+                flow_analysis['total_constraints'] += len(result.get('response_constraints', []))
+                
+                # Collect vulnerability candidates
+                for path in result.get('path_results', []):
+                    for vuln in path.get('vulnerability_candidates', []):
+                        vuln['endpoint'] = url
+                        flow_analysis['vulnerability_candidates'].append(vuln)
+        
+        # Analyze cross-endpoint data flows
+        flow_analysis['cross_endpoint_flows'] = self._analyze_cross_endpoint_flows(endpoints)
+        
+        return flow_analysis
+    
+    def _analyze_cross_endpoint_flows(self, endpoints):
+        """Analyze data flows between different endpoints"""
+        cross_flows = []
+        
+        # Look for parameter relationships between endpoints
+        param_patterns = {}
+        for endpoint in endpoints:
+            for param in endpoint.get('parameters', {}):
+                if param not in param_patterns:
+                    param_patterns[param] = []
+                param_patterns[param].append(endpoint['path'])
+        
+        # Identify parameters that appear in multiple endpoints (potential data flow)
+        for param, paths in param_patterns.items():
+            if len(paths) > 1:
+                cross_flows.append({
+                    'parameter': param,
+                    'endpoints': paths,
+                    'flow_type': 'parameter_sharing',
+                    'risk_level': 'medium' if len(paths) > 2 else 'low'
+                })
+        
+        return cross_flows
+
     def get_summary(self):
         """Get enhanced symbolic execution summary with Z3 solver information"""
         return {
@@ -44479,6 +46167,7 @@ class SymbolicExecutor:
             'z3_enabled': Z3_AVAILABLE,
             'z3_solver_active': self.engine.z3_solver is not None,
             'constraint_solving_method': 'Z3' if Z3_AVAILABLE and self.engine.z3_solver else 'basic',
+            'web_integration_enabled': True,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -44525,382 +46214,141 @@ def get_enhanced_scan_statistics(scanner_instance):
     return stats
 
 # ---------------------------------------------------------------------
-# GENETIC FUZZING ENGINE - AFL++/libFuzzer Inspired
+# SIMPLE MUTATION FUZZER - FFUF-Style Fuzzing
 # ---------------------------------------------------------------------
 
-class GeneticFuzzer:
+class SimpleMutationFuzzer:
     """
-    Enhanced genetic algorithm-based fuzzer inspired by AFL++ and libFuzzer.
-    Features coverage-guided fuzzing, edge coverage tracking, and power scheduling.
+    Simple ffuf-style mutation fuzzer for effective parameter fuzzing.
+    Replaces complex genetic algorithm with straightforward wordlist-based fuzzing
+    and response analysis. No complex coverage bitmap - focuses on response patterns.
     """
     
-    def __init__(self, target_url, session_manager, mutation_rate=0.1, crossover_rate=0.3, 
-                 population_size=50, max_generations=100, corpus_dir="fuzz_corpus"):
+    def __init__(self, target_url, session_manager, wordlist=None, max_requests=1000):
         self.target_url = target_url
         self.session_manager = session_manager
-        self.mutation_rate = mutation_rate
-        self.crossover_rate = crossover_rate
-        self.population_size = population_size
-        self.max_generations = max_generations
-        self.corpus_dir = corpus_dir
-        self.population = []
-        self.coverage_map = set()
-        self.edge_coverage = {}  # Enhanced edge coverage tracking
-        self.branch_coverage = {}  # Branch coverage tracking
-        self.bitmap_size = 65536  # AFL-style coverage bitmap
-        self.coverage_bitmap = [0] * self.bitmap_size
-        self.best_fitness = 0
-        self.generation = 0
+        self.wordlist = wordlist or self._get_default_wordlist()
+        self.max_requests = max_requests
+        self.results = []
+        self.request_count = 0
         self.stop_event = asyncio.Event()
-        self.power_schedule = 'fast'  # AFL power schedule: fast,coe,explore,exploit,linear,quad
         
-        # Coverage statistics
-        self.total_edges_found = 0
-        self.total_crashes = 0
-        self.total_timeouts = 0
-        self.unique_crashes = set()
-        self.unique_timeouts = set()
+        # Response pattern tracking
+        self.response_signatures = set()
+        self.status_codes = {}
+        self.content_lengths = {}
         
-        # Initialize corpus directory
-        os.makedirs(corpus_dir, exist_ok=True)
+        # Fuzzing statistics
+        self.total_requests = 0
+        self.unique_responses = 0
+        self.errors_found = 0
+        self.timeouts = 0
         
-        # Mutation operators with coverage guidance
-        self.mutation_operators = [
-            self._bit_flip,
-            self._byte_insert,
-            self._byte_delete,
-            self._arithmetic_mutate,
-            self._interesting_values,
-            self._dictionary_mutate,
-            self._splice_mutate,
-            self._block_mutate,
-            self._havoc_mutate  # AFL-style havoc mutation
+        logging.info("SimpleMutationFuzzer initialized with ffuf-style fuzzing")
+    
+    def _get_default_wordlist(self):
+        """Default wordlist for common fuzzing payloads"""
+        return [
+            # Directory traversal
+            '../../../etc/passwd', '..\\..\\..\\windows\\win.ini', '....//....//....//etc/passwd',
+            # SQL injection
+            "' OR '1'='1", "' OR 1=1--", "' UNION SELECT NULL--", "admin'--",
+            "' AND 1=1--", "' AND 1=2--", "'; DROP TABLE users--",
+            # XSS
+            '<script>alert(1)</script>', '<img src=x onerror=alert(1)>',
+            '<svg onload=alert(1)>', 'javascript:alert(1)',
+            # Command injection
+            '; ls -la', '| cat /etc/passwd', '`whoami`', '$(id)',
+            # Path traversal variants
+            '%2e%2e%2f', '%252e%252e%252f', '..%252f',
+            # Common files
+            'config.php', 'database.yml', '.env', 'web.config',
+            # SSRF
+            'http://127.0.0.1:80', 'http://localhost:80', 'file:///etc/passwd',
+            # Common parameters
+            'admin', 'test', 'password', 'login', 'id', 'user',
+            # Overflow
+            'A' * 1000, 'A' * 5000, '%00' + 'A' * 100,
+            # Special characters
+            '../', '..\\', '\'', '"', ';', '&', '|', '`', '$', '(', ')',
+            # Null bytes
+            '%00', '\x00',
+            # Unicode
+            '%u0000', '%ufffd'
         ]
-        
-        # Interesting values for mutation (inspired by AFL)
-        self.interesting_values = [
-            b'\x00', b'\x01', b'\x7f', b'\xff',
-            b'\x00\x00', b'\x01\x00', b'\x00\x01', b'\xff\xff',
-            b'\x7f\xff', b'\xff\x7f',
-            b'\x00\x00\x00', b'\x01\x00\x00', b'\x00\x01\x00', b'\x00\x00\x01',
-            b'\xff\xff\xff', b'\x7f\xff\xff', b'\xff\xff\x7f',
-            b'\x00\x00\x00\x00', b'\x01\x00\x00\x00', b'\x00\x01\x00\x00',
-            b'\x00\x00\x01\x00', b'\x00\x00\x00\x01', b'\xff\xff\xff\xff',
-            b'\x7f\xff\xff\xff', b'\xff\xff\xff\x7f',
-            b'\x80\x00\x00\x00', b'\x40\x00\x00\x00', b'\x20\x00\x00\x00'
-        ]
-        
-        # Dictionary of common HTTP-related strings
-        self.dictionary = [
-            b'../../', b'..\\..\\', b'/etc/passwd', b'\\windows\\win.ini',
-            b'<script>', b'alert(', b'onerror=', b'javascript:',
-            b'OR 1=1', b'AND 1=1', b'UNION SELECT', b'DROP TABLE',
-            b'{{7*7}}', b'${7*7}', b'<%= 7*7 %>', b'#{7*7}',
-            b'<?xml', b'<!DOCTYPE', b'<!ENTITY',
-            b'http://', b'https://', b'file://', b'gopher://',
-            b'Content-Type:', b'Authorization:', b'Cookie:',
-            b'admin', b'root', b'test', b'password', b'login'
-        ]
-        
-        logging.info(f"GeneticFuzzer initialized with coverage bitmap size: {self.bitmap_size}")
     
-    def _bit_flip(self, data):
-        """Flip random bits in the data"""
-        data = bytearray(data)
-        num_flips = random.randint(1, min(4, len(data) * 8))
-        for _ in range(num_flips):
-            byte_pos = random.randint(0, len(data) - 1)
-            bit_pos = random.randint(0, 7)
-            data[byte_pos] ^= (1 << bit_pos)
-        return bytes(data)
-    
-    def _byte_insert(self, data):
-        """Insert random bytes"""
-        if len(data) == 0:
-            return bytes([random.randint(0, 255)])
-        
-        data = bytearray(data)
-        pos = random.randint(0, len(data))
-        num_bytes = random.randint(1, 4)
-        for _ in range(num_bytes):
-            data.insert(pos, random.randint(0, 255))
-        return bytes(data)
-    
-    def _byte_delete(self, data):
-        """Delete random bytes"""
-        if len(data) <= 1:
-            return data
-        
-        data = bytearray(data)
-        pos = random.randint(0, len(data) - 1)
-        num_bytes = random.randint(1, min(4, len(data) - pos))
-        del data[pos:pos + num_bytes]
-        return bytes(data)
-    
-    def _arithmetic_mutate(self, data):
-        """Apply arithmetic mutations (add/subtract small values)"""
-        if len(data) == 0:
-            return data
-        
-        data = bytearray(data)
-        pos = random.randint(0, len(data) - 1)
-        delta = random.choice([-1, 1, -2, 2, -4, 4, -8, 8, -16, 16])
-        data[pos] = (data[pos] + delta) % 256
-        return bytes(data)
-    
-    def _interesting_values(self, data):
-        """Replace with interesting values"""
-        if len(data) == 0:
-            return random.choice(self.interesting_values)
-        
-        data = bytearray(data)
-        pos = random.randint(0, len(data) - 1)
-        value = random.choice(self.interesting_values)
-        
-        if len(value) == 1:
-            data[pos] = value[0]
-        else:
-            # Replace a block with interesting value
-            end_pos = min(pos + len(value), len(data))
-            data[pos:end_pos] = value[:end_pos - pos]
-        
-        return bytes(data)
-    
-    def _dictionary_mutate(self, data):
-        """Insert/replace with dictionary words"""
-        data = bytearray(data)
-        word = random.choice(self.dictionary)
-        
-        if random.random() < 0.5:
-            # Insert
-            pos = random.randint(0, len(data))
-            data[pos:pos] = word
-        else:
-            # Replace
-            if len(data) >= len(word):
-                pos = random.randint(0, len(data) - len(word))
-                data[pos:pos + len(word)] = word
-        
-        return bytes(data)
-    
-    def _splice_mutate(self, data):
-        """Splice data with another from corpus"""
-        if len(self.population) < 2:
-            return data
-        
-        other = random.choice(self.population)['data']
-        if len(other) == 0 or len(data) == 0:
-            return data
-        
-        data = bytearray(data)
-        other = bytearray(other)
-        
-        # Splice a random segment from other into data
-        splice_start = random.randint(0, len(other) - 1)
-        splice_end = random.randint(splice_start + 1, len(other))
-        splice_segment = other[splice_start:splice_end]
-        
-        insert_pos = random.randint(0, len(data))
-        data[insert_pos:insert_pos] = splice_segment
-        
-        return bytes(data)
-    
-    def _block_mutate(self, data):
-        """Mutate blocks of data"""
-        if len(data) < 2:
-            return data
-        
-        data = bytearray(data)
-        block_size = random.randint(2, min(16, len(data)))
-        block_start = random.randint(0, len(data) - block_size)
-        
-        mutation_type = random.choice(['set_zero', 'set_ff', 'reverse', 'shuffle'])
-        
-        if mutation_type == 'set_zero':
-            data[block_start:block_start + block_size] = b'\x00' * block_size
-        elif mutation_type == 'set_ff':
-            data[block_start:block_start + block_size] = b'\xff' * block_size
-        elif mutation_type == 'reverse':
-            data[block_start:block_start + block_size] = data[block_start:block_start + block_size][::-1]
-        elif mutation_type == 'shuffle':
-            block = list(data[block_start:block_start + block_size])
-            random.shuffle(block)
-            data[block_start:block_start + block_size] = bytes(block)
-        
-        return bytes(data)
-    
-    def _havoc_mutate(self, data):
-        """AFL-style havoc mutation - apply multiple random mutations"""
-        data = bytearray(data)
-        havoc_steps = random.randint(5, 15)
-        
-        for _ in range(havoc_steps):
-            mutation_type = random.choice([
-                'bit_flip', 'byte_insert', 'byte_delete', 
-                'interesting', 'dictionary', 'block'
-            ])
-            
-            if mutation_type == 'bit_flip':
-                if len(data) > 0:
-                    pos = random.randint(0, len(data) - 1)
-                    bit = random.randint(0, 7)
-                    data[pos] ^= (1 << bit)
-            elif mutation_type == 'byte_insert':
-                pos = random.randint(0, len(data))
-                data.insert(pos, random.randint(0, 255))
-            elif mutation_type == 'byte_delete':
-                if len(data) > 0:
-                    pos = random.randint(0, len(data) - 1)
-                    del data[pos]
-            elif mutation_type == 'interesting':
-                if len(data) > 0 and self.interesting_values:
-                    value = random.choice(self.interesting_values)
-                    pos = random.randint(0, len(data) - 1)
-                    if len(value) == 1:
-                        data[pos] = value[0]
-            elif mutation_type == 'dictionary':
-                if self.dictionary:
-                    word = random.choice(self.dictionary)
-                    pos = random.randint(0, len(data))
-                    data[pos:pos] = word
-            elif mutation_type == 'block':
-                if len(data) >= 2:
-                    block_size = random.randint(2, min(16, len(data)))
-                    block_start = random.randint(0, len(data) - block_size)
-                    data[block_start:block_start + block_size] = b'\x00' * block_size
-        
-        return bytes(data)
-    
-    def _calculate_coverage_hash(self, status, text, headers):
-        """Calculate AFL-style coverage hash"""
-        # Use multiple factors for better coverage detection
+    def _calculate_response_signature(self, status, text, headers):
+        """Calculate unique response signature for deduplication"""
         content_type = headers.get('content-type', '')
-        response_signature = (
+        signature = (
             status,
             len(text),
             content_type,
-            text[:100] if len(text) > 100 else text,  # First 100 chars
-            hash(text[-100:] if len(text) > 100 else text)  # Last 100 chars hash
+            text[:50] if len(text) > 50 else text,  # First 50 chars
+            hash(text[-50:] if len(text) > 50 else text)  # Last 50 chars hash
         )
-        return hash(response_signature)
+        return hash(signature)
     
-    def _update_coverage_bitmap(self, coverage_hash, status):
-        """Update AFL-style coverage bitmap"""
-        # Map coverage hash to bitmap index
-        bitmap_index = coverage_hash % self.bitmap_size
-        self.coverage_bitmap[bitmap_index] += 1
-        
-        # Track edge coverage
-        edge_key = (bitmap_index, status)
-        if edge_key not in self.edge_coverage:
-            self.edge_coverage[edge_key] = 0
-        self.edge_coverage[edge_key] += 1
-    
-    def _get_edge_coverage(self, coverage_hash):
-        """Get edge coverage for a specific hash"""
-        bitmap_index = coverage_hash % self.bitmap_size
-        return self.coverage_bitmap[bitmap_index]
-    
-    def _get_power_schedule_mutation_count(self):
-        """Apply AFL power schedule for mutation intensity"""
-        schedules = {
-            'fast': random.randint(1, 3),
-            'coe': random.randint(3, 7),
-            'explore': random.randint(5, 10),
-            'exploit': random.randint(2, 5),
-            'linear': random.randint(1, 4),
-            'quad': random.randint(1, 6)
+    def _analyze_response(self, status, text, headers):
+        """Analyze response for interesting patterns"""
+        analysis = {
+            'status': status,
+            'length': len(text),
+            'content_type': headers.get('content-type', ''),
+            'interesting': False,
+            'reason': ''
         }
-        return schedules.get(self.power_schedule, random.randint(1, 3))
+        
+        # Check for error status codes
+        if status >= 400:
+            analysis['interesting'] = True
+            analysis['reason'] = f'Error status code: {status}'
+        
+        # Check for unexpected content length
+        if status == 200 and len(text) < 100:
+            analysis['interesting'] = True
+            analysis['reason'] = 'Short response for 200 OK'
+        
+        # Check for reflection patterns
+        for payload in self.wordlist[:10]:  # Check first few payloads
+            if payload in text:
+                analysis['interesting'] = True
+                analysis['reason'] = f'Payload reflection detected: {payload[:20]}'
+                break
+        
+        # Check for error messages
+        error_indicators = ['error', 'exception', 'fatal', 'warning', 'stack trace']
+        for indicator in error_indicators:
+            if indicator.lower() in text.lower():
+                analysis['interesting'] = True
+                analysis['reason'] = f'Error indicator in response: {indicator}'
+                break
+        
+        return analysis
     
-    def mutate(self, data):
-        """Apply random mutation operators with power schedule"""
-        if random.random() < self.mutation_rate:
-            # Apply power schedule for mutation intensity
-            num_mutations = self._get_power_schedule_mutation_count()
-            for _ in range(num_mutations):
-                operator = random.choice(self.mutation_operators)
-                data = operator(data)
-        return data
-    
-    def crossover(self, parent1, parent2):
-        """Perform crossover between two parents"""
-        if random.random() > self.crossover_rate:
-            return parent1
-        
-        data1 = parent1['data']
-        data2 = parent2['data']
-        
-        if len(data1) == 0 or len(data2) == 0:
-            return data1 if data1 else data2
-        
-        # Choose crossover type
-        crossover_type = random.choice(['single_point', 'two_point', 'uniform'])
-        
-        if crossover_type == 'single_point':
-            point = random.randint(0, min(len(data1), len(data2)))
-            child = bytearray(data1[:point] + data2[point:])
-        elif crossover_type == 'two_point':
-            point1 = random.randint(0, min(len(data1), len(data2)))
-            point2 = random.randint(point1, min(len(data1), len(data2)))
-            child = bytearray(data1[:point1] + data2[point1:point2] + data1[point2:])
-        else:  # uniform
-            child = bytearray()
-            max_len = max(len(data1), len(data2))
-            for i in range(max_len):
-                if i < len(data1) and i < len(data2):
-                    child.append(data1[i] if random.random() < 0.5 else data2[i])
-                elif i < len(data1):
-                    child.append(data1[i])
-                else:
-                    child.append(data2[i])
-        
-        return bytes(child)
-    
-    def calculate_fitness(self, individual):
-        """Calculate fitness score for an individual with enhanced coverage feedback"""
-        fitness = 0
-        
-        # Prioritize new coverage (highest priority)
-        if individual.get('new_coverage', False):
-            fitness += 50  # Significantly higher for new coverage
-        
-        # Prioritize edge coverage from bitmap
-        edge_coverage = individual.get('edge_coverage', 0)
-        fitness += min(edge_coverage / 10, 20)  # Up to 20 points for edge coverage
-        
-        # Coverage contribution from bitmap
-        fitness += individual.get('coverage_score', 0) * 5
-        
-        # Response uniqueness
-        fitness += individual.get('response_unique', 0) * 3
-        
-        # Error detection bonus
-        if individual.get('is_error', False):
-            fitness += 15
-        
-        # Timeout detection
-        if individual.get('is_timeout', False):
-            fitness += 20
-        
-        # Crash detection (highest priority after new coverage)
-        if individual.get('is_crash', False):
-            fitness += 40
-        
-        return fitness
-    
-    async def async_send_request(self, individual):
-        """Send HTTP request and gather coverage data"""
+    async def _send_fuzz_request(self, parameter_name, payload, method='POST', headers=None):
+        """Send a single fuzzing request"""
         import aiohttp
+        from aiohttp import ClientTimeout
         
-        data = individual['data']
-        method = individual.get('method', 'POST')
-        headers = individual.get('headers', {})
+        if headers is None:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': '*/*'
+            }
+        
+        # Prepare request data based on method
+        if method == 'GET':
+            url = f"{self.target_url}?{parameter_name}={payload}"
+            data = None
+        else:
+            url = self.target_url
+            data = {parameter_name: payload}
         
         try:
             async with self.session_manager.async_session.session.request(
-                method, 
-                self.target_url, 
+                method,
+                url,
                 data=data,
                 headers=headers,
                 timeout=ClientTimeout(total=10)
@@ -44908,52 +46356,117 @@ class GeneticFuzzer:
                 text = await response.text()
                 status = response.status
                 
-                # Calculate enhanced coverage hash using AFL-style bitmap
-                coverage_hash = self._calculate_coverage_hash(status, text, response.headers)
+                # Calculate response signature
+                signature = self._calculate_response_signature(status, text, response.headers)
                 
-                # Update coverage bitmap
-                self._update_coverage_bitmap(coverage_hash, status)
+                # Analyze response
+                analysis = self._analyze_response(status, text, response.headers)
                 
-                individual['status'] = status
-                individual['response_length'] = len(text)
-                individual['response_hash'] = hash(text)
-                individual['coverage_hash'] = coverage_hash
-                individual['is_error'] = status >= 400
-                individual['is_timeout'] = False
-                individual['is_crash'] = status >= 500
-                individual['edge_coverage'] = self._get_edge_coverage(coverage_hash)
+                # Update statistics
+                self.total_requests += 1
+                self.status_codes[status] = self.status_codes.get(status, 0) + 1
+                self.content_lengths[len(text)] = self.content_lengths.get(len(text), 0) + 1
                 
-                # Check if this is new coverage
-                is_new_coverage = coverage_hash not in self.coverage_map
-                if is_new_coverage:
-                    self.coverage_map.add(coverage_hash)
-                    self.total_edges_found += 1
-                    individual['coverage_score'] = 10  # Higher score for new coverage
-                    individual['new_coverage'] = True
-                else:
-                    individual['coverage_score'] = 0
-                    individual['new_coverage'] = False
+                # Check for unique response
+                is_unique = signature not in self.response_signatures
+                if is_unique:
+                    self.response_signatures.add(signature)
+                    self.unique_responses += 1
                 
-                # Track crashes and timeouts
-                if status >= 500:
-                    self.total_crashes += 1
-                    crash_signature = hash(text[:100])  # Simple crash signature
-                    self.unique_crashes.add(crash_signature)
-                    individual['coverage_score'] += 20  # High score for crashes
+                # Track errors
+                if status >= 400:
+                    self.errors_found += 1
                 
-                return individual
+                result = {
+                    'parameter': parameter_name,
+                    'payload': payload,
+                    'status': status,
+                    'length': len(text),
+                    'signature': signature,
+                    'unique': is_unique,
+                    'analysis': analysis,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                return result
                 
         except asyncio.TimeoutError:
-            individual['is_timeout'] = True
-            individual['is_error'] = True
-            individual['coverage_score'] = 1
-            return individual
+            self.timeouts += 1
+            return {
+                'parameter': parameter_name,
+                'payload': payload,
+                'status': 0,
+                'length': 0,
+                'timeout': True,
+                'error': 'Request timeout',
+                'timestamp': datetime.now().isoformat()
+            }
         except Exception as e:
-            individual['is_crash'] = True
-            individual['is_error'] = True
-            individual['coverage_score'] = 1
-            individual['error'] = str(e)
-            return individual
+            return {
+                'parameter': parameter_name,
+                'payload': payload,
+                'status': 0,
+                'length': 0,
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    async def fuzz_parameter(self, parameter_name, method='POST', headers=None):
+        """Fuzz a single parameter with all payloads from wordlist"""
+        results = []
+        
+        for payload in self.wordlist:
+            if self.stop_event.is_set():
+                break
+                
+            if self.request_count >= self.max_requests:
+                break
+                
+            result = await self._send_fuzz_request(parameter_name, payload, method, headers)
+            results.append(result)
+            self.request_count += 1
+            
+            # Only store interesting results
+            if result.get('analysis', {}).get('interesting', False) or result.get('unique', False):
+                self.results.append(result)
+        
+        return results
+    
+    async def run(self, parameters=None, method='POST', headers=None):
+        """Run the fuzzer against specified parameters"""
+        if parameters is None:
+            parameters = ['id', 'user', 'search', 'file', 'page']
+        
+        logging.info(f"Starting SimpleMutationFuzzer against {len(parameters)} parameters")
+        logging.info(f"Wordlist size: {len(self.wordlist)}, Max requests: {self.max_requests}")
+        
+        all_results = []
+        
+        for parameter in parameters:
+            if self.stop_event.is_set():
+                break
+                
+            logging.info(f"Fuzzing parameter: {parameter}")
+            parameter_results = await self.fuzz_parameter(parameter, method, headers)
+            all_results.extend(parameter_results)
+        
+        # Prepare summary
+        summary = {
+            'total_requests': self.total_requests,
+            'unique_responses': self.unique_responses,
+            'errors_found': self.errors_found,
+            'timeouts': self.timeouts,
+            'interesting_results': len(self.results),
+            'status_codes': self.status_codes,
+            'results': self.results
+        }
+        
+        logging.info(f"Fuzzing completed: {summary['total_requests']} requests, "
+                   f"{summary['unique_responses']} unique responses, "
+                   f"{summary['errors_found']} errors, "
+                   f"{summary['interesting_results']} interesting results")
+        
+        return summary
     
     def initialize_population(self, seed_data):
         """Initialize population with seed data"""
@@ -45021,59 +46534,6 @@ class GeneticFuzzer:
                 
                 # Mutation
                 child_data = self.mutate(child_data)
-                
-                child = {
-                    'data': child_data,
-                    'method': random.choice([parent1['method'], parent2['method']]),
-                    'headers': parent1['headers'].copy(),
-                    'generation': self.generation + 1
-                }
-                new_population.append(child)
-            
-            self.population = new_population
-            self.generation += 1
-            
-            # Save interesting cases to corpus
-            self._save_corpus()
-        
-        return loop.run_until_complete(evolution_step())
-    
-    def _tournament_selection(self, tournament_size=3):
-        """Tournament selection for choosing parents"""
-        tournament = random.sample(self.population, min(tournament_size, len(self.population)))
-        return max(tournament, key=lambda x: x['fitness'])
-    
-    def _save_corpus(self):
-        """Save interesting test cases to corpus directory"""
-        for individual in self.population:
-            if individual['fitness'] > 0:
-                filename = f"{self.corpus_dir}/gen{self.generation}_fit{individual['fitness']}_{uuid.uuid4().hex[:8]}.bin"
-                with open(filename, 'wb') as f:
-                    f.write(individual['data'])
-    
-    def run(self, loop, seed_data=None):
-        """Run the genetic fuzzer"""
-        if seed_data is None:
-            seed_data = [b'test', b'hello', b'admin', b'<script>alert(1)</script>']
-        
-        self.initialize_population(seed_data)
-        
-        for generation in range(self.max_generations):
-            logging.info(f"Genetic Fuzzer - Generation {generation + 1}/{self.max_generations}")
-            logging.info(f"Best fitness: {self.best_fitness}")
-            logging.info(f"Coverage size: {len(self.coverage_map)}")
-            
-            self.evolve(loop)
-            
-            if self.stop_event.is_set():
-                break
-        
-        return {
-            'generations': self.generation,
-            'best_fitness': self.best_fitness,
-            'coverage_size': len(self.coverage_map),
-            'final_population': self.population
-        }
 
 
 class SchemaInferenceEngine:
@@ -46674,21 +48134,19 @@ class RequestTemplateFuzzer:
 
 
 # Integrate with OmegaDAST class
-def integrate_genetic_fuzzing(target_url, session_manager, mutation_rate=0.1, crossover_rate=0.3, population_size=50, max_generations=100, corpus_dir='fuzz_corpus'):
-    """Integrate genetic fuzzing methods into an OmegaDAST class"""
-    # Initialize genetic fuzzer
-    genetic_fuzzer = GeneticFuzzer(
+def integrate_mutation_fuzzing(target_url, session_manager, wordlist=None, max_requests=1000):
+    """Integrate simple mutation fuzzing methods into an OmegaDAST class"""
+    # Initialize simple mutation fuzzer
+    mutation_fuzzer = SimpleMutationFuzzer(
         target_url=target_url,
         session_manager=session_manager,
-        mutation_rate=mutation_rate,
-        crossover_rate=crossover_rate,
-        population_size=population_size,
-        max_generations=max_generations,
-        corpus_dir=corpus_dir
+        wordlist=wordlist,
+        max_requests=max_requests
     )
 
-    # Run genetic fuzzer
-    results = genetic_fuzzer.run(loop, seed_data)
+    # Run mutation fuzzer
+    loop = asyncio.get_event_loop()
+    results = loop.run_until_complete(mutation_fuzzer.run())
 
     return results
 
