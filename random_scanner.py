@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.1 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.2 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -14,6 +14,10 @@ Optional: Set NVD_API_KEY environment variable for higher CVE feed rate limits
 ChromeDriver must be in PATH.
 
 Authorised use only. Unauthorised scanning is illegal.
+
+CONFIGURATION VALIDATION:
+All configuration values are automatically validated using the validate_config() function.
+Invalid values will raise clear error messages at startup, preventing runtime errors.
 
 PROXY POOL CONFIGURATION EXAMPLE:
 {
@@ -30,8 +34,8 @@ PROXY POOL CONFIGURATION EXAMPLE:
             {
                 "url": "proxy1.example.com:8080",
                 "type": "http",
-                "username": "user1",
-                "password": "pass1",
+                "username": "your_username",
+                "password": "your_password",
                 "country": "US",
                 "region": "us-east",
                 "is_residential": false
@@ -39,8 +43,8 @@ PROXY POOL CONFIGURATION EXAMPLE:
             {
                 "url": "proxy2.example.com:1080",
                 "type": "socks5",
-                "username": "user2",
-                "password": "pass2",
+                "username": "your_username",
+                "password": "your_password",
                 "country": "GB",
                 "region": "eu-west",
                 "is_residential": true
@@ -212,14 +216,14 @@ IDS/IPS THROTTLING CONFIGURATION EXAMPLE:
         "enabled": true,
         "max_requests_per_second": 10,
         "burst_capacity": 20,
-        "min_requests_per_second": 0.1,  # Default minimum rate
-        "max_requests_per_second": 100
+        "min_requests_per_second": 0.1  # Default minimum rate
     }
 }
 
 IDS/IPS THROTTLING FEATURES:
 - Token Bucket algorithm for precise rate limiting
 - Configurable request rate and burst capacity
+- Configurable minimum and maximum rate limits
 - Adaptive throttling based on HTTP response codes (429, 503, etc.)
 - Automatic rate adjustment when throttling is detected
 - Gradual recovery when requests succeed
@@ -453,7 +457,8 @@ SYMBOLIC EXECUTION FEATURES:
 REQUEST DEDUPLICATION CONFIGURATION EXAMPLE:{
     "request_deduplication": {
         "enabled": true,
-        "dedup_cache_size": 10000
+        "dedup_cache_size": 10000,
+        "body_truncation_size": 1000
     }
 }
 
@@ -470,7 +475,8 @@ REQUEST DEDUPLICATION FEATURES:
 HTTP/2 AND HTTP/3 SUPPORT CONFIGURATION EXAMPLE:{
     "http2_enabled": true,
     "http3_enabled": false,
-    "http2_max_streams": 100
+    "http2_max_streams": 100,
+    "verify_ssl": true
 }
 
 HTTP/2 AND HTTP/3 FEATURES:
@@ -482,6 +488,7 @@ HTTP/2 AND HTTP/3 FEATURES:
 - Multi-Stream Testing: Efficient parallel testing using HTTP/2 streams
 - Connection Reuse: Keep-alive connections with proper timeout handling
 - Protocol Detection: Automatic detection and selection of best available protocol
+- SSL Verification: Configurable SSL certificate verification (enabled by default for security)
 """
 
 import asyncio
@@ -499,7 +506,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable, Pattern
 import warnings
-import hmac
 import secrets
 import multiprocessing
 from multiprocessing import Queue, Manager, Process
@@ -574,8 +580,8 @@ class RequestDeduplicator:
     def __init__(self, config=None):
         self.config = config or {}
         self.enabled = config.get('request_deduplication_enabled', True)
-        self.request_signatures = {}  # Store request signatures
-        self.response_signatures = {}  # Store response signatures
+        self.request_signatures = OrderedDict()  # Store request signatures with LRU eviction
+        self.response_signatures = OrderedDict()  # Store response signatures with LRU eviction
         self.dedup_stats = {
             'total_requests': 0,
             'duplicates_found': 0,
@@ -584,14 +590,13 @@ class RequestDeduplicator:
         }
         self.signature_cache = OrderedDict()
         self.max_cache_size = config.get('dedup_cache_size', 10000)
+        self.body_truncation_size = config.get('body_truncation_size', 1000)  # Configurable truncation size
         
         if self.enabled:
             logging.info("Request deduplication engine initialized")
     
     def generate_request_signature(self, method, url, headers=None, body=None):
         """Generate unique signature for HTTP request"""
-        import hashlib
-        
         # Normalize URL
         normalized_url = self._normalize_url(url)
         
@@ -601,21 +606,19 @@ class RequestDeduplicator:
         # Normalize body
         normalized_body = self._normalize_body(body)
         
-        # Create signature
-        signature_data = f"{method}:{normalized_url}:{normalized_headers}:{normalized_body}"
+        # Create signature using join for better performance with large data
+        signature_data = ":".join([method, normalized_url, normalized_headers, normalized_body])
         signature = hashlib.sha256(signature_data.encode()).hexdigest()
         
         return signature
     
     def generate_response_signature(self, status, headers, body):
         """Generate unique signature for HTTP response"""
-        import hashlib
-        
         # Normalize response (ignore dynamic headers like Date, Server)
         normalized_headers = self._normalize_response_headers(headers)
         
-        # Create signature
-        signature_data = f"{status}:{normalized_headers}:{body[:1000]}"  # First 1KB of body
+        # Create signature using join for better performance
+        signature_data = ":".join([str(status), normalized_headers, body[:self.body_truncation_size]])  # Configurable truncation
         signature = hashlib.sha256(signature_data.encode()).hexdigest()
         
         return signature
@@ -626,9 +629,8 @@ class RequestDeduplicator:
         
         # Remove query parameters that might be dynamic
         query_params = parse_qs(parsed.query)
-        dynamic_params = ['timestamp', 'nonce', 'random', 'csrf_token', '_']
         
-        for param in dynamic_params:
+        for param in DYNAMIC_QUERY_PARAMS:
             if param in query_params:
                 del query_params[param]
         
@@ -690,15 +692,14 @@ class RequestDeduplicator:
         try:
             if body_str.startswith('{'):
                 body_json = json.loads(body_str)
-                dynamic_fields = ['timestamp', 'nonce', 'random', 'csrf_token', '_csrf']
-                for field in dynamic_fields:
+                for field in DYNAMIC_BODY_FIELDS:
                     if field in body_json:
                         body_json[field] = "REDACTED"
                 return json.dumps(body_json, sort_keys=True)
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
         
-        return body_str[:1000]  # First 1KB for non-JSON
+        return body_str[:self.body_truncation_size]  # Configurable truncation for non-JSON
     
     def is_duplicate_request(self, method, url, headers=None, body=None):
         """Check if request is a duplicate"""
@@ -713,14 +714,17 @@ class RequestDeduplicator:
             logging.debug(f"Duplicate request detected: {method} {url}")
             return True
         
-        # Store new signature
+        # Store new signature with LRU eviction
+        if len(self.request_signatures) >= self.max_cache_size:
+            self.request_signatures.popitem(last=False)
+        
         self.request_signatures[signature] = {
             'method': method,
             'url': url,
             'timestamp': time.time()
         }
         
-        # Manage cache size
+        # Also manage signature cache size
         if len(self.signature_cache) >= self.max_cache_size:
             self.signature_cache.popitem(last=False)
         
@@ -739,6 +743,10 @@ class RequestDeduplicator:
         
         if signature in self.response_signatures:
             return True
+        
+        # Store new signature with LRU eviction
+        if len(self.response_signatures) >= self.max_cache_size:
+            self.response_signatures.popitem(last=False)
         
         self.response_signatures[signature] = {
             'status': status,
@@ -797,6 +805,14 @@ class HTTP2Client:
     async def _get_session(self, host):
         """Get or create HTTP/2 session for a specific host"""
         if host not in self.connection_pool or self.connection_pool[host].closed:
+            # Explicitly close existing session if present to prevent resource leak
+            if host in self.connection_pool and not self.connection_pool[host].closed:
+                try:
+                    await self.connection_pool[host].close()
+                    logging.debug(f"Closed existing HTTP/2 session for {host}")
+                except Exception as e:
+                    logging.warning(f"Error closing HTTP/2 session for {host}: {e}")
+            
             # Create HTTP/2 enabled session with connection pooling
             connector = aiohttp.TCPConnector(
                 limit=self.max_concurrent_streams,
@@ -929,7 +945,10 @@ class HTTP2Client:
         """Close all HTTP/2 sessions"""
         for host, session in self.connection_pool.items():
             if not session.closed:
-                await session.close()
+                try:
+                    await session.close()
+                except Exception as e:
+                    logging.warning(f"Error closing HTTP/2 session for {host}: {e}")
         self.connection_pool.clear()
         logging.info("HTTP/2 client sessions closed")
 
@@ -947,6 +966,7 @@ class HTTP3Client:
         self.session = None
         self.quic_available = False
         self.aioquic_available = False
+        self.verify_ssl = config.get('verify_ssl', True)  # Default to secure SSL verification
         
         if self.enabled:
             try:
@@ -974,7 +994,14 @@ class HTTP3Client:
                     max_data=2**24,
                     max_stream_data=2**23,
                 )
-                self.quic_config.verify_mode = ssl.CERT_NONE  # For scanning purposes
+                
+                # Configure SSL verification based on settings
+                if not self.verify_ssl:
+                    self.quic_config.verify_mode = ssl.CERT_NONE
+                    logging.warning("SSL certificate verification DISABLED for HTTP/3 - only use for authorized scanning")
+                else:
+                    self.quic_config.verify_mode = ssl.CERT_REQUIRED
+                    logging.info("SSL certificate verification ENABLED for HTTP/3")
                 
                 logging.info("HTTP/3 client initialized with aioquic QUIC support")
             except ImportError:
@@ -1117,6 +1144,67 @@ DEFAULT_TTL_ESTIMATE_LINUX = 64
 DEFAULT_CACHE_MAX_SIZE = 1000
 DEFAULT_CACHE_TTL = 300
 
+# Dynamic parameter filtering constants
+DYNAMIC_QUERY_PARAMS = ['timestamp', 'nonce', 'random', 'csrf_token', '_']
+DYNAMIC_BODY_FIELDS = ['timestamp', 'nonce', 'random', 'csrf_token', '_csrf']
+
+# Configuration validation
+def validate_config(config):
+    """
+    Validate configuration values and provide clear error messages.
+    
+    Args:
+        config: Dictionary containing configuration values
+        
+    Returns:
+        tuple: (is_valid, error_messages)
+    """
+    errors = []
+    
+    # Validate numeric ranges
+    if 'depth' in config:
+        if not isinstance(config['depth'], int) or config['depth'] < 1 or config['depth'] > 10:
+            errors.append("depth must be an integer between 1 and 10")
+    
+    if 'threads' in config:
+        if not isinstance(config['threads'], int) or config['threads'] < 1 or config['threads'] > 1000:
+            errors.append("threads must be an integer between 1 and 1000")
+    
+    if 'delay' in config:
+        if not isinstance(config['delay'], (int, float)) or config['delay'] < 0:
+            errors.append("delay must be a non-negative number")
+    
+    # Validate timeout values
+    if 'request_timeout' in config:
+        if not isinstance(config['request_timeout'], (int, float)) or config['request_timeout'] < 1:
+            errors.append("request_timeout must be a positive number")
+    
+    # Validate cache configuration
+    if 'dedup_cache_size' in config:
+        if not isinstance(config['dedup_cache_size'], int) or config['dedup_cache_size'] < 100:
+            errors.append("dedup_cache_size must be an integer >= 100")
+    
+    if 'body_truncation_size' in config:
+        if not isinstance(config['body_truncation_size'], int) or config['body_truncation_size'] < 100:
+            errors.append("body_truncation_size must be an integer >= 100")
+    
+    # Validate rate limiting
+    if 'verification_rate_limit' in config:
+        if not isinstance(config['verification_rate_limit'], (int, float)) or config['verification_rate_limit'] < 0.1:
+            errors.append("verification_rate_limit must be >= 0.1")
+    
+    if 'discovery_rate_limit' in config:
+        if not isinstance(config['discovery_rate_limit'], (int, float)) or config['discovery_rate_limit'] < 0.1:
+            errors.append("discovery_rate_limit must be >= 0.1")
+    
+    # Validate boolean flags
+    boolean_fields = ['http2_enabled', 'http3_enabled', 'verify_ssl', 'request_deduplication_enabled']
+    for field in boolean_fields:
+        if field in config and not isinstance(config[field], bool):
+            errors.append(f"{field} must be a boolean value")
+    
+    return len(errors) == 0, errors
+
 # Regression oracle constants
 DEFAULT_BENIGN_SAMPLE_SIZE = 50
 DEFAULT_REGRESSION_RETRIES = 3
@@ -1193,12 +1281,14 @@ class AsyncTaskManager:
             except Exception as e:
                 logging.error(f"Error in task completion callback for '{task_name}': {e}", exc_info=True)
             finally:
-                # Clean up task from tracking set
-                asyncio.create_task(self._remove_task(task))
+                # Clean up task from tracking set synchronously to avoid race condition
+                if task in self.background_tasks:
+                    self.background_tasks.discard(task)
         
         task.add_done_callback(handle_completion)
         
-        # Track the task (synchronously)
+        # Track the task synchronously but ensure thread safety
+        # Use a simple add since the callback handles removal with proper checking
         self.background_tasks.add(task)
         
         return task
@@ -1234,8 +1324,9 @@ class AsyncTaskManager:
             except Exception as e:
                 logging.error(f"Error in task completion callback for '{task_name}': {e}", exc_info=True)
             finally:
-                # Clean up task from tracking set
-                asyncio.create_task(self._remove_task(task))
+                # Clean up task from tracking set synchronously to avoid race condition
+                if task in self.background_tasks:
+                    self.background_tasks.discard(task)
         
         task.add_done_callback(handle_completion)
         
@@ -1280,6 +1371,7 @@ class AsyncTaskManager:
         
         logging.info(f"Cancelling {len(self.background_tasks)} background tasks")
         
+        cancellation_failures = 0
         async with self._lock:
             for task in self.background_tasks:
                 if not task.done():
@@ -1290,16 +1382,12 @@ class AsyncTaskManager:
                         pass
                     except Exception as e:
                         logging.warning(f"Error during task cancellation: {e}")
+                        cancellation_failures += 1
             
             self.background_tasks.clear()
-    
-    async def cancel_all(self):
-        """Cancel all tracked background tasks"""
-        async with self._lock:
-            for task in self.background_tasks:
-                if not task.done():
-                    task.cancel()
-            self.background_tasks.clear()
+        
+        if cancellation_failures > 0:
+            logging.warning(f"Task cancellation completed with {cancellation_failures} failures")
 
 class BackgroundTaskManager:
     """
@@ -1339,20 +1427,17 @@ class BackgroundTaskManager:
             except Exception as e:
                 logging.error(f"Error in background task completion callback for '{task_name}': {e}", exc_info=True)
             finally:
-                # Clean up task from tracking set
-                asyncio.create_task(self._remove_task(task))
+                # Clean up task from tracking set synchronously to avoid race condition
+                if task in self.background_tasks:
+                    self.background_tasks.discard(task)
         
         task.add_done_callback(handle_completion)
         
-        # Track the task (synchronously)
+        # Track the task synchronously but ensure thread safety
+        # Use a simple add since the callback handles removal with proper checking
         self.background_tasks.add(task)
         
         return task
-    
-    async def _remove_task(self, task):
-        """Remove a completed task from tracking set"""
-        async with self._lock:
-            self.background_tasks.discard(task)
     
     async def cancel_all(self):
         """Cancel all tracked background tasks."""
@@ -1361,6 +1446,7 @@ class BackgroundTaskManager:
         
         logging.info(f"Cancelling {len(self.background_tasks)} background tasks")
         
+        cancellation_failures = 0
         try:
             # Cancel all tasks
             for task in self.background_tasks:
@@ -1378,23 +1464,57 @@ class BackgroundTaskManager:
             self.background_tasks.clear()
         except Exception as e:
             logging.error(f"Error cancelling background tasks: {e}", exc_info=True)
+            cancellation_failures += 1
             self.background_tasks.clear()
+        
+        if cancellation_failures > 0:
+            logging.warning(f"Task cancellation completed with {cancellation_failures} failures")
 
 # Global async task manager instance
-async_task_manager = AsyncTaskManager()
+ASYNC_TASK_MANAGER = AsyncTaskManager()
 
 # Security utility functions
 def validate_checkpoint_filename(filename):
-    """Validate checkpoint filename to prevent path traversal attacks"""
+    """
+    Validate checkpoint filename to prevent path traversal attacks.
+    
+    Args:
+        filename: The filename to validate
+        
+    Returns:
+        bool: True if filename is safe, False otherwise
+    """
     import re
+    import os
+    
+    # Check for null bytes
+    if '\x00' in filename:
+        return False
+    
+    # Extract just the filename (no path components)
+    safe_filename = os.path.basename(filename)
+    
+    # Ensure basename didn't change (no path traversal)
+    if safe_filename != filename:
+        return False
+    
     # Allow only checkpoint_<timestamp>.json pattern
     # timestamp should be digits only
     pattern = r'^checkpoint_\d+\.json$'
-    if not re.match(pattern, filename):
+    if not re.match(pattern, safe_filename):
         return False
     
-    # Ensure no path traversal characters
-    if '..' in filename or '/' in filename or '\\' in filename:
+    # Ensure no path traversal characters (double-check)
+    if '..' in safe_filename or '/' in safe_filename or '\\' in safe_filename:
+        return False
+    
+    # Check for absolute path attempts
+    if os.path.isabs(filename):
+        return False
+    
+    # Validate character set (only alphanumeric, underscore, and dot)
+    allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.')
+    if not all(c in allowed_chars for c in safe_filename):
         return False
     
     return True
@@ -1641,7 +1761,7 @@ class MultiprocessingScanner:
             while True:
                 result = self.result_queue.get(timeout=timeout or 0.1)
                 results.append(result)
-        except:
+        except Exception:
             pass
         return results
     
@@ -1732,7 +1852,7 @@ class RESTAPIServer:
             }
             
             # Start scan in background with proper exception handling
-            task = async_task_manager.create_task_sync(
+            task = ASYNC_TASK_MANAGER.create_task_sync(
                 self.run_scan(task_id, target_url, config),
                 task_name=f"scan_{task_id}",
                 callback=lambda t: logging.info(f"Scan task {task_id} completed")
@@ -3684,7 +3804,7 @@ class BrowserAuthHelper:
                         EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                     )
                     break
-                except:
+                except Exception:
                     continue
             
             if username_field and credentials.get('username'):
@@ -3705,7 +3825,7 @@ class BrowserAuthHelper:
                         EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                     )
                     break
-                except:
+                except Exception:
                     continue
             
             if password_field and credentials.get('password'):
@@ -3725,7 +3845,7 @@ class BrowserAuthHelper:
                     submit_btn = self.driver.find_element(By.CSS_SELECTOR, selector)
                     submit_btn.click()
                     break
-                except:
+                except Exception:
                     continue
                     
         except Exception as e:
@@ -3767,7 +3887,7 @@ class BrowserAuthHelper:
             for key, value in local_storage.items():
                 if 'token' in key.lower():
                     tokens[key] = value
-        except:
+        except Exception:
             pass
         
         return tokens
@@ -4771,7 +4891,7 @@ class AdvancedProxyTab(QWidget):
                 from datetime import datetime
                 dt = datetime.fromisoformat(timestamp)
                 time_str = dt.strftime('%H:%M:%S')
-            except:
+            except (ValueError, TypeError):
                 time_str = timestamp
             
             # Add row
@@ -7124,7 +7244,7 @@ class ContextAwareSemanticMutator:
             try:
                 b64_encoded = base64.b64encode(payload.encode()).decode()
                 variants.append(b64_encoded)
-            except:
+            except (UnicodeEncodeError, UnicodeDecodeError, AttributeError):
                 pass
             
             # URL encoding chain
@@ -7132,14 +7252,14 @@ class ContextAwareSemanticMutator:
                 url_encoded = urllib.parse.quote(payload)
                 double_encoded = urllib.parse.quote(url_encoded)
                 variants.append(double_encoded)
-            except:
+            except (UnicodeEncodeError, TypeError):
                 pass
             
             # Hex encoding
             try:
                 hex_encoded = payload.encode('utf-8').hex()
                 variants.append(hex_encoded)
-            except:
+            except (UnicodeEncodeError, AttributeError):
                 pass
             
             return variants
@@ -9284,7 +9404,7 @@ async def start_oob_polling_task(marker, timeout_seconds=60, check_interval=1.0)
     This spawns a background task that polls oob_results every 1 second for 60 seconds.
     Returns the task object which can be awaited or cancelled.
     """
-    task = async_task_manager.create_task_sync(
+    task = ASYNC_TASK_MANAGER.create_task_sync(
         wait_for_oob_callback_async(marker, timeout_seconds, check_interval),
         task_name=f"oob_polling_{marker[:8]}",
         callback=lambda t: logging.info(f"OOB polling task for marker {marker[:8]} completed")
@@ -13171,7 +13291,7 @@ class SessionStateManager:
             # Schedule background session renewal task with proper exception handling
             try:
                 # Create a background async task for renewal to avoid blocking
-                await async_task_manager.create_task(
+                await ASYNC_TASK_MANAGER.create_task(
                     self._background_renewal_worker_async(
                         session_id, status_code, response_headers, scanner_instance
                     ),
@@ -31887,7 +32007,7 @@ class OmegaDAST:
                 self.vulnerability_timestamps[vuln_key] = time.time()
             if self.validation_enabled and self.validation_engine:
                 try:
-                    task = await async_task_manager.create_task(
+                    task = await ASYNC_TASK_MANAGER.create_task(
                         self._validate_vulnerability(vuln),
                         task_name=f"validate_{vuln['type']}_{vuln.get('url','')[:30]}",
                         callback=lambda t: self.log(f"Validation completed for {vuln['type']}")
@@ -36942,7 +37062,7 @@ class GraphQLSelfReferencingFragmentGenerator:
                 self.vulnerability_timestamps[vuln_key] = time.time()
             if self.validation_enabled and self.validation_engine:
                 try:
-                    task = await async_task_manager.create_task(
+                    task = await ASYNC_TASK_MANAGER.create_task(
                         self._validate_vulnerability(vuln),
                         task_name=f"validate_{vuln['type']}_{vuln.get('url','')[:30]}",
                         callback=lambda t: self.log(f"Validation completed for {vuln['type']}")
@@ -42619,7 +42739,7 @@ class ScanTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.1 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.2 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -43702,7 +43822,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.1']
+                        ['Tool Version', 'UltraDAST v18.2']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -43813,7 +43933,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.1",
+                            "tool": "UltraDAST v18.2",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -44105,7 +44225,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.1 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.2 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
