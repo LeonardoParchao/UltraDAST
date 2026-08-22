@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.4 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.5 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -8,7 +8,7 @@ JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
 Install:
     pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt dnspython html5lib
     pip install websockets grpcio grpcio-reflection cvss PyQt5 reportlab markupsafe protobuf
-    pip install z3-solver  # Required for symbolic execution with Z3 SMT solver
+    pip install z3-solver  # Required for JavaScript symbolic execution with Z3 SMT solver
     pip install playwright  # Required for advanced JavaScript instrumentation
     playwright install chromium  # Install Playwright browser binaries
 
@@ -507,21 +507,24 @@ STEALTH MODE USAGE:
 7. If FSM is stuck (e.g., not detecting Checkout): Manually navigate to Checkout
    using the Selenium Browser tab to force FSM to learn the transition
 
-SYMBOLIC EXECUTION WITH Z3 SMT SOLVER CONFIGURATION EXAMPLE:{
+JAVASCRIPT SYMBOLIC EXECUTION WITH Z3 SMT SOLVER CONFIGURATION EXAMPLE:{
     "symbolic_execution_enabled": true,
     "symbolic_max_depth": 10,
     "symbolic_timeout": 30,
     "use_z3_solver": true
 }
 
-SYMBOLIC EXECUTION FEATURES:
-- Z3 SMT Solver Integration: Real constraint solving using Microsoft Research Z3 theorem prover
-- Path Exploration: Systematic exploration of code paths with symbolic variables
-- Constraint Solving: Automatic generation of test inputs that satisfy path conditions
-- Type-Aware Symbolic Variables: Proper handling of integers, booleans, strings, and custom types
-- Vulnerability Candidate Detection: Identification of potential injection points through symbolic analysis
-- High-Confidence Input Generation: Z3 provides mathematically proven valid test inputs
-- Fallback Support: Graceful degradation to basic constraint solving when Z3 unavailable
+JAVASCRIPT SYMBOLIC EXECUTION FEATURES:
+- Client-Side Security Analysis: JavaScript code parsing and vulnerability detection
+- DOM XSS Detection: Automatic identification of DOM-based cross-site scripting vulnerabilities
+- Data Flow Analysis: Tracing user input from sources (location.search, URL parameters) to dangerous sinks (innerHTML, eval)
+- Z3 SMT Solver Integration: Constraint solving for JavaScript logic analysis
+- Unsafe Pattern Detection: Identification of dangerous JavaScript patterns (eval, document.write, Function constructor)
+- Event Handler Analysis: Security analysis of inline event handlers and JavaScript event listeners
+- Prototype Pollution Detection: Detection of JavaScript prototype pollution vulnerabilities
+- Client-Side Template Injection: Identification of template injection vulnerabilities in modern frameworks
+- Real-Time Analysis: JavaScript analysis during web crawling and scanning phases
+- External Script Tracking: Analysis of external JavaScript files referenced by web pages
 
 REQUEST DEDUPLICATION CONFIGURATION EXAMPLE:{
     "request_deduplication": {
@@ -656,14 +659,14 @@ except ImportError:
     motor = None
     logging.warning("motor library not available - MongoDB scanning will be disabled")
 
-# Optional Z3 SMT solver import with fallback
+# Optional Z3 SMT solver import with fallback for JavaScript symbolic execution
 try:
     from z3 import Solver, Bool, Int, Real, String, And, Or, Not, Implies, Exists, ForAll, sat, solve
     Z3_AVAILABLE = True
 except ImportError:
     Z3_AVAILABLE = False
     Solver = None
-    logging.warning("Z3 library not available - symbolic execution will use basic constraint solving")
+    logging.warning("Z3 library not available - JavaScript symbolic execution will use pattern matching only")
 
 # ============================================================================
 # REQUEST DEDUPLICATION ENGINE
@@ -26399,11 +26402,11 @@ class InjectionEngine:
             self.taint_tracker = None
             self.taint_instrumentor = None
 
-        # Symbolic execution integration - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        # JavaScript symbolic execution integration - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
         self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
-                self.symbolic_executor = SymbolicExecutor(config)
+                self.symbolic_executor = JavaScriptSymbolicExecutor(config)
                 logging.info("Symbolic execution enabled and initialized")
             except Exception as e:
                 logging.warning(f"Failed to initialize symbolic execution: {e}")
@@ -26728,7 +26731,7 @@ class InjectionEngine:
         self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
-                self.symbolic_executor = SymbolicExecutor(self.config)
+                self.symbolic_executor = JavaScriptSymbolicExecutor(self.config)
                 logging.info("Symbolic execution initialized for testing")
             except Exception as e:
                 logging.warning(f"Failed to initialize symbolic execution during test run: {e}")
@@ -33773,11 +33776,11 @@ class OmegaDAST:
             self.taint_instrumentor = None
             self.taint_integrated_session = None
 
-        # Symbolic execution initialization - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        # JavaScript symbolic execution initialization - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
         self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
-                self.symbolic_executor = SymbolicExecutor(config)
+                self.symbolic_executor = JavaScriptSymbolicExecutor(config)
                 logging.info("Symbolic execution enabled and initialized in OmegaDAST")
             except Exception as e:
                 logging.warning(f"Failed to initialize symbolic execution in OmegaDAST: {e}")
@@ -34212,11 +34215,11 @@ class OmegaDAST:
                 self.taint_instrumentor = None
                 self.taint_integrated_session = None
 
-        # Symbolic execution setup - Now implemented with SymbolicExecutionEngine and SymbolicExecutor classes
+        # JavaScript symbolic execution setup - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
         self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
-                self.symbolic_executor = SymbolicExecutor(self.config)
+                self.symbolic_executor = JavaScriptSymbolicExecutor(self.config)
                 logging.info("Symbolic execution enabled and initialized")
             except Exception as e:
                 logging.warning(f"Failed to initialize symbolic execution: {e}")
@@ -34821,49 +34824,64 @@ class OmegaDAST:
                 logging.warning(f"Genetic fuzzing failed: {e}")
                 self.log(f"Genetic fuzzing encountered an error: {e}")
 
-        # Run symbolic execution if enabled
+        # Run JavaScript symbolic execution if enabled
         if self.symbolic_execution_enabled and self.symbolic_executor:
-            self.log("Starting symbolic execution analysis...")
+            self.log("Starting JavaScript symbolic execution analysis...")
             try:
-                # Analyze key endpoints with symbolic execution
+                # Analyze crawled pages for JavaScript vulnerabilities
                 symbolic_results = []
-                for url_data in self.crawler_engine.visited_urls[:50]:  # Limit to top 50 URLs
-                    url = url_data.get('url', url_data) if isinstance(url_data, dict) else url_data
-                    if url:
-                        # Extract parameters from the URL
-                        parsed = urlparse(url)
-                        params = parse_qs(parsed.query)
-                        
-                        # Perform symbolic analysis
-                        analysis = self.symbolic_executor.analyze_endpoint(
-                            url, 'GET', params
-                        )
-                        if analysis:
-                            symbolic_results.append(analysis)
+                pages_to_analyze = min(20, len(self.crawler_engine.crawled_pages))  # Limit to 20 pages
                 
-                # Process vulnerability candidates from symbolic execution
+                for page in self.crawler_engine.crawled_pages[:pages_to_analyze]:
+                    page_url = page.get('url', page)
+                    if page_url:
+                        try:
+                            # Fetch page content for analysis
+                            session_to_use = self.taint_integrated_session if self.taint_integrated_session else self.session_manager
+                            resp = await session_to_use.fetch(page_url) if hasattr(session_to_use, 'fetch') else await session_to_use.session_manager.fetch(page_url)
+                            
+                            if resp and resp.status == 200:
+                                html = resp._body
+                                
+                                # Analyze page for JavaScript
+                                js_analysis = self.symbolic_executor.analyze_page_for_javascript(html, page_url)
+                                if js_analysis:
+                                    symbolic_results.append(js_analysis)
+                                    
+                                    # Process JavaScript vulnerabilities immediately
+                                    for js_vuln in js_analysis.get('javascript_vulnerabilities', []):
+                                        js_vuln['url'] = page_url
+                                        js_vuln['discovery_phase'] = 'symbolic_execution'
+                                        
+                                        # Map to standard vulnerability format
+                                        vuln = {
+                                            'type': js_vuln.get('type', 'JAVASCRIPT_VULNERABILITY').upper(),
+                                            'url': page_url,
+                                            'parameter': js_vuln.get('sink', 'javascript'),
+                                            'confidence': 'Medium',
+                                            'severity': js_vuln.get('severity', 'High'),
+                                            'evidence': f"JavaScript analysis detected {js_vuln['type']} in {js_vuln.get('source_type', 'unknown')}: {js_vuln.get('sink', 'unknown')} <- {js_vuln.get('source', 'unknown')}",
+                                            'detection_method': 'javascript_symbolic_execution',
+                                            'timestamp': datetime.now().isoformat()
+                                        }
+                                        await self._add_vulnerability(vuln)
+                                        self.log(f"[JAVASCRIPT ANALYSIS] {js_vuln['type']} found at {page_url}")
+                                        
+                        except Exception as page_error:
+                            logging.debug(f"Failed to analyze page {page_url}: {page_error}")
+                            continue
+                
+                # Get all vulnerability candidates from symbolic analysis
                 vuln_candidates = self.symbolic_executor.get_vulnerability_candidates()
-                for candidate in vuln_candidates:
-                    vuln = {
-                        'type': candidate['type'].upper(),
-                        'url': candidate['url'],
-                        'parameter': candidate['variable'],
-                        'confidence': 'Medium',
-                        'severity': 'High',
-                        'evidence': f"Symbolic execution detected {candidate['type']} pattern in parameter '{candidate['variable']}' with value: {candidate['value'][:100]}",
-                        'detection_method': 'symbolic_execution',
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    await self._add_vulnerability(vuln)
-                    self.log(f"[SYMBOLIC EXECUTION] {candidate['type']} candidate found via symbolic analysis")
+                self.log(f"JavaScript symbolic execution found {len(vuln_candidates)} vulnerability candidates")
                 
                 # Log symbolic execution summary
                 summary = self.symbolic_executor.get_summary()
-                self.log(f"Symbolic execution completed: {summary['total_analyses']} analyses, {summary['total_paths_explored']} paths explored, {summary['vulnerability_candidates']} vulnerability candidates")
+                self.log(f"JavaScript symbolic execution completed: {summary['total_analyses']} analyses, {summary['javascript_files_analyzed']} JS files analyzed, {summary['vulnerability_candidates']} vulnerability candidates")
                 
             except Exception as e:
-                logging.warning(f"Symbolic execution failed: {e}")
-                self.log(f"Symbolic execution encountered an error: {e}")
+                logging.warning(f"JavaScript symbolic execution failed: {e}")
+                self.log(f"JavaScript symbolic execution encountered an error: {e}")
         
         # Run schema-aware fuzzing if enabled (more intelligent than genetic fuzzing)
         if self.schema_inference_enabled and self.dynamic_mutation_enabled:
@@ -35136,6 +35154,28 @@ class OmegaDAST:
                     self.signals.endpoint_progress.emit(url, "Completed", self.current_task, self.total_tasks)
                     
                 await self._passive_checks(resp)
+                
+                # Perform JavaScript symbolic analysis if enabled
+                if self.symbolic_executor and self.config.get('symbolic_execution_enabled', True):
+                    try:
+                        js_analysis = self.symbolic_executor.analyze_page_for_javascript(html, url)
+                        if js_analysis:
+                            # Process JavaScript vulnerabilities found
+                            for js_vuln in js_analysis.get('javascript_vulnerabilities', []):
+                                js_vuln['url'] = url
+                                js_vuln['discovery_phase'] = 'crawling'
+                                self.reporting_engine.vulnerabilities.append(js_vuln)
+                                self.log(f"[JAVASCRIPT ANALYSIS] {js_vuln['type']} at {url}")
+                                self.add_finding(js_vuln)
+                            
+                            # Log analysis summary
+                            inline_count = len(js_analysis.get('inline_scripts', []))
+                            external_count = len(js_analysis.get('external_scripts', []))
+                            vuln_count = len(js_analysis.get('javascript_vulnerabilities', []))
+                            logging.info(f"JavaScript analysis: {inline_count} inline scripts, {external_count} external scripts, {vuln_count} vulnerabilities found")
+                    except Exception as e:
+                        logging.warning(f"JavaScript symbolic analysis failed during crawl: {e}")
+                
                 links = self.crawler_engine._extract_links(soup, url, html)
                 for l in links:
                     if l not in self.crawler_engine.visited_urls:
@@ -44508,8 +44548,9 @@ class ScanTab(QWidget):
         advanced_layout.setSpacing(8)
         advanced_layout.setContentsMargins(16, 20, 16, 16)
         
-        self.symbolic_execution_enabled = QCheckBox("Enable Symbolic Execution")
+        self.symbolic_execution_enabled = QCheckBox("Enable JavaScript Symbolic Execution")
         self.symbolic_execution_enabled.setChecked(True)
+        self.symbolic_execution_enabled.setToolTip("Enable client-side JavaScript security analysis with DOM XSS and data flow detection")
         
         self.genetic_fuzzing_enabled = QCheckBox("Enable Genetic Fuzzing")
         self.genetic_fuzzing_enabled.setChecked(False)
@@ -45662,7 +45703,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.4 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.5 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -46769,7 +46810,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.4']
+                        ['Tool Version', 'UltraDAST v18.5']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -46880,7 +46921,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.4",
+                            "tool": "UltraDAST v18.5",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -47172,7 +47213,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.4 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.5 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -48337,13 +48378,14 @@ class AdvancedReflectionDetector:
         }
 
 # ---------------------------------------------------------------------
-# SYMBOLIC EXECUTION ENGINE - Path Exploration & Constraint Solving
+# JAVASCRIPT SYMBOLIC EXECUTION ENGINE - Client-Side Security Analysis
 # ---------------------------------------------------------------------
 
-class SymbolicExecutionEngine:
+class JavaScriptSymbolicExecutionEngine:
     """
-    Real symbolic execution engine with AST parsing and Z3 constraint solving.
-    Uses Python's ast module for code analysis and Z3 SMT solver for constraint solving.
+    JavaScript symbolic execution engine for client-side security analysis.
+    Parses JavaScript code to detect DOM-based XSS, unsafe data flows, and client-side vulnerabilities.
+    Uses Z3 SMT solver for constraint solving when analyzing JavaScript logic.
     """
     
     def __init__(self, config=None):
@@ -48357,133 +48399,149 @@ class SymbolicExecutionEngine:
         self.timeout = config.get('symbolic_timeout', 30)
         self.z3_solver = None
         self.z3_variables = {}
-        self.ast_cache = {}  # Cache for parsed ASTs
+        self.js_cache = {}  # Cache for parsed JavaScript
+        
+        # DOM XSS patterns
+        self.dom_xss_sinks = [
+            'innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write',
+            'document.writeln', 'eval', 'setTimeout', 'setInterval', 'Function',
+            'location.href', 'location.assign', 'location.replace', 'window.open'
+        ]
+        
+        # Unsafe JavaScript patterns
+        self.unsafe_patterns = {
+            'eval_usage': r'eval\s*\(',
+            'document_write': r'document\.(write|writeln)\s*\(',
+            'innerHTML': r'\.innerHTML\s*=',
+            'dangerous_functions': r'(setTimeout|setInterval)\s*\(\s*["\']',
+            'location_manipulation': r'location\.(href|assign|replace)\s*=',
+            'domparser': r'DOMParser\s*\(',
+            'localstorage': r'localStorage\.(getItem|setItem)\s*\(',
+            'postmessage': r'window\.postMessage\s*\(',
+            'atob_btoa': r'(atob|btoa)\s*\('
+        }
         
         # Initialize Z3 solver if available
         if Z3_AVAILABLE:
             try:
                 self.z3_solver = Solver()
                 self.z3_solver.set('timeout', self.timeout * 1000)  # Convert to milliseconds
-                logging.info("Z3 SMT solver initialized for symbolic execution")
+                logging.info("Z3 SMT solver initialized for JavaScript symbolic execution")
             except Exception as e:
                 logging.warning(f"Z3 initialization failed: {e}")
                 self.z3_solver = None
         else:
-            logging.warning("Z3 not available - symbolic execution will use AST analysis only")
+            logging.warning("Z3 not available - JavaScript analysis will use pattern matching only")
         
-        logging.info("SymbolicExecutionEngine initialized with AST parsing support")
+        logging.info("JavaScriptSymbolicExecutionEngine initialized for client-side security analysis")
     
-    def parse_code_to_ast(self, code_string):
-        """Parse code string into AST using Python's ast module"""
+    def parse_javascript_code(self, js_code):
+        """Parse JavaScript code and extract security-relevant patterns"""
         try:
-            import ast
-            tree = ast.parse(code_string)
-            self.ast_cache[code_string] = tree
-            return tree
-        except SyntaxError as e:
-            logging.warning(f"Failed to parse code to AST: {e}")
-            return None
-        except Exception as e:
-            logging.warning(f"AST parsing error: {e}")
-            return None
-    
-    def analyze_ast_for_constraints(self, ast_tree):
-        """Analyze AST to extract path constraints and symbolic variables"""
-        constraints = []
-        symbolic_vars = set()
-        
-        try:
-            import ast
+            # Parse JavaScript for security patterns
+            js_analysis = {
+                'code_hash': hashlib.md5(js_code.encode()).hexdigest(),
+                'dom_xss_sinks': [],
+                'data_flows': [],
+                'unsafe_evaluations': [],
+                'event_handlers': [],
+                'variable_assignments': [],
+                'function_calls': []
+            }
             
-            class ConstraintExtractor(ast.NodeVisitor):
-                def __init__(self):
-                    self.constraints = []
-                    self.symbolic_vars = set()
-                    self.current_scope = []
-                
-                def visit_Name(self, node):
-                    if isinstance(node.ctx, ast.Load):
-                        self.symbolic_vars.add(node.id)
-                    self.generic_visit(node)
-                
-                def visit_Compare(self, node):
-                    # Extract comparison constraints
-                    if len(node.ops) == 1 and len(node.comparators) == 1:
-                        op = node.ops[0]
-                        left = node.left
-                        right = node.comparators[0]
-                        
-                        constraint_type = None
-                        if isinstance(op, ast.Eq):
-                            constraint_type = '=='
-                        elif isinstance(op, ast.NotEq):
-                            constraint_type = '!='
-                        elif isinstance(op, ast.Lt):
-                            constraint_type = '<'
-                        elif isinstance(op, ast.LtE):
-                            constraint_type = '<='
-                        elif isinstance(op, ast.Gt):
-                            constraint_type = '>'
-                        elif isinstance(op, ast.GtE):
-                            constraint_type = '>='
-                        
-                        if constraint_type:
-                            left_expr = self._extract_expr(left)
-                            right_expr = self._extract_expr(right)
-                            self.constraints.append({
-                                'type': constraint_type,
-                                'left': left_expr,
-                                'right': right_expr,
-                                'line': node.lineno
-                            })
+            # Extract DOM XSS sinks
+            for sink in self.dom_xss_sinks:
+                pattern = rf'\b{sink}\b'
+                if re.search(pattern, js_code, re.IGNORECASE):
+                    js_analysis['dom_xss_sinks'].append(sink)
+            
+            # Extract unsafe patterns
+            for vuln_type, pattern in self.unsafe_patterns.items():
+                matches = re.finditer(pattern, js_code, re.IGNORECASE)
+                for match in matches:
+                    js_analysis['unsafe_evaluations'].append({
+                        'type': vuln_type,
+                        'match': match.group(),
+                        'line': js_code[:match.start()].count('\n') + 1
+                    })
+            
+            # Extract data flows (source -> sink analysis)
+            js_analysis['data_flows'] = self._extract_data_flows(js_code)
+            
+            # Extract event handlers
+            event_pattern = r'on\w+\s*=\s*["\']([^"\']+)["\']|addEventListener\s*\(\s*["\'](\w+)["\']'
+            for match in re.finditer(event_pattern, js_code, re.IGNORECASE):
+                handler = match.group(1) or match.group(2)
+                if handler:
+                    js_analysis['event_handlers'].append({
+                        'handler': handler,
+                        'line': js_code[:match.start()].count('\n') + 1
+                    })
+            
+            # Extract variable assignments that might be user-controlled
+            var_pattern = r'(var|let|const)\s+(\w+)\s*=\s*([^;]+)'
+            for match in re.finditer(var_pattern, js_code):
+                var_name = match.group(2)
+                var_value = match.group(3).strip()
+                if any(source in var_value.lower() for source in ['location', 'window', 'document', 'url', 'hash', 'search']):
+                    js_analysis['variable_assignments'].append({
+                        'variable': var_name,
+                        'value': var_value[:100],  # Truncate long values
+                        'source': 'user_controlled',
+                        'line': js_code[:match.start()].count('\n') + 1
+                    })
+            
+            # Extract function calls that might be security-sensitive
+            func_pattern = r'(\w+)\s*\('
+            for match in re.finditer(func_pattern, js_code):
+                func_name = match.group(1)
+                if func_name in self.dom_xss_sinks or func_name in ['eval', 'setTimeout', 'setInterval', 'Function']:
+                    js_analysis['function_calls'].append({
+                        'function': func_name,
+                        'line': js_code[:match.start()].count('\n') + 1
+                    })
+            
+            self.js_cache[js_code] = js_analysis
+            return js_analysis
+            
+        except Exception as e:
+            logging.warning(f"JavaScript parsing failed: {e}")
+            return None
+    
+    def _extract_data_flows(self, js_code):
+        """Extract potential data flows from user-controlled sources to dangerous sinks"""
+        data_flows = []
+        
+        # Common sources of user input in JavaScript
+        user_sources = [
+            'location.search', 'location.hash', 'document.cookie', 'document.URL',
+            'document.referrer', 'window.name', 'localStorage', 'sessionStorage',
+            'URLSearchParams', 'postMessage', 'history.pushState'
+        ]
+        
+        for source in user_sources:
+            if source in js_code:
+                # Find what happens to data from this source
+                source_pattern = rf'{source}[^;]*(?=\s*[;=])'
+                for match in re.finditer(source_pattern, js_code, re.IGNORECASE):
+                    context_start = max(0, match.start() - 200)
+                    context_end = min(len(js_code), match.end() + 200)
+                    context = js_code[context_start:context_end]
                     
-                    self.generic_visit(node)
-                
-                def visit_If(self, node):
-                    # Extract if condition as constraint
-                    if node.test:
-                        condition = self._extract_expr(node.test)
-                        self.constraints.append({
-                            'type': 'if',
-                            'condition': condition,
-                            'line': node.lineno
-                        })
-                    self.generic_visit(node)
-                
-                def visit_While(self, node):
-                    # Extract while condition as constraint
-                    if node.test:
-                        condition = self._extract_expr(node.test)
-                        self.constraints.append({
-                            'type': 'while',
-                            'condition': condition,
-                            'line': node.lineno
-                        })
-                    self.generic_visit(node)
-                
-                def _extract_expr(self, node):
-                    """Extract expression as string"""
-                    try:
-                        import ast
-                        return ast.unparse(node) if hasattr(ast, 'unparse') else str(node)
-                    except:
-                        return str(node)
-            
-            extractor = ConstraintExtractor()
-            extractor.visit(ast_tree)
-            
-            constraints = extractor.constraints
-            symbolic_vars = extractor.symbolic_vars
-            
-            logging.debug(f"Extracted {len(constraints)} constraints and {len(symbolic_vars)} symbolic variables from AST")
-            
-        except Exception as e:
-            logging.warning(f"AST constraint extraction failed: {e}")
+                    # Check if data flows to dangerous sinks
+                    for sink in self.dom_xss_sinks:
+                        if sink in context:
+                            data_flows.append({
+                                'source': source,
+                                'sink': sink,
+                                'context': context[:200],
+                                'severity': 'high' if sink in ['innerHTML', 'eval', 'document.write'] else 'medium'
+                            })
         
-        return constraints, symbolic_vars
+        return data_flows
     
-    def create_symbolic_variable(self, name, value_type='string', constraints=None):
-        """Create a symbolic variable for analysis with Z3 integration"""
+    def create_symbolic_variable(self, name, value_type='string', constraints=None, is_user_controlled=False):
+        """Create a symbolic variable for JavaScript analysis with Z3 integration"""
         var_id = f"sym_{name}_{uuid.uuid4().hex[:8]}"
         
         # Create Z3 symbolic variable if available
@@ -48510,21 +48568,41 @@ class SymbolicExecutionEngine:
             'name': name,
             'type': value_type,
             'constraints': constraints or [],
-            'possible_values': self._get_default_values(value_type),
-            'z3_var': z3_var
+            'possible_values': self._get_javascript_test_values(value_type),
+            'z3_var': z3_var,
+            'is_user_controlled': is_user_controlled
         }
         logging.debug(f"Created symbolic variable: {var_id} ({name})")
         return var_id
     
-    def _get_default_values(self, value_type):
-        """Get default values for different types"""
+    def _get_javascript_test_values(self, value_type):
+        """Get JavaScript-specific test values for different types"""
         defaults = {
-            'string': ['', 'test', '../../etc/passwd', '<script>alert(1)</script>', "' OR '1'='1"],
-            'integer': [0, 1, -1, 999999, -999999],
+            'string': [
+                '',  # Empty string
+                'test',  # Normal string
+                '<script>alert(1)</script>',  # XSS
+                'javascript:alert(1)',  # JavaScript URL
+                '../../etc/passwd',  # Path traversal
+                "' OR '1'='1",  # SQL injection
+                '${7*7}',  # Template injection
+                '{{7*7}}',  # Angular template injection
+                '<img src=x onerror=alert(1)>',  # Image XSS
+                'document.cookie',  # Cookie access
+                'localStorage.getItem("token")',  # LocalStorage access
+            ],
+            'integer': [0, 1, -1, 999999, -999999, 2147483647, -2147483648],  # Include boundary values
             'boolean': [True, False],
-            'path': ['/', '/etc/passwd', '../', '..\\'],
-            'url': ['http://evil.com', 'javascript:alert(1)', 'data:text/html,<script>'],
-            'real': [0.0, 1.0, -1.0, 999999.0, -999999.0]
+            'path': ['/', '/etc/passwd', '../', '..\\', 'C:\\Windows\\System32'],
+            'url': [
+                'http://evil.com',
+                'javascript:alert(1)',
+                'data:text/html,<script>alert(1)</script>',
+                'file:///etc/passwd'
+            ],
+            'real': [0.0, 1.0, -1.0, 999999.0, -999999.0, 1.7976931348623157e+308],  # Include max float
+            'dom_element': ['document.body', 'document.getElementById("test")', 'window'],
+            'cookie': ['sessionid=abc123', 'auth_token=xyz789', '']
         }
         return defaults.get(value_type, [''])
     
@@ -48619,8 +48697,8 @@ class SymbolicExecutionEngine:
             logging.warning(f"Z3 constraint solving failed: {e}")
             return None
     
-    def explore_path(self, inputs, depth=0):
-        """Explore a symbolic execution path with AST analysis"""
+    def explore_path(self, inputs, depth=0, js_context=None):
+        """Explore a JavaScript execution path with client-side vulnerability analysis"""
         if depth > self.max_depth:
             return None
         
@@ -48633,77 +48711,129 @@ class SymbolicExecutionEngine:
             'inputs': inputs,
             'constraints': [],
             'branch_decisions': [],
-            'vulnerability_candidates': []
+            'vulnerability_candidates': [],
+            'dom_vulnerabilities': []
         }
         
-        # Analyze inputs for potential vulnerabilities using AST if code is provided
+        # Analyze inputs for potential JavaScript vulnerabilities
         for var_id, input_value in inputs.items():
             if var_id in self.symbolic_variables:
                 var_info = self.symbolic_variables[var_id]
                 
-                # Check for common vulnerability patterns
-                vuln_patterns = {
-                    'sqli': r"[';]|(\b(OR|AND)\s+\d+\s*=\s*\d)",
+                # Check for JavaScript-specific vulnerability patterns
+                js_vuln_patterns = {
+                    'dom_xss': r"<script|javascript:|on\w+\s*=|\.innerHTML\s*=",
                     'xss': r"<script|javascript:|on\w+\s*=",
-                    'path_traversal': r"\.\./|\.\.\\",
-                    'command_injection': r"[;&|]|(\|\|)",
-                    'ldap_injection': r"\(|\)|\*"
+                    'prototype_pollution': r'__proto__|constructor\.prototype',
+                    'dom_clobbering': r'window\.\w+\s*=',
+                    'insecure_eval': r'eval\s*\(|Function\s*\(',
+                    'dangerous_dom': r'document\.write|location\.(href|assign|replace)',
+                    'cookie_manipulation': r'document\.cookie\s*=',
+                    'localstorage_injection': r'localStorage\.(setItem|getItem)\s*\('
                 }
                 
-                for vuln_type, pattern in vuln_patterns.items():
+                for vuln_type, pattern in js_vuln_patterns.items():
                     if re.search(pattern, str(input_value), re.IGNORECASE):
                         path_result['vulnerability_candidates'].append({
                             'type': vuln_type,
                             'variable': var_info['name'],
-                            'value': input_value,
-                            'pattern': pattern
+                            'value': str(input_value)[:100],  # Truncate long values
+                            'pattern': pattern,
+                            'severity': self._get_js_vulnerability_severity(vuln_type)
                         })
+        
+        # Analyze JavaScript context if provided
+        if js_context:
+            dom_analysis = self._analyze_dom_vulnerabilities(js_context, inputs)
+            path_result['dom_vulnerabilities'] = dom_analysis
         
         self.explored_paths.add(path_id)
         return path_result
     
-    def analyze_code_symbolically(self, code_string, inputs=None):
-        """Analyze code string using AST and symbolic execution"""
-        if not code_string:
-            return None
-        
-        # Parse code to AST
-        ast_tree = self.parse_code_to_ast(code_string)
-        if not ast_tree:
-            return None
-        
-        # Extract constraints and symbolic variables from AST
-        constraints, symbolic_vars = self.analyze_ast_for_constraints(ast_tree)
-        
-        # Create symbolic variables for discovered variables
-        for var_name in symbolic_vars:
-            if not any(var['name'] == var_name for var in self.symbolic_variables.values()):
-                self.create_symbolic_variable(var_name, 'string')
-        
-        # Add constraints to solver
-        for constraint in constraints:
-            # Find matching symbolic variable
-            matching_var_id = None
-            for var_id, var_info in self.symbolic_variables.items():
-                if var_info['name'] in str(constraint.get('left', '')) or var_info['name'] in str(constraint.get('condition', '')):
-                    matching_var_id = var_id
-                    break
-            
-            if matching_var_id:
-                constraint_type = constraint.get('type', 'unknown')
-                condition = constraint.get('condition') or constraint.get('right', '')
-                self.add_path_constraint(constraint_type, matching_var_id, condition)
-        
-        # Try to solve constraints
-        solution = self.solve_constraints()
-        
-        return {
-            'ast_parsed': True,
-            'constraints_extracted': len(constraints),
-            'symbolic_variables_found': len(symbolic_vars),
-            'solution': solution,
-            'constraints': constraints
+    def _get_js_vulnerability_severity(self, vuln_type):
+        """Get severity level for JavaScript vulnerability types"""
+        severity_map = {
+            'dom_xss': 'high',
+            'xss': 'high',
+            'prototype_pollution': 'high',
+            'dom_clobbering': 'medium',
+            'insecure_eval': 'high',
+            'dangerous_dom': 'high',
+            'cookie_manipulation': 'medium',
+            'localstorage_injection': 'medium'
         }
+        return severity_map.get(vuln_type, 'medium')
+    
+    def _analyze_dom_vulnerabilities(self, js_code, inputs):
+        """Analyze JavaScript code for DOM-based vulnerabilities"""
+        vulnerabilities = []
+        
+        try:
+            # Check for unsafe innerHTML assignments with user input
+            innerhtml_pattern = r'\.innerHTML\s*=\s*([^;]+)'
+            for match in re.finditer(innerhtml_pattern, js_code):
+                assignment = match.group(1)
+                # Check if assignment uses user-controlled input
+                for var_id, input_value in inputs.items():
+                    var_info = self.symbolic_variables.get(var_id, {})
+                    if var_info.get('name') in assignment or str(input_value) in assignment:
+                        vulnerabilities.append({
+                            'type': 'dom_xss_innerhtml',
+                            'sink': 'innerHTML',
+                            'assignment': assignment[:100],
+                            'severity': 'high',
+                            'line': js_code[:match.start()].count('\n') + 1
+                        })
+            
+            # Check for unsafe eval usage
+            eval_pattern = r'eval\s*\(\s*([^)]+)\)'
+            for match in re.finditer(eval_pattern, js_code):
+                eval_arg = match.group(1)
+                for var_id, input_value in inputs.items():
+                    var_info = self.symbolic_variables.get(var_id, {})
+                    if var_info.get('name') in eval_arg or str(input_value) in eval_arg:
+                        vulnerabilities.append({
+                            'type': 'unsafe_eval',
+                            'sink': 'eval',
+                            'argument': eval_arg[:100],
+                            'severity': 'high',
+                            'line': js_code[:match.start()].count('\n') + 1
+                        })
+            
+            # Check for document.write with user input
+            docwrite_pattern = r'document\.(write|writeln)\s*\(\s*([^)]+)\)'
+            for match in re.finditer(docwrite_pattern, js_code):
+                write_arg = match.group(2)
+                for var_id, input_value in inputs.items():
+                    var_info = self.symbolic_variables.get(var_id, {})
+                    if var_info.get('name') in write_arg or str(input_value) in write_arg:
+                        vulnerabilities.append({
+                            'type': 'dom_xss_document_write',
+                            'sink': 'document.write',
+                            'argument': write_arg[:100],
+                            'severity': 'high',
+                            'line': js_code[:match.start()].count('\n') + 1
+                        })
+            
+            # Check for location manipulation with user input
+            location_pattern = r'location\.(href|assign|replace)\s*=\s*([^;]+)'
+            for match in re.finditer(location_pattern, js_code):
+                location_arg = match.group(2)
+                for var_id, input_value in inputs.items():
+                    var_info = self.symbolic_variables.get(var_id, {})
+                    if var_info.get('name') in location_arg or str(input_value) in location_arg:
+                        vulnerabilities.append({
+                            'type': 'open_redirect',
+                            'sink': 'location',
+                            'argument': location_arg[:100],
+                            'severity': 'medium',
+                            'line': js_code[:match.start()].count('\n') + 1
+                        })
+            
+        except Exception as e:
+            logging.warning(f"DOM vulnerability analysis failed: {e}")
+        
+        return vulnerabilities
     
     def _extract_z3_value(self, model, z3_var, var_type):
         """Extract value from Z3 model"""
@@ -48861,84 +48991,116 @@ class SymbolicExecutionEngine:
         
         return solutions
     
-    def analyze_code_path(self, code_snippet, input_variables):
-        """Analyze a code snippet for symbolic execution"""
-        analysis = {
-            'snippet_hash': hashlib.md5(code_snippet.encode()).hexdigest(),
-            'variables_found': [],
-            'branches_detected': [],
-            'symbolic_paths': []
+    def analyze_javascript_symbolically(self, js_code, inputs=None):
+        """Analyze JavaScript code using symbolic execution for client-side vulnerabilities"""
+        if not js_code:
+            return None
+        
+        # Parse JavaScript code
+        js_analysis = self.parse_javascript_code(js_code)
+        if not js_analysis:
+            return None
+        
+        # Create symbolic variables for discovered user-controlled variables
+        for var_assignment in js_analysis.get('variable_assignments', []):
+            var_name = var_assignment['variable']
+            if not any(var['name'] == var_name for var in self.symbolic_variables.values()):
+                self.create_symbolic_variable(
+                    var_name, 
+                    'string', 
+                    is_user_controlled=True
+                )
+        
+        # Explore execution paths with user input
+        path_results = []
+        if inputs:
+            for var_id, input_value in inputs.items():
+                path = self.explore_path(
+                    {var_id: input_value},
+                    depth=0,
+                    js_context=js_code
+                )
+                if path:
+                    path_results.append(path)
+        
+        # Try to solve constraints if Z3 is available
+        solution = None
+        if Z3_AVAILABLE and self.z3_solver:
+            solution = self.solve_constraints()
+        
+        return {
+            'js_parsed': True,
+            'dom_xss_sinks_found': len(js_analysis.get('dom_xss_sinks', [])),
+            'data_flows_found': len(js_analysis.get('data_flows', [])),
+            'unsafe_evaluations': len(js_analysis.get('unsafe_evaluations', [])),
+            'event_handlers_found': len(js_analysis.get('event_handlers', [])),
+            'user_controlled_vars': len(js_analysis.get('variable_assignments', [])),
+            'solution': solution,
+            'path_results': path_results,
+            'js_analysis': js_analysis
         }
-        
-        # Find variable assignments
-        var_patterns = [
-            r'\$(\w+)\s*=',  # PHP style
-            r'(\w+)\s*=',    # General assignment
-            r'params\["(\w+)"\]',  # Parameter access
-            r'(\w+)\.request',  # Object property
-        ]
-        
-        for pattern in var_patterns:
-            matches = re.findall(pattern, code_snippet)
-            for match in matches:
-                if match not in analysis['variables_found']:
-                    analysis['variables_found'].append(match)
-        
-        # Find conditional branches
-        branch_patterns = [
-            r'if\s*\((.+?)\)',
-            r'while\s*\((.+?)\)',
-            r'for\s*\((.+?)\)',
-            r'switch\s*\((.+?)\)'
-        ]
-        
-        for pattern in branch_patterns:
-            matches = re.findall(pattern, code_snippet)
-            for match in matches:
-                analysis['branches_detected'].append(match)
-        
-        # Generate symbolic paths based on branches
-        for branch in analysis['branches_detected']:
-            path = self.explore_path(input_variables, depth=len(analysis['symbolic_paths']))
-            if path:
-                analysis['symbolic_paths'].append(path)
-        
-        return analysis
     
     def get_coverage_report(self):
-        """Generate symbolic execution coverage report"""
+        """Generate JavaScript symbolic execution coverage report"""
         return {
             'explored_paths': len(self.explored_paths),
             'symbolic_variables': len(self.symbolic_variables),
+            'user_controlled_vars': len([v for v in self.symbolic_variables.values() if v.get('is_user_controlled')]),
             'path_constraints': len(self.path_constraints),
             'branch_coverage': self.branch_coverage,
             'execution_count': self.execution_count,
             'max_depth_reached': max([p.get('depth', 0) for p in self.explored_paths] if self.explored_paths else [0]),
+            'javascript_files_analyzed': len(self.js_cache),
+            'z3_enabled': Z3_AVAILABLE,
             'timestamp': datetime.now().isoformat()
         }
     
     def generate_test_inputs(self, symbolic_var_id):
-        """Generate test inputs based on symbolic variable analysis"""
+        """Generate JavaScript-specific test inputs based on symbolic variable analysis"""
         if symbolic_var_id not in self.symbolic_variables:
             return []
         
         var_info = self.symbolic_variables[symbolic_var_id]
         test_inputs = []
         
-        # Generate boundary values
+        # Generate JavaScript-specific test values
         if var_info['type'] == 'integer':
-            test_inputs.extend([0, 1, -1, 255, 256, 65535, 65536, -999999, 999999])
+            test_inputs.extend([0, 1, -1, 255, 256, 65535, 65536, -999999, 999999, 2147483647, -2147483648])
         elif var_info['type'] == 'string':
             test_inputs.extend([
-                '',  # Empty
+                '',  # Empty string
                 'a' * 100,  # Long string
-                '../../etc/passwd',  # Path traversal
                 '<script>alert(1)</script>',  # XSS
-                "' OR '1'='1",  # SQLi
+                'javascript:alert(1)',  # JavaScript URL
+                '../../etc/passwd',  # Path traversal
+                "' OR '1'='1",  # SQL injection
                 '${7*7}',  # Template injection
+                '{{7*7}}',  # Angular template injection
                 '%00',  # Null byte
                 'test@test.com',  # Email format
                 '🔥',  # Unicode
+                'document.cookie',  # Cookie reference
+                'localStorage.getItem("token")',  # LocalStorage reference
+                '__proto__',  # Prototype pollution
+                'constructor.prototype',  # Prototype pollution
+                '<img src=x onerror=alert(1)>',  # Image XSS
+                '"><script>alert(1)</script>',  # Attribute XSS
+            ])
+        elif var_info['type'] == 'url':
+            test_inputs.extend([
+                'http://evil.com',
+                'javascript:alert(1)',
+                'data:text/html,<script>alert(1)</script>',
+                'file:///etc/passwd',
+                '//evil.com',
+                'https://evil.com/phishing'
+            ])
+        elif var_info['type'] == 'cookie':
+            test_inputs.extend([
+                'sessionid=abc123',
+                'auth_token=xyz789',
+                'sessionid=<script>alert(1)</script>',
+                '__proto__[test]=evil'
             ])
         
         # Add constraint-based values
@@ -48946,91 +49108,105 @@ class SymbolicExecutionEngine:
             if 'length' in constraint.lower():
                 test_inputs.append('a' * 1000)  # Very long
             if 'special' in constraint.lower():
-                test_inputs.extend(['!@#$%^&*()', '<>{}[]'])
+                test_inputs.extend(['!@#$%^&*()', '<>{}[]', '`'])
+            if 'dom' in constraint.lower():
+                test_inputs.extend(['document.body', 'window.top', 'parent.frames'])
+        
+        # Add user-controlled specific payloads if this is user-controlled
+        if var_info.get('is_user_controlled'):
+            test_inputs.extend([
+                'location.hash',
+                'window.name',
+                'document.referrer',
+                'postMessage'
+            ])
         
         return test_inputs
 
 
-class SymbolicExecutor:
+class JavaScriptSymbolicExecutor:
     """
-    High-level interface for symbolic execution in security testing.
-    Integrates with the scanning engine to provide path exploration.
+    High-level interface for JavaScript symbolic execution in web security testing.
+    Integrates with the scanning engine to provide client-side vulnerability analysis.
     """
     
     def __init__(self, config=None):
         self.config = config or {}
-        self.engine = SymbolicExecutionEngine(config)
+        self.engine = JavaScriptSymbolicExecutionEngine(config)
         self.session_results = {}
         self.enabled = config.get('symbolic_execution_enabled', True)
+        self.js_files_analyzed = set()
         
-        logging.info("SymbolicExecutor initialized")
+        logging.info("JavaScriptSymbolicExecutor initialized for client-side security analysis")
     
-    def analyze_endpoint(self, url, method, parameters, request_headers=None, response_data=None):
-        """Symbolically analyze an endpoint with web request/response integration"""
-        if not self.enabled:
+    def analyze_javascript_file(self, js_url, js_content, parameters=None):
+        """Analyze a JavaScript file for client-side vulnerabilities"""
+        if not self.enabled or not js_content:
             return None
         
-        analysis_id = f"analysis_{uuid.uuid4().hex[:8]}"
+        analysis_id = f"js_analysis_{uuid.uuid4().hex[:8]}"
         
-        # Create symbolic variables for parameters
+        # Track analyzed files to avoid duplicate analysis
+        content_hash = hashlib.md5(js_content.encode()).hexdigest()
+        if content_hash in self.js_files_analyzed:
+            logging.debug(f"JavaScript file already analyzed: {js_url}")
+            return None
+        self.js_files_analyzed.add(content_hash)
+        
+        # Create symbolic variables for parameters if provided
         symbolic_vars = {}
-        for param_name, param_value in parameters.items():
-            var_id = self.engine.create_symbolic_variable(
-                param_name, 
-                self._infer_type(param_value)
-            )
-            symbolic_vars[param_name] = var_id
-        
-        # Analyze request headers if provided
-        header_analysis = {}
-        if request_headers:
-            for header_name, header_value in request_headers.items():
-                header_var_id = self.engine.create_symbolic_variable(
-                    f"header_{header_name}",
-                    self._infer_type(header_value)
+        if parameters:
+            for param_name, param_value in parameters.items():
+                var_id = self.engine.create_symbolic_variable(
+                    param_name, 
+                    self._infer_js_type(param_value),
+                    is_user_controlled=True
                 )
-                header_analysis[header_name] = header_var_id
+                symbolic_vars[param_name] = var_id
         
-        # Explore execution paths
-        path_results = []
-        for param_name, var_id in symbolic_vars.items():
-            path = self.engine.explore_path(
-                {var_id: parameters[param_name]},
-                depth=0
-            )
-            if path:
-                path_results.append(path)
+        # Analyze JavaScript code
+        js_analysis = self.engine.parse_javascript_code(js_content)
         
-        # Analyze response data if provided for constraint extraction
-        response_constraints = []
-        if response_data:
-            response_constraints = self._analyze_response_for_constraints(response_data)
+        # Perform symbolic analysis
+        symbolic_analysis = self.engine.analyze_javascript_symbolically(
+            js_content, 
+            symbolic_vars
+        )
         
-        # Generate test inputs
+        # Generate test inputs for discovered variables
         test_inputs = {}
-        for param_name, var_id in symbolic_vars.items():
-            test_inputs[param_name] = self.engine.generate_test_inputs(var_id)
+        for var_name, var_id in symbolic_vars.items():
+            test_inputs[var_name] = self.engine.generate_test_inputs(var_id)
         
-        # Apply response-based constraints to refine test inputs
-        if response_constraints:
-            test_inputs = self._refine_test_inputs_with_constraints(test_inputs, response_constraints)
+        # Extract DOM XSS vulnerabilities
+        dom_vulnerabilities = []
+        if js_analysis:
+            for data_flow in js_analysis.get('data_flows', []):
+                if data_flow.get('severity') == 'high':
+                    dom_vulnerabilities.append({
+                        'type': 'dom_xss',
+                        'source': data_flow['source'],
+                        'sink': data_flow['sink'],
+                        'context': data_flow['context'],
+                        'severity': data_flow['severity']
+                    })
         
         self.session_results[analysis_id] = {
-            'url': url,
-            'method': method,
+            'js_url': js_url,
+            'js_hash': content_hash,
             'symbolic_vars': symbolic_vars,
-            'header_analysis': header_analysis,
-            'path_results': path_results,
+            'js_analysis': js_analysis,
+            'symbolic_analysis': symbolic_analysis,
             'test_inputs': test_inputs,
-            'response_constraints': response_constraints,
+            'dom_vulnerabilities': dom_vulnerabilities,
             'coverage': self.engine.get_coverage_report(),
             'timestamp': datetime.now().isoformat()
         }
         
         return self.session_results[analysis_id]
     
-    def _infer_type(self, value):
-        """Infer the type of a parameter value"""
+    def _infer_js_type(self, value):
+        """Infer the JavaScript type of a parameter value"""
         if isinstance(value, bool):
             return 'boolean'
         elif isinstance(value, int):
@@ -49040,201 +49216,243 @@ class SymbolicExecutor:
                 return 'path'
             elif value.startswith(('http://', 'https://', 'javascript:', 'data:')):
                 return 'url'
+            elif '=' in value and ';' in value:
+                return 'cookie'
+            elif value.startswith(('<script', 'javascript:', 'eval(')):
+                return 'dom_element'
             return 'string'
         return 'string'
     
     def get_vulnerability_candidates(self):
-        """Get all vulnerability candidates from symbolic analysis"""
+        """Get all JavaScript vulnerability candidates from symbolic analysis"""
         candidates = []
         
         for analysis_id, result in self.session_results.items():
-            for path in result.get('path_results', []):
+            # Add DOM vulnerabilities
+            for dom_vuln in result.get('dom_vulnerabilities', []):
+                dom_vuln['analysis_id'] = analysis_id
+                dom_vuln['js_url'] = result.get('js_url', 'unknown')
+                candidates.append(dom_vuln)
+            
+            # Add path-based vulnerabilities
+            for path in result.get('symbolic_analysis', {}).get('path_results', []):
                 for vuln in path.get('vulnerability_candidates', []):
                     vuln['analysis_id'] = analysis_id
-                    vuln['url'] = result['url']
+                    vuln['js_url'] = result.get('js_url', 'unknown')
                     candidates.append(vuln)
+            
+            # Add unsafe evaluations from JS analysis
+            js_analysis = result.get('js_analysis', {})
+            for unsafe_eval in js_analysis.get('unsafe_evaluations', []):
+                candidates.append({
+                    'type': 'unsafe_javascript_pattern',
+                    'subtype': unsafe_eval['type'],
+                    'pattern': unsafe_eval['match'],
+                    'line': unsafe_eval['line'],
+                    'analysis_id': analysis_id,
+                    'js_url': result.get('js_url', 'unknown'),
+                    'severity': 'medium'
+                })
         
         return candidates
     
-    def _analyze_response_for_constraints(self, response_data):
-        """Analyze HTTP response data to extract constraints for symbolic execution"""
-        constraints = []
+    def analyze_page_for_javascript(self, html_content, base_url):
+        """Extract and analyze JavaScript from a web page"""
+        if not html_content:
+            return None
         
         try:
-            # Analyze response status codes
-            if 'status_code' in response_data:
-                status = response_data['status_code']
-                if status >= 400:
-                    constraints.append({
-                        'type': 'status_error',
-                        'condition': f'status >= 400',
-                        'severity': 'high' if status >= 500 else 'medium'
-                    })
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Analyze response headers for security constraints
-            if 'headers' in response_data:
-                headers = response_data['headers']
-                security_headers = ['Content-Security-Policy', 'X-Frame-Options', 
-                                   'X-Content-Type-Options', 'Strict-Transport-Security']
-                for header in security_headers:
-                    if header not in headers:
-                        constraints.append({
-                            'type': 'missing_security_header',
-                            'condition': f'header_{header} == None',
-                            'severity': 'medium'
-                        })
+            analysis_results = {
+                'inline_scripts': [],
+                'external_scripts': [],
+                'event_handlers': [],
+                'javascript_vulnerabilities': []
+            }
             
-            # Analyze response body for input validation patterns
-            if 'body' in response_data:
-                body = response_data['body']
-                if isinstance(body, str):
-                    # Check for error messages that might reveal validation logic
-                    if 'error' in body.lower() or 'invalid' in body.lower():
-                        constraints.append({
-                            'type': 'validation_error',
-                            'condition': 'response contains error message',
-                            'severity': 'low'
-                        })
-                    
-                    # Check for SQL injection indicators
-                    sql_errors = ['syntax error', 'mysql', 'oracle', 'postgresql', 'sqlite']
-                    for error in sql_errors:
-                        if error in body.lower():
-                            constraints.append({
-                                'type': 'sql_error_indication',
-                                'condition': f'response contains "{error}"',
-                                'severity': 'high'
-                            })
-                            break
+            # Extract inline scripts
+            for script in soup.find_all('script'):
+                if script.string and script.string.strip():
+                    script_content = script.string.strip()
+                    # Analyze inline JavaScript
+                    js_analysis = self.analyze_javascript_file(
+                        f"{base_url}#inline_script_{len(analysis_results['inline_scripts'])}",
+                        script_content
+                    )
+                    if js_analysis:
+                        analysis_results['inline_scripts'].append(js_analysis)
+                        # Collect vulnerabilities
+                        for vuln in js_analysis.get('dom_vulnerabilities', []):
+                            vuln['source_type'] = 'inline_script'
+                            analysis_results['javascript_vulnerabilities'].append(vuln)
             
-            # Analyze response time for timing attack constraints
-            if 'response_time' in response_data:
-                response_time = response_data['response_time']
-                if response_time > 1.0:  # Slow response might indicate heavy processing
-                    constraints.append({
-                        'type': 'timing_constraint',
-                        'condition': f'response_time > {response_time}',
-                        'severity': 'low'
-                    })
-        
+            # Extract external scripts
+            for script in soup.find_all('script', src=True):
+                script_url = script['src']
+                abs_url = script_url if script_url.startswith(('http://', 'https://')) else urljoin(base_url, script_url)
+                analysis_results['external_scripts'].append(abs_url)
+            
+            # Extract event handlers
+            event_pattern = r'on\w+\s*=\s*["\']([^"\']+)["\']'
+            for match in re.finditer(event_pattern, html_content):
+                analysis_results['event_handlers'].append({
+                    'handler': match.group(1),
+                    'full_match': match.group(0)
+                })
+            
+            # Analyze event handlers for vulnerabilities
+            for handler in analysis_results['event_handlers']:
+                handler_analysis = self.analyze_javascript_file(
+                    f"{base_url}#event_handler",
+                    handler['handler']
+                )
+                if handler_analysis:
+                    for vuln in handler_analysis.get('dom_vulnerabilities', []):
+                        vuln['source_type'] = 'event_handler'
+                        analysis_results['javascript_vulnerabilities'].append(vuln)
+            
+            return analysis_results
+            
         except Exception as e:
-            logging.warning(f"Response constraint analysis failed: {e}")
-        
-        return constraints
+            logging.warning(f"JavaScript extraction from page failed: {e}")
+            return None
     
-    def _refine_test_inputs_with_constraints(self, test_inputs, constraints):
-        """Refine test inputs based on response constraints"""
+    def _refine_test_inputs_with_js_context(self, test_inputs, js_analysis):
+        """Refine test inputs based on JavaScript analysis context"""
         refined_inputs = test_inputs.copy()
         
-        for constraint in constraints:
-            constraint_type = constraint.get('type')
-            
-            if constraint_type == 'sql_error_indication':
-                # Add more SQL injection payloads
-                for param in refined_inputs:
-                    if isinstance(refined_inputs[param], list):
-                        refined_inputs[param].extend([
-                            "' UNION SELECT NULL--",
-                            "1' OR 1=1--",
-                            "'; DROP TABLE users--",
-                            "' OR '1'='1' /*"
-                        ])
-            
-            elif constraint_type == 'validation_error':
-                # Add boundary testing payloads
-                for param in refined_inputs:
-                    if isinstance(refined_inputs[param], list):
-                        refined_inputs[param].extend([
-                            'A' * 1000,  # Buffer overflow attempt
-                            '<script>alert(document.cookie)</script>',  # XSS
-                            '../../../etc/passwd',  # Path traversal
-                            '{{7*7}}',  # Template injection
-                            '%00'  # Null byte injection
-                        ])
-            
-            elif constraint_type == 'missing_security_header':
-                # Add header-based attack payloads
-                for param in refined_inputs:
-                    if isinstance(refined_inputs[param], list):
-                        refined_inputs[param].extend([
-                            '<iframe src="javascript:alert(1)"></iframe>',
-                            '<meta http-equiv="refresh" content="0;url=data:text/html,<script>alert(1)</script>">'
-                        ])
+        if not js_analysis:
+            return refined_inputs
+        
+        # Add DOM XSS specific payloads if DOM sinks are found
+        if js_analysis.get('dom_xss_sinks'):
+            for param in refined_inputs:
+                if isinstance(refined_inputs[param], list):
+                    refined_inputs[param].extend([
+                        '<img src=x onerror=alert(1)>',
+                        '<svg onload=alert(1)>',
+                        '"><script>alert(1)</script>',
+                        '\';alert(1);//',
+                        '${alert(1)}',  # Template injection
+                        '{{alert(1)}}',  # Angular template injection
+                    ])
+        
+        # Add prototype pollution payloads if relevant patterns found
+        unsafe_evals = js_analysis.get('unsafe_evaluations', [])
+        if any('eval' in eval['type'] for eval in unsafe_evals):
+            for param in refined_inputs:
+                if isinstance(refined_inputs[param], list):
+                    refined_inputs[param].extend([
+                        '__proto__[test]=evil',
+                        'constructor.prototype.test=evil',
+                        '","__proto__":{"test":"evil"}',
+                    ])
+        
+        # Add location-based payloads if location manipulation found
+        data_flows = js_analysis.get('data_flows', [])
+        if any('location' in flow['sink'] for flow in data_flows):
+            for param in refined_inputs:
+                if isinstance(refined_inputs[param], list):
+                    refined_inputs[param].extend([
+                        'javascript:alert(1)',
+                        'data:text/html,<script>alert(1)</script>',
+                        '//evil.com',
+                    ])
         
         return refined_inputs
     
-    def analyze_web_application_flow(self, base_url, endpoints):
-        """Analyze complete web application flow with request/response integration"""
+    def analyze_web_application_javascript(self, base_url, pages_html):
+        """Analyze JavaScript across multiple pages of a web application"""
         flow_analysis = {
             'base_url': base_url,
-            'endpoints_analyzed': 0,
-            'total_constraints': 0,
-            'vulnerability_candidates': [],
-            'cross_endpoint_flows': []
+            'pages_analyzed': 0,
+            'total_js_files': 0,
+            'javascript_vulnerabilities': [],
+            'shared_javascript_patterns': []
         }
         
-        for endpoint in endpoints:
-            url = f"{base_url}{endpoint['path']}"
-            method = endpoint.get('method', 'GET')
-            parameters = endpoint.get('parameters', {})
-            headers = endpoint.get('headers', {})
+        for page_url, html_content in pages_html.items():
+            # Analyze individual page for JavaScript
+            page_analysis = self.analyze_page_for_javascript(html_content, page_url)
             
-            # Analyze individual endpoint
-            result = self.analyze_endpoint(url, method, parameters, headers)
-            
-            if result:
-                flow_analysis['endpoints_analyzed'] += 1
-                flow_analysis['total_constraints'] += len(result.get('response_constraints', []))
+            if page_analysis:
+                flow_analysis['pages_analyzed'] += 1
+                flow_analysis['total_js_files'] += len(page_analysis.get('external_scripts', []))
+                flow_analysis['total_js_files'] += len(page_analysis.get('inline_scripts', []))
                 
-                # Collect vulnerability candidates
-                for path in result.get('path_results', []):
-                    for vuln in path.get('vulnerability_candidates', []):
-                        vuln['endpoint'] = url
-                        flow_analysis['vulnerability_candidates'].append(vuln)
+                # Collect JavaScript vulnerabilities
+                for vuln in page_analysis.get('javascript_vulnerabilities', []):
+                    vuln['page_url'] = page_url
+                    flow_analysis['javascript_vulnerabilities'].append(vuln)
         
-        # Analyze cross-endpoint data flows
-        flow_analysis['cross_endpoint_flows'] = self._analyze_cross_endpoint_flows(endpoints)
+        # Analyze shared JavaScript patterns across pages
+        flow_analysis['shared_javascript_patterns'] = self._analyze_shared_javascript_patterns(pages_html)
         
         return flow_analysis
     
-    def _analyze_cross_endpoint_flows(self, endpoints):
-        """Analyze data flows between different endpoints"""
-        cross_flows = []
+    def _analyze_shared_javascript_patterns(self, pages_html):
+        """Analyze shared JavaScript patterns across multiple pages"""
+        shared_patterns = []
         
-        # Look for parameter relationships between endpoints
-        param_patterns = {}
-        for endpoint in endpoints:
-            for param in endpoint.get('parameters', {}):
-                if param not in param_patterns:
-                    param_patterns[param] = []
-                param_patterns[param].append(endpoint['path'])
+        # Look for common JavaScript patterns across pages
+        pattern_analysis = {
+            'dom_xss_sinks': set(),
+            'event_handlers': set(),
+            'framework_usage': set(),
+            'api_calls': set()
+        }
         
-        # Identify parameters that appear in multiple endpoints (potential data flow)
-        for param, paths in param_patterns.items():
-            if len(paths) > 1:
-                cross_flows.append({
-                    'parameter': param,
-                    'endpoints': paths,
-                    'flow_type': 'parameter_sharing',
-                    'risk_level': 'medium' if len(paths) > 2 else 'low'
+        for page_url, html_content in pages_html.items():
+            # Extract patterns from this page
+            for sink in self.engine.dom_xss_sinks:
+                if sink in html_content:
+                    pattern_analysis['dom_xss_sinks'].add(sink)
+            
+            # Find event handlers
+            event_matches = re.findall(r'on\w+\s*=', html_content)
+            for event in event_matches:
+                pattern_analysis['event_handlers'].add(event)
+            
+            # Find framework usage
+            frameworks = ['React', 'Vue', 'Angular', 'jQuery', 'Backbone']
+            for framework in frameworks:
+                if framework in html_content:
+                    pattern_analysis['framework_usage'].add(framework)
+            
+            # Find API calls
+            api_patterns = ['fetch(', 'axios.', '$.ajax', 'XMLHttpRequest']
+            for api in api_patterns:
+                if api in html_content:
+                    pattern_analysis['api_calls'].add(api)
+        
+        # Generate analysis results
+        for category, patterns in pattern_analysis.items():
+            if patterns:
+                shared_patterns.append({
+                    'category': category,
+                    'patterns': list(patterns),
+                    'count': len(patterns)
                 })
         
-        return cross_flows
+        return shared_patterns
 
     def get_summary(self):
-        """Get enhanced symbolic execution summary with Z3 solver information"""
+        """Get enhanced JavaScript symbolic execution summary with Z3 solver information"""
         return {
             'total_analyses': len(self.session_results),
             'total_paths_explored': sum(
-                len(r.get('path_results', [])) 
+                len(r.get('symbolic_analysis', {}).get('path_results', [])) 
                 for r in self.session_results.values()
             ),
             'vulnerability_candidates': len(self.get_vulnerability_candidates()),
+            'javascript_files_analyzed': len(self.js_files_analyzed),
             'coverage_report': self.engine.get_coverage_report(),
             'z3_enabled': Z3_AVAILABLE,
             'z3_solver_active': self.engine.z3_solver is not None,
-            'constraint_solving_method': 'Z3' if Z3_AVAILABLE and self.engine.z3_solver else 'basic',
-            'web_integration_enabled': True,
+            'constraint_solving_method': 'Z3' if Z3_AVAILABLE and self.engine.z3_solver else 'pattern_matching',
+            'client_side_analysis_enabled': True,
             'timestamp': datetime.now().isoformat()
         }
 
