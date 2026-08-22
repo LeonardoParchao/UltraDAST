@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.2 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.3 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -216,7 +216,7 @@ IDS/IPS THROTTLING CONFIGURATION EXAMPLE:
         "enabled": true,
         "max_requests_per_second": 10,
         "burst_capacity": 20,
-        "min_requests_per_second": 0.1  # Default minimum rate
+        "min_requests_per_second": 0.5  # Default minimum rate
     }
 }
 
@@ -271,7 +271,7 @@ GLOBAL REQUEST CACHE CONFIGURATION EXAMPLE:
     "request_cache": {
         "enabled": true,
         "max_size": 1000,
-        "default_ttl": 300,
+        "default_ttl": 600,
         "use_disk_storage": false,
         "db_path": "baseline_cache.db",
         "cleanup_interval_hours": 24,
@@ -381,8 +381,8 @@ HEURISTIC REGRESSION ORACLE CONFIGURATION EXAMPLE:
     "heuristic_regression_oracle": {
         "enabled": true,
         "benign_sample_size": 50,
-        "regression_retries": 3,
-        "regression_delay": 1.0,
+        "regression_retries": 10,
+        "regression_delay": 1.5,
         "db_path": "anomalies.db"
     }
 }
@@ -437,6 +437,41 @@ DYNAMIC MUTATION SERVER FEATURES:
 - Stack Overflow: Creates deeply nested objects/arrays for stack overflow testing
 - Deserialization Flaws: Tests for insecure deserialization with prototype pollution payloads
 - Adaptive Intensity: Adjusts mutation intensity based on discovered vulnerability indicators
+
+GRAY ZONE HANDLING CONFIGURATION EXAMPLE:{
+    "gray_zone_handling": {
+        "enabled": true,
+        "manual_verification_enabled": true,
+        "resend_count": 10,
+        "error_500_discard_threshold": 3,
+        "error_500_accept_threshold": 8,
+        "auto_process_on_scan_complete": true
+    },
+    "fsm_stuck_detection": {
+        "enabled": true,
+        "stuck_timeout": 300,
+        "enable_manual_navigation_guidance": true
+    }
+}
+
+GRAY ZONE HANDLING FEATURES:
+- Gray Zone Bucket Monitoring: Track ambiguous findings with probability scoring
+- Manual Resend Verification: Automatically resend requests 10 times to verify 500 error consistency
+- 500 Error Frequency Analysis: Discard findings with < 30% 500 errors, accept findings with > 80% 500 errors
+- FSM Stuck Detection: Detect when FSM is stuck in a state (e.g., not detecting Checkout)
+- Manual Navigation Guidance: Provide specific Selenium navigation instructions to force FSM learning
+- Configurable Thresholds: Customize resend count and 500 error thresholds per requirements
+- Auto-Processing: Optionally process all Gray Zone findings automatically when scan completes
+
+GRAY ZONE VERIFICATION WORKFLOW:
+1. Monitor the "Gray Zone" Bucket (Ambiguous findings)
+2. DO NOT accept Gray Zone findings automatically
+3. For Gray Zone items: Open Repeater Tab -> Copy Raw Request
+4. Manually resend the request 10 times in a loop
+5. If 500 error appears < 3/10 times -> DISCARD (False Positive)
+6. If 500 error appears > 8/10 times -> ACCEPT (True Positive)
+7. If FSM is stuck (e.g., not detecting Checkout): Manually navigate to Checkout
+   using the Selenium Browser tab to force FSM to learn the transition
 
 SYMBOLIC EXECUTION WITH Z3 SMT SOLVER CONFIGURATION EXAMPLE:{
     "symbolic_execution_enabled": true,
@@ -580,6 +615,7 @@ class RequestDeduplicator:
     def __init__(self, config=None):
         self.config = config or {}
         self.enabled = config.get('request_deduplication_enabled', True)
+        self.disabled_endpoints = config.get('disabled_endpoints', [])  # Endpoints to skip deduplication
         self.request_signatures = OrderedDict()  # Store request signatures with LRU eviction
         self.response_signatures = OrderedDict()  # Store response signatures with LRU eviction
         self.dedup_stats = {
@@ -701,9 +737,28 @@ class RequestDeduplicator:
         
         return body_str[:self.body_truncation_size]  # Configurable truncation for non-JSON
     
+    def _is_endpoint_disabled(self, url):
+        """Check if URL matches any disabled endpoints"""
+        if not self.disabled_endpoints:
+            return False
+        
+        parsed = urlparse(url)
+        path = parsed.path
+        
+        for disabled_endpoint in self.disabled_endpoints:
+            if path.startswith(disabled_endpoint) or path == disabled_endpoint:
+                return True
+        
+        return False
+    
     def is_duplicate_request(self, method, url, headers=None, body=None):
         """Check if request is a duplicate"""
         if not self.enabled:
+            return False
+        
+        # Skip deduplication for disabled endpoints
+        if self._is_endpoint_disabled(url):
+            logging.debug(f"Deduplication disabled for endpoint: {url}")
             return False
         
         signature = self.generate_request_signature(method, url, headers, body)
@@ -1203,6 +1258,42 @@ def validate_config(config):
         if field in config and not isinstance(config[field], bool):
             errors.append(f"{field} must be a boolean value")
     
+    # Validate Gray Zone handling configuration
+    if 'gray_zone_handling' in config:
+        gray_zone_config = config['gray_zone_handling']
+        if not isinstance(gray_zone_config, dict):
+            errors.append("gray_zone_handling must be a dictionary")
+        else:
+            if 'enabled' in gray_zone_config and not isinstance(gray_zone_config['enabled'], bool):
+                errors.append("gray_zone_handling.enabled must be a boolean value")
+            if 'manual_verification_enabled' in gray_zone_config and not isinstance(gray_zone_config['manual_verification_enabled'], bool):
+                errors.append("gray_zone_handling.manual_verification_enabled must be a boolean value")
+            if 'resend_count' in gray_zone_config:
+                if not isinstance(gray_zone_config['resend_count'], int) or gray_zone_config['resend_count'] < 1 or gray_zone_config['resend_count'] > 100:
+                    errors.append("gray_zone_handling.resend_count must be an integer between 1 and 100")
+            if 'error_500_discard_threshold' in gray_zone_config:
+                if not isinstance(gray_zone_config['error_500_discard_threshold'], int) or gray_zone_config['error_500_discard_threshold'] < 0 or gray_zone_config['error_500_discard_threshold'] > 10:
+                    errors.append("gray_zone_handling.error_500_discard_threshold must be an integer between 0 and 10")
+            if 'error_500_accept_threshold' in gray_zone_config:
+                if not isinstance(gray_zone_config['error_500_accept_threshold'], int) or gray_zone_config['error_500_accept_threshold'] < 0 or gray_zone_config['error_500_accept_threshold'] > 10:
+                    errors.append("gray_zone_handling.error_500_accept_threshold must be an integer between 0 and 10")
+            if 'auto_process_on_scan_complete' in gray_zone_config and not isinstance(gray_zone_config['auto_process_on_scan_complete'], bool):
+                errors.append("gray_zone_handling.auto_process_on_scan_complete must be a boolean value")
+    
+    # Validate FSM stuck detection configuration
+    if 'fsm_stuck_detection' in config:
+        fsm_config = config['fsm_stuck_detection']
+        if not isinstance(fsm_config, dict):
+            errors.append("fsm_stuck_detection must be a dictionary")
+        else:
+            if 'enabled' in fsm_config and not isinstance(fsm_config['enabled'], bool):
+                errors.append("fsm_stuck_detection.enabled must be a boolean value")
+            if 'stuck_timeout' in fsm_config:
+                if not isinstance(fsm_config['stuck_timeout'], int) or fsm_config['stuck_timeout'] < 10 or fsm_config['stuck_timeout'] > 3600:
+                    errors.append("fsm_stuck_detection.stuck_timeout must be an integer between 10 and 3600 seconds")
+            if 'enable_manual_navigation_guidance' in fsm_config and not isinstance(fsm_config['enable_manual_navigation_guidance'], bool):
+                errors.append("fsm_stuck_detection.enable_manual_navigation_guidance must be a boolean value")
+    
     return len(errors) == 0, errors
 
 # Regression oracle constants
@@ -1524,7 +1615,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QLineEdit, QPlainTextEdit, 
                              QComboBox, QGroupBox, QTabWidget, QTableWidget, 
                              QTableWidgetItem, QMessageBox, QFileDialog, QSplitter, QDockWidget,
-                             QCheckBox, QSpinBox, QDoubleSpinBox, QHeaderView)
+                             QCheckBox, QSpinBox, QDoubleSpinBox, QHeaderView, QFrame)
 from PyQt5.QtCore import Qt, QThread
 from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextDocument, QPalette
 
@@ -1913,6 +2004,19 @@ class RESTAPIServer:
                     'tested_payloads': getattr(self.scanner_instance, 'tested_payloads', 0),
                     'scan_duration': getattr(self.scanner_instance, 'scan_duration', 0)
                 }
+                
+                # Process Gray Zone findings if auto-processing is enabled
+                gray_zone_config = config.get('gray_zone_handling', {})
+                if gray_zone_config.get('auto_process_on_scan_complete', False):
+                    try:
+                        if hasattr(self.scanner_instance, 'validation_engine'):
+                            logging.info("Auto-processing Gray Zone findings after scan completion")
+                            gray_zone_results = await self.scanner_instance.validation_engine.process_gray_zone_bucket()
+                            scan_stats['gray_zone_processing'] = gray_zone_results
+                            logging.info(f"Gray Zone auto-processing completed: {gray_zone_results}")
+                    except Exception as e:
+                        logging.error(f"Error during Gray Zone auto-processing: {e}")
+                        scan_stats['gray_zone_processing_error'] = str(e)
                 
                 self.scan_tasks[task_id]['status'] = 'completed'
                 self.scan_tasks[task_id]['end_time'] = datetime.now().isoformat()
@@ -12237,13 +12341,13 @@ class BaselineCache:
     This prevents redundant requests to the same baseline URLs,
     reducing network jitter and improving scan performance.
     """
-    def __init__(self, max_size=1000, default_ttl=300, use_disk_storage=False, db_path='baseline_cache.db'):
+    def __init__(self, max_size=1000, default_ttl=600, use_disk_storage=False, db_path='baseline_cache.db'):
         """
         Initialize the LRU cache with SQLite disk cache to prevent memory bloat.
         
         Args:
             max_size: Maximum number of entries to store (default: 1000)
-            default_ttl: Default time-to-live in seconds (default: 300 = 5 minutes)
+            default_ttl: Default time-to-live in seconds (default: 600 = 10 minutes)
             use_disk_storage: Use file-based SQLite instead of in-memory (default: False)
             db_path: Path to database file when use_disk_storage is True (default: 'baseline_cache.db')
         """
@@ -12785,7 +12889,7 @@ class AsyncRateLimiter:
                 self.token_bucket = TokenBucket(rate=rate, capacity=capacity)
                 
                 # Initialize adaptive throttler with payload queue
-                min_rate = ids_ips_config.get('min_requests_per_second', 0.1)
+                min_rate = ids_ips_config.get('min_requests_per_second', 0.5)
                 abs_max_rate = ids_ips_config.get('absolute_max_requests_per_second', 100)
                 self.adaptive_throttler = AdaptiveThrottler(
                     base_rate=rate,
@@ -14095,11 +14199,11 @@ async def paired_request_sampling(session, benign_url, malicious_url, benign_par
             if benign_stdev > 0:
                 # Calculate Z-score for malicious median
                 z_score = (malicious_median - benign_mean) / benign_stdev
-                # Flag if Z-score > 3 (statistically significant outlier)
-                should_flag = z_score > 3.0
+                # Flag if Z-score > 4.5 (stricter statistically significant outlier)
+                should_flag = z_score > 4.5
                 
                 logging.info(f"Moving Z-Score - Benign Mean: {benign_mean:.3f}s, Stdev: {benign_stdev:.3f}s, "
-                           f"Malicious Median: {malicious_median:.3f}s, Z-score: {z_score:.2f}, Flag: {should_flag}")
+                           f"Malicious Median: {malicious_median:.3f}s, Z-score: {z_score:.2f}, Flag: {should_flag} (threshold: 4.5)")
             else:
                 # Fallback to simple ratio if no variance
                 TIME_FACTOR = self.config.get('time_dilation_factor', 3.0)
@@ -16443,6 +16547,13 @@ class BusinessLogicFSM:
                 'payloads': ['amount_tampering', 'double_spend', 'payment_bypass']
             }
         }
+        
+        # FSM stuck detection
+        self.stuck_detection_enabled = True
+        self.stuck_timeout = 300  # 5 minutes in same state before considering stuck
+        self.last_state_change_time = time.time()
+        self.stuck_state_history = []
+        self.manual_navigation_guidance = {}
     
     def add_transition(self, from_state, to_state, action, context=None):
         """
@@ -16477,6 +16588,206 @@ class BusinessLogicFSM:
         self.state_context[to_state] = context or {}
         
         logging.debug(f"FSM transition: {from_state} -> {to_state} (action: {action})")
+        
+        # Update last state change time for stuck detection
+        self.last_state_change_time = time.time()
+    
+    def detect_fsm_stuck(self):
+        """
+        Detect if the FSM is stuck in a particular state.
+        
+        This implements the requirement:
+        - If FSM is stuck (e.g., not detecting Checkout): Manually navigate to Checkout
+        using the Selenium Browser tab to force FSM to learn the transition.
+        
+        Returns:
+            dict: Stuck detection result with guidance if stuck
+        """
+        if not self.stuck_detection_enabled:
+            return {'stuck': False, 'reason': 'Stuck detection disabled'}
+        
+        current_time = time.time()
+        time_in_current_state = current_time - self.last_state_change_time
+        
+        # Check if we've been in the same state too long
+        if time_in_current_state > self.stuck_timeout:
+            stuck_info = {
+                'stuck': True,
+                'current_state': self.current_state,
+                'time_in_state': time_in_current_state,
+                'timeout_threshold': self.stuck_timeout,
+                'detected_at': datetime.now().isoformat()
+            }
+            
+            # Provide manual navigation guidance based on current state
+            guidance = self._generate_manual_navigation_guidance(self.current_state)
+            stuck_info['manual_navigation_guidance'] = guidance
+            
+            logging.warning(f"FSM detected as stuck in state '{self.current_state}' for {time_in_current_state:.1f}s")
+            logging.warning(f"Manual navigation guidance: {guidance}")
+            
+            # Add to stuck state history
+            self.stuck_state_history.append(stuck_info)
+            
+            return stuck_info
+        
+        return {'stuck': False, 'current_state': self.current_state, 'time_in_state': time_in_current_state}
+    
+    def _generate_manual_navigation_guidance(self, stuck_state):
+        """
+        Generate manual navigation guidance for when FSM is stuck.
+        
+        This provides specific instructions for manually navigating using
+        the Selenium Browser tab to force the FSM to learn transitions.
+        
+        Args:
+            stuck_state: The state where the FSM is stuck
+            
+        Returns:
+            dict: Manual navigation guidance
+        """
+        guidance = {
+            'stuck_state': stuck_state,
+            'selenium_actions': [],
+            'expected_transitions': [],
+            'url_patterns': [],
+            'form_actions': []
+        }
+        
+        # State-specific guidance
+        if stuck_state == 'initial':
+            guidance['selenium_actions'] = [
+                'Navigate to a product page',
+                'Click on "Add to Cart" button',
+                'Verify cart state is detected'
+            ]
+            guidance['expected_transitions'] = ['initial -> browse', 'browse -> cart']
+            guidance['url_patterns'] = ['/product', '/item', '/cart']
+            guidance['form_actions'] = ['add_to_cart_form', 'cart_button']
+            
+        elif stuck_state == 'browse':
+            guidance['selenium_actions'] = [
+                'Find and click "Add to Cart" on current product page',
+                'Alternatively, navigate directly to cart URL',
+                'Verify cart state is detected'
+            ]
+            guidance['expected_transitions'] = ['browse -> cart']
+            guidance['url_patterns'] = ['/cart', '/basket', '/bag']
+            guidance['form_actions'] = ['add_to_cart', 'view_cart']
+            
+        elif stuck_state == 'cart':
+            guidance['selenium_actions'] = [
+                'Click "Checkout" or "Proceed to Checkout" button',
+                'Navigate directly to checkout URL if button not found',
+                'Fill in required checkout fields if needed',
+                'Verify checkout state is detected'
+            ]
+            guidance['expected_transitions'] = ['cart -> checkout']
+            guidance['url_patterns'] = ['/checkout', '/purchase', '/buy']
+            guidance['form_actions'] = ['checkout_form', 'proceed_to_checkout']
+            
+        elif stuck_state == 'checkout':
+            guidance['selenium_actions'] = [
+                'Fill in shipping/billing information',
+                'Click "Continue to Payment" or similar',
+                'Navigate to payment URL if stuck',
+                'Verify payment state is detected'
+            ]
+            guidance['expected_transitions'] = ['checkout -> payment']
+            guidance['url_patterns'] = ['/payment', '/pay', '/billing']
+            guidance['form_actions'] = ['payment_form', 'continue_to_payment']
+            
+        elif stuck_state == 'payment':
+            guidance['selenium_actions'] = [
+                'Enter test payment details',
+                'Click "Place Order" or "Complete Purchase"',
+                'Navigate to confirmation page if needed',
+                'Verify confirm state is detected'
+            ]
+            guidance['expected_transitions'] = ['payment -> confirm']
+            guidance['url_patterns'] = ['/confirm', '/review', '/finalize', '/success']
+            guidance['form_actions'] = ['place_order', 'complete_purchase']
+            
+        elif stuck_state == 'confirm':
+            guidance['selenium_actions'] = [
+                'Click "Confirm Order" or "Complete" button',
+                'Wait for order completion page',
+                'Navigate to order success URL if needed',
+                'Verify complete state is detected'
+            ]
+            guidance['expected_transitions'] = ['confirm -> complete']
+            guidance['url_patterns'] = ['/complete', '/success', '/thank-you', '/order']
+            guidance['form_actions'] = ['confirm_order', 'complete_order']
+            
+        elif stuck_state == 'complete':
+            guidance['selenium_actions'] = [
+                'Order flow completed successfully',
+                'Optionally navigate to "Continue Shopping"',
+                'Start new flow for additional testing'
+            ]
+            guidance['expected_transitions'] = ['complete -> browse', 'complete -> initial']
+            guidance['url_patterns'] = ['/', '/home', '/shop']
+            guidance['form_actions'] = ['continue_shopping', 'new_order']
+        
+        else:
+            # Unknown state - general guidance
+            guidance['selenium_actions'] = [
+                'Examine current page structure',
+                'Identify available navigation options',
+                'Try navigating to expected next state URL directly',
+                'Force state transition by manually triggering expected action'
+            ]
+            guidance['expected_transitions'] = ['unknown -> browse']
+            guidance['url_patterns'] = ['/', '/home']
+            guidance['form_actions'] = ['navigate_home']
+        
+        # Store guidance for reference
+        self.manual_navigation_guidance[stuck_state] = guidance
+        
+        return guidance
+    
+    def force_state_transition(self, target_state, context=None):
+        """
+        Force a state transition (used when manual navigation is performed).
+        
+        This should be called after manually navigating using Selenium to
+        teach the FSM about the transition.
+        
+        Args:
+            target_state: The state to transition to
+            context: Additional context about the manual transition
+        """
+        previous_state = self.current_state
+        
+        # Force the transition
+        self.current_state = target_state
+        self.state_context[target_state] = context or {}
+        self.last_state_change_time = time.time()
+        
+        # Record the manual transition
+        transition = {
+            'from': previous_state,
+            'to': target_state,
+            'action': 'manual_navigation',
+            'context': context or {},
+            'timestamp': datetime.now().isoformat(),
+            'forced': True
+        }
+        
+        self.transition_history.append(transition)
+        
+        # Update learned sequences
+        sequence_key = f"{previous_state}->{target_state}"
+        self.learned_sequences[sequence_key].append(transition)
+        
+        # Increase confidence for manually learned transitions
+        self.sequence_confidence[sequence_key] = min(1.0, 
+            self.sequence_confidence[sequence_key] + 0.3)
+        
+        logging.info(f"Manual state transition forced: {previous_state} -> {target_state}")
+        logging.info(f"FSM learned manual transition with increased confidence")
+        
+        return transition
     
     def detect_state_from_url(self, url, form_data=None):
         """
@@ -17481,7 +17792,7 @@ class ScanStateManager:
         self.c.execute('''CREATE TABLE IF NOT EXISTS scan_state
              (id INTEGER PRIMARY KEY, target TEXT, timestamp TEXT, 
               visited_urls TEXT, parameters TEXT, vulnerabilities TEXT,
-              crawled_pages TEXT, config TEXT)''')
+              crawled_pages TEXT, config TEXT, fsm_state TEXT)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS page_hashes
              (url TEXT PRIMARY KEY, content_hash TEXT, metadata TEXT, html_path TEXT, timestamp TEXT)''')
         # Migration: add html_path column if it doesn't exist
@@ -17490,6 +17801,16 @@ class ScanStateManager:
         except sqlite3.OperationalError:
             # Column doesn't exist, add it
             self.c.execute("ALTER TABLE page_hashes ADD COLUMN html_path TEXT")
+        # Migration: add fsm_state column if it doesn't exist
+        try:
+            self.c.execute("SELECT fsm_state FROM scan_state LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist, add it (if table exists)
+            try:
+                self.c.execute("ALTER TABLE scan_state ADD COLUMN fsm_state TEXT")
+            except sqlite3.OperationalError:
+                # Table might not exist yet, will be created with the column
+                pass
         # Migration: if old html_content column exists, migrate to html_path
         try:
             self.c.execute("SELECT html_content FROM page_hashes LIMIT 1")
@@ -17522,7 +17843,7 @@ class ScanStateManager:
                 return f.read()
         except (FileNotFoundError, IOError):
             return None
-    def save_state(self, target, visited_urls, parameters, vulnerabilities, crawled_pages, config):
+    def save_state(self, target, visited_urls, parameters, vulnerabilities, crawled_pages, config, fsm_state=None):
         with self.lock:
             timestamp = datetime.now().isoformat()
             # Store only metadata (URL and hash) instead of full HTML
@@ -17536,13 +17857,23 @@ class ScanStateManager:
                     page_meta['hash'] = hashlib.md5(p['html_path'].encode()).hexdigest()
                 crawled_pages_metadata.append(page_meta)
             
-            self.c.execute("INSERT OR REPLACE INTO scan_state (id, target, timestamp, visited_urls, parameters, vulnerabilities, crawled_pages, config) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
-                          (target, json.dumps(list(visited_urls)), json.dumps(parameters), json.dumps(vulnerabilities), json.dumps(crawled_pages_metadata), json.dumps(config)))
+            fsm_state_json = json.dumps(fsm_state) if fsm_state else None
+            self.c.execute("INSERT OR REPLACE INTO scan_state (id, target, timestamp, visited_urls, parameters, vulnerabilities, crawled_pages, config, fsm_state) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (target, json.dumps(list(visited_urls)), json.dumps(parameters), json.dumps(vulnerabilities), json.dumps(crawled_pages_metadata), json.dumps(config), fsm_state_json))
             self.conn.commit()
     def load_state(self):
         with self.lock:
-            self.c.execute("SELECT target, visited_urls, parameters, vulnerabilities, crawled_pages, config FROM scan_state WHERE id=1")
-            row = self.c.fetchone()
+            # Try to load with fsm_state column first
+            try:
+                self.c.execute("SELECT target, visited_urls, parameters, vulnerabilities, crawled_pages, config, fsm_state FROM scan_state WHERE id=1")
+                row = self.c.fetchone()
+            except sqlite3.OperationalError:
+                # Fallback for older databases without fsm_state column
+                self.c.execute("SELECT target, visited_urls, parameters, vulnerabilities, crawled_pages, config FROM scan_state WHERE id=1")
+                row = self.c.fetchone()
+                if row:
+                    row = list(row) + [None]  # Add None for fsm_state
+            
             if row:
                 try:
                     parameters = json.loads(row[2]) if row[2] else []
@@ -17564,13 +17895,18 @@ class ScanStateManager:
                     config = json.loads(row[5]) if row[5] else {}
                 except json.JSONDecodeError:
                     config = {}
+                try:
+                    fsm_state = json.loads(row[6]) if row[6] else None
+                except (json.JSONDecodeError, IndexError):
+                    fsm_state = None
                 return {
                     'target': row[0],
                     'visited_urls': visited_urls,
                     'parameters': parameters if isinstance(parameters, list) else [],
                     'vulnerabilities': vulnerabilities if isinstance(vulnerabilities, list) else [],
                     'crawled_pages': crawled_pages,
-                    'config': config
+                    'config': config,
+                    'fsm_state': fsm_state
                 }
             return None
     def store_page_hash(self, url, content, metadata):
@@ -18151,6 +18487,16 @@ class ValidationEngine:
         
         # Gray zone tracking
         self.gray_zone_findings = []
+        
+        # Gray Zone verification configuration
+        self.gray_zone_manual_verification_enabled = config.get('gray_zone_manual_verification_enabled', True)
+        self.gray_zone_resend_count = config.get('gray_zone_resend_count', 10)
+        self.gray_zone_500_discard_threshold = config.get('gray_zone_500_discard_threshold', 3)  # < 3/10 = discard
+        self.gray_zone_500_accept_threshold = config.get('gray_zone_500_accept_threshold', 8)  # > 8/10 = accept
+        
+        # FSM stuck detection configuration
+        self.fsm_stuck_detection_enabled = config.get('fsm_stuck_detection_enabled', True)
+        self.fsm_stuck_timeout = config.get('fsm_stuck_timeout', 300)  # 5 minutes
         
         # Initialize session marker
         self.session_marker = f"Scan_{uuid.uuid4().hex[:8]}"
@@ -18952,6 +19298,240 @@ class ValidationEngine:
     def get_gray_zone_findings(self):
         """Get all gray zone findings that exceed threshold"""
         return [gz for gz in self.gray_zone_findings if gz['probability_score'] > self.GRAY_ZONE_THRESHOLD]
+    
+    async def manual_resend_verification(self, gray_zone_entry, resend_count=10):
+        """
+        Manually resend the request multiple times to verify Gray Zone findings.
+        
+        This implements the requirement:
+        - For Gray Zone items: Open Repeater Tab -> Copy Raw Request
+        - Manually resend the request 10 times in a loop
+        - If 500 error appears < 3/10 times -> DISCARD (False Positive)
+        - If 500 error appears > 8/10 times -> ACCEPT (True Positive)
+        
+        Args:
+            gray_zone_entry: The gray zone finding to verify
+            resend_count: Number of times to resend the request (default: 10)
+            
+        Returns:
+            dict: Verification result with 500 error frequency analysis
+        """
+        vuln = gray_zone_entry.get('vulnerability', {})
+        url = vuln.get('url', '')
+        method = vuln.get('method', 'GET')
+        headers = vuln.get('request_headers', {})
+        body = vuln.get('request_body', None)
+        parameter = vuln.get('parameter', '')
+        payload = vuln.get('payload', '')
+        
+        logging.info(f"Starting manual resend verification for {vuln.get('type')} at {url}")
+        logging.info(f"Will resend request {resend_count} times to analyze 500 error frequency")
+        
+        # Track 500 error occurrences
+        error_500_count = 0
+        other_error_count = 0
+        success_count = 0
+        response_times = []
+        status_codes = []
+        
+        # Store detailed results for each resend
+        resend_results = []
+        
+        for i in range(resend_count):
+            try:
+                logging.info(f"Resend attempt {i + 1}/{resend_count}")
+                
+                # Make the request with the same parameters
+                start_time = time.time()
+                
+                if method.upper() == 'GET':
+                    async with self.session.get(url, headers=headers, timeout=ClientTimeout(total=30)) as resp:
+                        status = resp.status
+                        response_time = time.time() - start_time
+                        response_text = await resp.text()
+                elif method.upper() == 'POST':
+                    async with self.session.post(url, headers=headers, data=body, timeout=ClientTimeout(total=30)) as resp:
+                        status = resp.status
+                        response_time = time.time() - start_time
+                        response_text = await resp.text()
+                else:
+                    async with self.session.request(method, url, headers=headers, data=body, timeout=ClientTimeout(total=30)) as resp:
+                        status = resp.status
+                        response_time = time.time() - start_time
+                        response_text = await resp.text()
+                
+                # Track results
+                status_codes.append(status)
+                response_times.append(response_time)
+                
+                resend_result = {
+                    'attempt': i + 1,
+                    'status_code': status,
+                    'response_time': response_time,
+                    'response_length': len(response_text),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                if status == 500:
+                    error_500_count += 1
+                    resend_result['error_type'] = '500_internal_server_error'
+                    logging.warning(f"Attempt {i + 1}: 500 Internal Server Error")
+                elif status >= 400:
+                    other_error_count += 1
+                    resend_result['error_type'] = f'{status}_error'
+                    logging.warning(f"Attempt {i + 1}: {status} Error")
+                else:
+                    success_count += 1
+                    resend_result['error_type'] = 'success'
+                    logging.info(f"Attempt {i + 1}: Success ({status})")
+                
+                resend_results.append(resend_result)
+                
+                # Small delay between resends to avoid overwhelming the server
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logging.error(f"Resend attempt {i + 1} failed with exception: {e}")
+                other_error_count += 1
+                resend_results.append({
+                    'attempt': i + 1,
+                    'error_type': 'exception',
+                    'error_message': str(e),
+                    'timestamp': datetime.now().isoformat()
+                })
+        
+        # Calculate 500 error frequency
+        error_500_frequency = (error_500_count / resend_count) * 100
+        
+        # Determine result based on 500 error frequency
+        if error_500_count < 3:  # Less than 3/10 times -> DISCARD (False Positive)
+            recommendation = 'discard'
+            confidence_adjustment = -50  # Significantly reduce confidence
+            logging.info(f"500 errors appeared {error_500_count}/{resend_count} times (< 30%) -> DISCARD (False Positive)")
+        elif error_500_count > 8:  # More than 8/10 times -> ACCEPT (True Positive)
+            recommendation = 'accept'
+            confidence_adjustment = 30  # Increase confidence
+            logging.info(f"500 errors appeared {error_500_count}/{resend_count} times (> 80%) -> ACCEPT (True Positive)")
+        else:
+            recommendation = 'manual_review'  # Still ambiguous
+            confidence_adjustment = 0
+            logging.info(f"500 errors appeared {error_500_count}/{resend_count} times (30-80%) -> Still requires manual review")
+        
+        # Update the gray zone entry with verification results
+        verification_result = {
+            'resend_count': resend_count,
+            'error_500_count': error_500_count,
+            'other_error_count': other_error_count,
+            'success_count': success_count,
+            'error_500_frequency': error_500_frequency,
+            'recommendation': recommendation,
+            'confidence_adjustment': confidence_adjustment,
+            'resend_results': resend_results,
+            'average_response_time': statistics.mean(response_times) if response_times else 0,
+            'status_codes': status_codes,
+            'verified_at': datetime.now().isoformat()
+        }
+        
+        # Update the gray zone entry
+        gray_zone_entry['manual_resend_verification'] = verification_result
+        gray_zone_entry['recommendation'] = recommendation
+        gray_zone_entry['verified'] = True
+        
+        # Update the original vulnerability confidence
+        if recommendation == 'accept':
+            vuln['confidence'] = min(100, vuln.get('confidence', 0) + confidence_adjustment)
+            vuln['validated'] = True
+            vuln['gray_zone'] = False  # Remove from gray zone
+        elif recommendation == 'discard':
+            vuln['confidence'] = max(0, vuln.get('confidence', 0) + confidence_adjustment)
+            vuln['false_positive'] = True
+            vuln['gray_zone'] = False  # Remove from gray zone
+        else:
+            # Still in gray zone but updated
+            vuln['gray_zone'] = True
+            vuln['manual_verification_completed'] = True
+        
+        logging.info(f"Manual resend verification completed: {recommendation} (500 errors: {error_500_count}/{resend_count})")
+        
+        return verification_result
+    
+    async def process_gray_zone_bucket(self):
+        """
+        Process all Gray Zone findings with manual resend verification.
+        
+        This implements the requirement to monitor the Gray Zone bucket and
+        perform manual resend verification for all ambiguous findings.
+        
+        Returns:
+            dict: Processing results with statistics
+        """
+        if not self.gray_zone_manual_verification_enabled:
+            logging.info("Gray Zone manual verification is disabled")
+            return {'enabled': False, 'reason': 'Manual verification disabled'}
+        
+        gray_zone_findings = self.get_gray_zone_findings()
+        
+        if not gray_zone_findings:
+            logging.info("No Gray Zone findings to process")
+            return {
+                'enabled': True,
+                'processed': 0,
+                'accepted': 0,
+                'discarded': 0,
+                'still_ambiguous': 0,
+                'findings': []
+            }
+        
+        logging.info(f"Processing {len(gray_zone_findings)} Gray Zone findings with manual resend verification")
+        
+        results = {
+            'enabled': True,
+            'processed': len(gray_zone_findings),
+            'accepted': 0,
+            'discarded': 0,
+            'still_ambiguous': 0,
+            'findings': []
+        }
+        
+        for gray_zone_entry in gray_zone_findings:
+            try:
+                vuln = gray_zone_entry.get('vulnerability', {})
+                vuln_type = vuln.get('type', 'unknown')
+                url = vuln.get('url', '')
+                
+                logging.info(f"Processing Gray Zone finding: {vuln_type} at {url}")
+                
+                # Perform manual resend verification
+                verification_result = await self.manual_resend_verification(
+                    gray_zone_entry, 
+                    self.gray_zone_resend_count
+                )
+                
+                # Update statistics based on recommendation
+                recommendation = verification_result.get('recommendation')
+                if recommendation == 'accept':
+                    results['accepted'] += 1
+                elif recommendation == 'discard':
+                    results['discarded'] += 1
+                else:
+                    results['still_ambiguous'] += 1
+                
+                results['findings'].append({
+                    'vulnerability_type': vuln_type,
+                    'url': url,
+                    'verification_result': verification_result
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing Gray Zone finding: {e}")
+                results['findings'].append({
+                    'error': str(e),
+                    'processing_failed': True
+                })
+        
+        logging.info(f"Gray Zone bucket processing completed: {results['accepted']} accepted, {results['discarded']} discarded, {results['still_ambiguous']} still ambiguous")
+        
+        return results
 
 
 class OOBServiceMonitor:
@@ -22799,7 +23379,7 @@ class SecondOrderInjectionQueue:
     Stores injection points with TTL and supports background retry processing.
     """
 
-    def __init__(self, db_path='second_order_queue.db', default_ttl=300):
+    def __init__(self, db_path='second_order_queue.db', default_ttl=600):
         self.db_path = db_path
         self.default_ttl = default_ttl
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -23304,7 +23884,7 @@ class SessionManager:
         cache_config = config.get('request_cache', {})
         self.request_cache = BaselineCache(
             max_size=cache_config.get('max_size', 1000),
-            default_ttl=cache_config.get('default_ttl', 300),  # 5 minutes default
+            default_ttl=cache_config.get('default_ttl', 600),  # 10 minutes default
             use_disk_storage=cache_config.get('use_disk_storage', False),
             db_path=cache_config.get('db_path', 'baseline_cache.db')
         )
@@ -23312,6 +23892,9 @@ class SessionManager:
         
         # Initialize request deduplicator to avoid redundant tests
         dedup_config = config.get('request_deduplication', {})
+        # Add disabled_endpoints if configured at top level
+        if 'disabled_endpoints' in config:
+            dedup_config['disabled_endpoints'] = config['disabled_endpoints']
         self.request_deduplicator = RequestDeduplicator(dedup_config)
         
         # Initialize HTTP/2 and HTTP/3 clients
@@ -24528,6 +25111,9 @@ class InjectionEngine:
         
         # Request deduplication - Avoid redundant tests
         dedup_config = config.get('request_deduplication', {})
+        # Add disabled_endpoints if configured at top level
+        if 'disabled_endpoints' in config:
+            dedup_config['disabled_endpoints'] = config['disabled_endpoints']
         self.request_deduplicator = RequestDeduplicator(dedup_config)
         
         # HTTP/2 and HTTP/3 support
@@ -31646,7 +32232,7 @@ class OmegaDAST:
         
         print("Creating CircuitBreaker...")
         self.circuit_breaker = CircuitBreaker(
-            failure_threshold=config.get('circuit_breaker_threshold', 15.0),
+            failure_threshold=config.get('circuit_breaker_threshold', 25.0),
             cooldown=config.get('circuit_breaker_cooldown', 30),
             max_retries=config.get('circuit_breaker_max_retries', 3)
         )
@@ -31716,6 +32302,16 @@ class OmegaDAST:
         self.validation_engine = None
         self.selenium_driver = None
         self.selenium_ready = False
+        
+        # Initialize scan statistics for tracking
+        self.scan_stats = {
+            'start_time': None,
+            'end_time': None,
+            'total_requests': 0,
+            'vulnerabilities_found': 0,
+            'gray_zone_processing': None,
+            'fsm_stuck_detection': None
+        }
         self.js_driver_manager = JSRenderDriverManager()
         
         # Replace global OOB lists with instance state
@@ -31882,6 +32478,12 @@ class OmegaDAST:
         print("Initializing enhanced SPA route discovery and FSM components...")
         try:
             self.business_logic_fsm = BusinessLogicFSM()
+            
+            # Configure FSM stuck detection from config
+            fsm_config = config.get('fsm_stuck_detection', {})
+            self.business_logic_fsm.stuck_detection_enabled = fsm_config.get('enabled', True)
+            self.business_logic_fsm.stuck_timeout = fsm_config.get('stuck_timeout', 300)
+            
             self.spa_route_discovery_enabled = config.get('spa_route_discovery_enabled', True)
             self.fsm_aware_testing_enabled = config.get('fsm_aware_testing_enabled', True)
             self.log("Enhanced SPA route discovery and FSM components initialized")
@@ -32221,6 +32823,12 @@ class OmegaDAST:
                 self.crawler_engine.parameters = prev_state['parameters'] if isinstance(prev_state['parameters'], list) else []
                 self.reporting_engine.vulnerabilities = prev_state['vulnerabilities'] if isinstance(prev_state['vulnerabilities'], list) else []
                 self.crawler_engine.crawled_pages = prev_state['crawled_pages'] if isinstance(prev_state['crawled_pages'], list) else []
+                
+                # Restore FSM state if available
+                if prev_state.get('fsm_state') and hasattr(self, 'business_logic_fsm') and self.business_logic_fsm:
+                    self.business_logic_fsm.import_fsm_state(prev_state['fsm_state'])
+                    self.log(f"FSM state restored: {len(prev_state['fsm_state'].get('learned_sequences', {}))} learned sequences")
+                
                 self.log(f"Resumed scan with {len(self.crawler_engine.visited_urls)} URLs, {len(self.crawler_engine.parameters)} parameters")
         checkpoint_data = self.config.get('checkpoint_data')
         if checkpoint_data and checkpoint_data.get('target') == self.target:
@@ -32230,7 +32838,23 @@ class OmegaDAST:
         if self.validation_enabled:
             # Use the appropriate session for validation
             session_to_use = self.session_manager.async_session.session if self.session_manager.async_session else None
-            self.validation_engine = ValidationEngine(session_to_use, self.config)
+            
+            # Extract Gray Zone and FSM configuration
+            gray_zone_config = self.config.get('gray_zone_handling', {})
+            fsm_config = self.config.get('fsm_stuck_detection', {})
+            
+            # Merge configurations for ValidationEngine
+            validation_config = self.config.copy()
+            validation_config.update({
+                'gray_zone_manual_verification_enabled': gray_zone_config.get('manual_verification_enabled', True),
+                'gray_zone_resend_count': gray_zone_config.get('resend_count', 10),
+                'gray_zone_500_discard_threshold': gray_zone_config.get('error_500_discard_threshold', 3),
+                'gray_zone_500_accept_threshold': gray_zone_config.get('error_500_accept_threshold', 8),
+                'fsm_stuck_detection_enabled': fsm_config.get('enabled', True),
+                'fsm_stuck_timeout': fsm_config.get('stuck_timeout', 300)
+            })
+            
+            self.validation_engine = ValidationEngine(session_to_use, validation_config)
             
             # Initialize Surgical Mode Orchestrator if intelligent verification is enabled
             if self.config.get('intelligent_verification', {}).get('enabled', False):
@@ -32369,6 +32993,9 @@ class OmegaDAST:
             self.session_manager.load_cookies(self.config['cookies'])
     async def scan(self):
         self.log(LEGAL_BANNER)
+        
+        # Initialize scan statistics
+        self.scan_stats['start_time'] = datetime.now().isoformat()
         
         # Log safety configuration at start of scan
         maturity_level = self.config.get('maturity_level', 3)
@@ -32686,13 +33313,20 @@ class OmegaDAST:
             self.log("Schema-aware fuzzing is enabled - this will provide more targeted vulnerability detection")
             await self.run_schema_aware_fuzzing_integration()
         if self.config.get('save_state'):
+            # Export FSM state if available
+            fsm_state = None
+            if hasattr(self, 'business_logic_fsm') and self.business_logic_fsm:
+                fsm_state = self.business_logic_fsm.export_fsm_state()
+                self.log(f"FSM state saved: {len(fsm_state.get('learned_sequences', {}))} learned sequences")
+            
             self.scan_state_manager.save_state(
                 self.target,
                 self.crawler_engine.visited_urls,
                 self.crawler_engine.parameters,
                 self.reporting_engine.vulnerabilities,
                 self.crawler_engine.crawled_pages,
-                self.config
+                self.config,
+                fsm_state
             )
             self.log("Scan state saved for resumption.")
         await self.finalize()
@@ -32768,6 +33402,49 @@ class OmegaDAST:
         # Close version detection engine to prevent resource leaks
         if hasattr(self, 'version_detection') and hasattr(self.version_detection, 'close'):
             self.version_detection.close()
+        
+        # Process Gray Zone findings if auto-processing is enabled
+        gray_zone_config = self.config.get('gray_zone_handling', {})
+        if gray_zone_config.get('auto_process_on_scan_complete', False):
+            try:
+                if hasattr(self, 'validation_engine'):
+                    self.log("Auto-processing Gray Zone findings before scan finalization...")
+                    gray_zone_results = await self.validation_engine.process_gray_zone_bucket()
+                    self.log(f"Gray Zone auto-processing completed: {gray_zone_results['accepted']} accepted, {gray_zone_results['discarded']} discarded, {gray_zone_results['still_ambiguous']} still ambiguous")
+                    
+                    # Add results to scan statistics
+                    if hasattr(self, 'scan_stats'):
+                        self.scan_stats['gray_zone_processing'] = gray_zone_results
+            except Exception as e:
+                logging.error(f"Error during Gray Zone auto-processing: {e}")
+                self.log(f"Gray Zone auto-processing encountered an error: {e}")
+                if hasattr(self, 'scan_stats'):
+                    self.scan_stats['gray_zone_processing'] = {'error': str(e)}
+        
+        # Check FSM stuck detection and provide guidance if needed
+        fsm_config = self.config.get('fsm_stuck_detection', {})
+        if fsm_config.get('enabled', True) and hasattr(self, 'business_logic_fsm') and self.business_logic_fsm:
+            try:
+                stuck_detection = self.business_logic_fsm.detect_fsm_stuck()
+                if stuck_detection.get('stuck'):
+                    self.log(f"FSM stuck detection: FSM stuck in state '{stuck_detection['current_state']}' for {stuck_detection['time_in_state']:.1f}s")
+                    guidance = stuck_detection.get('manual_navigation_guidance', {})
+                    self.log(f"Manual navigation guidance available for state '{stuck_detection['current_state']}'")
+                    
+                    # Log specific guidance actions
+                    for action in guidance.get('selenium_actions', []):
+                        self.log(f"  - {action}")
+                    
+                    # Store stuck detection results
+                    if hasattr(self, 'scan_stats'):
+                        self.scan_stats['fsm_stuck_detection'] = stuck_detection
+            except Exception as e:
+                logging.error(f"Error during FSM stuck detection: {e}")
+        
+        # Record scan end time
+        if hasattr(self, 'scan_stats'):
+            self.scan_stats['end_time'] = datetime.now().isoformat()
+            self.scan_stats['vulnerabilities_found'] = len(self.reporting_engine.vulnerabilities) if hasattr(self.reporting_engine, 'vulnerabilities') else 0
         
         self.oob_manager.stop()
         await self.reporting_engine.close()
@@ -41559,7 +42236,7 @@ class ProxyTab(QWidget):
             'enabled': False,
             'max_requests_per_second': 10.0,
             'burst_capacity': 20,
-            'min_requests_per_second': 0.1,
+            'min_requests_per_second': 0.5,
             'absolute_max_requests_per_second': 100.0
         }
 
@@ -41668,9 +42345,69 @@ class RepeaterTab(QWidget):
         copy_raw_btn.clicked.connect(self.copy_raw_request)
         layout.addWidget(copy_raw_btn)
         
+        # Gray Zone Verification Section
+        gray_zone_group = QGroupBox("🔍 Gray Zone Verification")
+        gray_zone_layout = QVBoxLayout()
+        gray_zone_layout.setSpacing(12)
+        
+        # Verification controls
+        verification_controls = QHBoxLayout()
+        
+        self.resend_count_spin = QSpinBox()
+        self.resend_count_spin.setRange(1, 100)
+        self.resend_count_spin.setValue(10)
+        self.resend_count_spin.setToolTip("Number of times to resend the request")
+        verification_controls.addWidget(QLabel("Resend Count:"))
+        verification_controls.addWidget(self.resend_count_spin)
+        
+        self.discard_threshold_spin = QSpinBox()
+        self.discard_threshold_spin.setRange(0, 10)
+        self.discard_threshold_spin.setValue(3)
+        self.discard_threshold_spin.setToolTip("500 errors < this count = DISCARD")
+        verification_controls.addWidget(QLabel("Discard Threshold:"))
+        verification_controls.addWidget(self.discard_threshold_spin)
+        
+        self.accept_threshold_spin = QSpinBox()
+        self.accept_threshold_spin.setRange(0, 10)
+        self.accept_threshold_spin.setValue(8)
+        self.accept_threshold_spin.setToolTip("500 errors > this count = ACCEPT")
+        verification_controls.addWidget(QLabel("Accept Threshold:"))
+        verification_controls.addWidget(self.accept_threshold_spin)
+        
+        verification_controls.addStretch()
+        gray_zone_layout.addLayout(verification_controls)
+        
+        # Gray Zone verification button
+        self.gray_zone_verify_btn = QPushButton("🔄 Run Gray Zone Verification")
+        self.gray_zone_verify_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff9800;
+                color: white;
+                font-weight: 600;
+                padding: 10px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #f57c00;
+            }
+        """)
+        self.gray_zone_verify_btn.clicked.connect(self.run_gray_zone_verification)
+        gray_zone_layout.addWidget(self.gray_zone_verify_btn)
+        
+        # Gray Zone results
+        self.gray_zone_results_label = QLabel("Gray Zone verification results will appear here")
+        self.gray_zone_results_label.setStyleSheet("QLabel { padding: 8px; background-color: #fff3e0; border-radius: 6px; }")
+        self.gray_zone_results_label.setWordWrap(True)
+        gray_zone_layout.addWidget(self.gray_zone_results_label)
+        
+        gray_zone_group.setLayout(gray_zone_layout)
+        layout.addWidget(gray_zone_group)
+        
         # Store raw request data
         self.last_raw_request = ""
         self.last_raw_response = ""
+        self.gray_zone_verification_results = None
     
     def clear_form(self):
         self.url_input.clear()
@@ -41868,6 +42605,142 @@ class RepeaterTab(QWidget):
                 self.status_label.setStyleSheet("QLabel { font-weight: 600; padding: 12px; background-color: #ffebee; border-radius: 8px; color: #c62828; }")
         import threading
         threading.Thread(target=send_in_thread, daemon=True).start()
+    
+    def run_gray_zone_verification(self):
+        """Run Gray Zone verification by resending the request multiple times"""
+        if not self.last_raw_request:
+            self.gray_zone_results_label.setText("Error: No request to verify. Send a request first.")
+            self.gray_zone_results_label.setStyleSheet("QLabel { padding: 8px; background-color: #ffebee; border-radius: 6px; color: #c62828; }")
+            return
+        
+        method = self.method_combo.currentText()
+        url = self.url_input.text().strip()
+        headers_text = self.headers_input.toPlainText().strip()
+        body_text = self.body_input.toPlainText().strip()
+        
+        resend_count = self.resend_count_spin.value()
+        discard_threshold = self.discard_threshold_spin.value()
+        accept_threshold = self.accept_threshold_spin.value()
+        
+        self.gray_zone_results_label.setText(f"Running Gray Zone verification ({resend_count} resends)...")
+        self.gray_zone_results_label.setStyleSheet("QLabel { padding: 8px; background-color: #e3f2fd; border-radius: 6px; color: #1565c0; }")
+        
+        def verify_in_thread():
+            try:
+                import aiohttp
+                import asyncio
+                from aiohttp import ClientTimeout
+                import statistics
+                
+                async def async_verify():
+                    try:
+                        headers = json.loads(headers_text) if headers_text else {}
+                        body = json.loads(body_text) if body_text else None
+                    except json.JSONDecodeError:
+                        headers = {}
+                        body = None
+                    
+                    error_500_count = 0
+                    other_error_count = 0
+                    success_count = 0
+                    response_times = []
+                    status_codes = []
+                    
+                    for i in range(resend_count):
+                        try:
+                            start_time = time.time()
+                            
+                            async with aiohttp.ClientSession() as session:
+                                if method.upper() == 'GET':
+                                    async with session.get(url, headers=headers, timeout=ClientTimeout(total=30)) as resp:
+                                        status = resp.status
+                                        response_time = time.time() - start_time
+                                        await resp.text()
+                                elif method.upper() == 'POST':
+                                    async with session.post(url, headers=headers, json=body, timeout=ClientTimeout(total=30)) as resp:
+                                        status = resp.status
+                                        response_time = time.time() - start_time
+                                        await resp.text()
+                                else:
+                                    async with session.request(method, url, headers=headers, json=body, timeout=ClientTimeout(total=30)) as resp:
+                                        status = resp.status
+                                        response_time = time.time() - start_time
+                                        await resp.text()
+                            
+                            status_codes.append(status)
+                            response_times.append(response_time)
+                            
+                            if status == 500:
+                                error_500_count += 1
+                            elif status >= 400:
+                                other_error_count += 1
+                            else:
+                                success_count += 1
+                            
+                            await asyncio.sleep(0.5)  # Small delay between resends
+                            
+                        except Exception as e:
+                            other_error_count += 1
+                            logging.error(f"Resend attempt {i + 1} failed: {e}")
+                    
+                    # Calculate results
+                    error_500_frequency = (error_500_count / resend_count) * 100
+                    
+                    if error_500_count < discard_threshold:
+                        recommendation = 'DISCARD (False Positive)'
+                        confidence_adjustment = -50
+                        result_color = "#c62828"  # Red
+                    elif error_500_count > accept_threshold:
+                        recommendation = 'ACCEPT (True Positive)'
+                        confidence_adjustment = 30
+                        result_color = "#2e7d32"  # Green
+                    else:
+                        recommendation = 'MANUAL REVIEW (Still Ambiguous)'
+                        confidence_adjustment = 0
+                        result_color = "#ff9800"  # Orange
+                    
+                    avg_response_time = statistics.mean(response_times) if response_times else 0
+                    
+                    result_text = f"""
+<strong>Gray Zone Verification Results:</strong>
+• 500 Errors: {error_500_count}/{resend_count} ({error_500_frequency:.1f}%)
+• Other Errors: {other_error_count}/{resend_count}
+• Success: {success_count}/{resend_count}
+• Avg Response Time: {avg_response_time:.3f}s
+• <strong>Recommendation: {recommendation}</strong>
+                    """.strip()
+                    
+                    return result_text, result_color, {
+                        'error_500_count': error_500_count,
+                        'other_error_count': other_error_count,
+                        'success_count': success_count,
+                        'error_500_frequency': error_500_frequency,
+                        'recommendation': recommendation,
+                        'average_response_time': avg_response_time,
+                        'status_codes': status_codes
+                    }
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result_text, result_color, results_data = loop.run_until_complete(async_verify())
+                finally:
+                    loop.close()
+                
+                # Update UI with results
+                self.gray_zone_results_label.setText(result_text)
+                self.gray_zone_results_label.setStyleSheet(f"QLabel {{ padding: 8px; background-color: {result_color}; border-radius: 6px; color: white; }}")
+                self.gray_zone_verification_results = results_data
+                
+            except Exception as e:
+                error_text = f"Gray Zone verification failed: {str(e)}"
+                self.gray_zone_results_label.setText(error_text)
+                self.gray_zone_results_label.setStyleSheet("QLabel { padding: 8px; background-color: #ffebee; border-radius: 6px; color: #c62828; }")
+                logging.error(f"Gray Zone verification error: {e}")
+        
+        import threading
+        import time
+        threading.Thread(target=verify_in_thread, daemon=True).start()
 
 class ScanTab(QWidget):
     def __init__(self, parent=None):
@@ -42736,10 +43609,455 @@ class ScanTab(QWidget):
                     self.log_area.append(f"  {i}. {anomaly['endpoint']} - Status {anomaly['status_code']} "
                                        f"(Confirmed {anomaly['confirmation_count']}x)")
 
+class GrayZoneTab(QWidget):
+    def __init__(self, parent=None):
+        QWidget.__init__(self, parent)
+        layout = QVBoxLayout()
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+        self.setLayout(layout)
+        
+        # Gray Zone Monitor Section
+        monitor_group = QGroupBox("🔍 Gray Zone Bucket Monitor")
+        monitor_layout = QVBoxLayout()
+        monitor_layout.setSpacing(12)
+        
+        # Monitor controls
+        monitor_controls = QHBoxLayout()
+        
+        self.auto_process_check = QCheckBox("Auto-process on scan complete")
+        self.auto_process_check.setChecked(True)
+        self.auto_process_check.setToolTip("Automatically process Gray Zone findings when scan completes")
+        monitor_controls.addWidget(self.auto_process_check)
+        
+        monitor_controls.addStretch()
+        
+        self.refresh_btn = QPushButton("🔄 Refresh Gray Zone")
+        self.refresh_btn.clicked.connect(self.refresh_gray_zone)
+        monitor_controls.addWidget(self.refresh_btn)
+        
+        self.process_all_btn = QPushButton("✅ Process All Findings")
+        self.process_all_btn.clicked.connect(self.process_all_gray_zone)
+        monitor_controls.addWidget(self.process_all_btn)
+        
+        monitor_layout.addLayout(monitor_controls)
+        
+        # Gray Zone findings table
+        self.gray_zone_table = QTableWidget()
+        self.gray_zone_table.setColumnCount(6)
+        self.gray_zone_table.setHorizontalHeaderLabels([
+            "Type", "URL", "Parameter", "Probability", "Recommendation", "Actions"
+        ])
+        self.gray_zone_table.horizontalHeader().setStretchLastSection(True)
+        self.gray_zone_table.setSelectionBehavior(QTableWidget.SelectRows)
+        monitor_layout.addWidget(self.gray_zone_table)
+        
+        monitor_group.setLayout(monitor_layout)
+        layout.addWidget(monitor_group)
+        
+        # Statistics Section
+        stats_group = QGroupBox("📊 Gray Zone Statistics")
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(20)
+        
+        self.total_gray_zone_label = QLabel("Total Gray Zone: 0")
+        self.total_gray_zone_label.setStyleSheet("QLabel { font-weight: 600; font-size: 14px; }")
+        stats_layout.addWidget(self.total_gray_zone_label)
+        
+        self.accepted_label = QLabel("Accepted: 0")
+        self.accepted_label.setStyleSheet("QLabel { color: #2e7d32; font-weight: 600; }")
+        stats_layout.addWidget(self.accepted_label)
+        
+        self.discarded_label = QLabel("Discarded: 0")
+        self.discarded_label.setStyleSheet("QLabel { color: #c62828; font-weight: 600; }")
+        stats_layout.addWidget(self.discarded_label)
+        
+        self.ambiguous_label = QLabel("Still Ambiguous: 0")
+        self.ambiguous_label.setStyleSheet("QLabel { color: #ff9800; font-weight: 600; }")
+        stats_layout.addWidget(self.ambiguous_label)
+        
+        stats_layout.addStretch()
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
+        
+        # Manual verification results
+        results_group = QGroupBox("📋 Manual Verification Results")
+        results_layout = QVBoxLayout()
+        
+        self.verification_results_area = QPlainTextEdit()
+        self.verification_results_area.setReadOnly(True)
+        self.verification_results_area.setMaximumHeight(200)
+        self.verification_results_area.setFont(QFont("Consolas", 9))
+        results_layout.addWidget(self.verification_results_area)
+        
+        results_group.setLayout(results_layout)
+        layout.addWidget(results_group)
+        
+        # Initialize with sample data
+        self.refresh_gray_zone()
+    
+    def refresh_gray_zone(self):
+        """Refresh the Gray Zone findings table"""
+        # Clear existing rows
+        self.gray_zone_table.setRowCount(0)
+        
+        # Add sample data (in real implementation, this would come from the scanner)
+        sample_findings = [
+            {
+                'type': 'SQL Injection',
+                'url': 'http://example.com/api/users',
+                'parameter': 'id',
+                'probability': 15,
+                'recommendation': 'manual_review'
+            },
+            {
+                'type': 'XSS',
+                'url': 'http://example.com/search',
+                'parameter': 'q',
+                'probability': 25,
+                'recommendation': 'manual_review'
+            }
+        ]
+        
+        for finding in sample_findings:
+            row = self.gray_zone_table.rowCount()
+            self.gray_zone_table.insertRow(row)
+            
+            self.gray_zone_table.setItem(row, 0, QTableWidgetItem(finding['type']))
+            self.gray_zone_table.setItem(row, 1, QTableWidgetItem(finding['url']))
+            self.gray_zone_table.setItem(row, 2, QTableWidgetItem(finding['parameter']))
+            
+            prob_item = QTableWidgetItem(f"{finding['probability']}%")
+            if finding['probability'] < 10:
+                prob_item.setBackground(QColor("#ffebee"))
+            elif finding['probability'] > 20:
+                prob_item.setBackground(QColor("#fff3e0"))
+            self.gray_zone_table.setItem(row, 3, prob_item)
+            
+            rec_item = QTableWidgetItem(finding['recommendation'].replace('_', ' ').title())
+            if finding['recommendation'] == 'accept':
+                rec_item.setBackground(QColor("#e8f5e9"))
+            elif finding['recommendation'] == 'discard':
+                rec_item.setBackground(QColor("#ffebee"))
+            else:
+                rec_item.setBackground(QColor("#fff3e0"))
+            self.gray_zone_table.setItem(row, 4, rec_item)
+            
+            # Add action button
+            action_btn = QPushButton("Verify")
+            action_btn.clicked.connect(lambda checked, r=row: self.verify_finding(r))
+            self.gray_zone_table.setCellWidget(row, 5, action_btn)
+        
+        # Update statistics
+        self.update_statistics(len(sample_findings), 0, 0, len(sample_findings))
+    
+    def update_statistics(self, total, accepted, discarded, ambiguous):
+        """Update the statistics labels"""
+        self.total_gray_zone_label.setText(f"Total Gray Zone: {total}")
+        self.accepted_label.setText(f"Accepted: {accepted}")
+        self.discarded_label.setText(f"Discarded: {discarded}")
+        self.ambiguous_label.setText(f"Still Ambiguous: {ambiguous}")
+    
+    def verify_finding(self, row):
+        """Verify a specific Gray Zone finding"""
+        finding_type = self.gray_zone_table.item(row, 0).text()
+        url = self.gray_zone_table.item(row, 1).text()
+        
+        self.verification_results_area.appendPlainText(f"Verifying: {finding_type} at {url}")
+        self.verification_results_area.appendPlainText("Use the Repeater tab to copy the raw request and run manual verification.")
+        self.verification_results_area.appendPlainText("-" * 50)
+    
+    def process_all_gray_zone(self):
+        """Process all Gray Zone findings"""
+        self.verification_results_area.appendPlainText("Processing all Gray Zone findings...")
+        self.verification_results_area.appendPlainText("This will run manual resend verification on all findings.")
+        self.verification_results_area.appendPlainText("-" * 50)
+
+class SeleniumBrowserTab(QWidget):
+    def __init__(self, parent=None):
+        QWidget.__init__(self, parent)
+        layout = QVBoxLayout()
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+        self.setLayout(layout)
+        
+        # Browser Control Section
+        browser_group = QGroupBox("🌐 Selenium Browser Control")
+        browser_layout = QVBoxLayout()
+        browser_layout.setSpacing(12)
+        
+        # Navigation controls
+        nav_controls = QHBoxLayout()
+        
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://example.com")
+        nav_controls.addWidget(self.url_input)
+        
+        self.navigate_btn = QPushButton("🔗 Navigate")
+        self.navigate_btn.clicked.connect(self.navigate_to_url)
+        nav_controls.addWidget(self.navigate_btn)
+        
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_page)
+        nav_controls.addWidget(self.refresh_btn)
+        
+        nav_controls.addStretch()
+        browser_layout.addLayout(nav_controls)
+        
+        # FSM Guidance Section
+        fsm_group = QGroupBox("🤖 FSM Stuck Detection & Guidance")
+        fsm_layout = QVBoxLayout()
+        fsm_layout.setSpacing(12)
+        
+        # FSM status
+        self.fsm_status_label = QLabel("FSM Status: Active")
+        self.fsm_status_label.setStyleSheet("QLabel { font-weight: 600; padding: 8px; background-color: #e8f5e9; border-radius: 6px; }")
+        fsm_layout.addWidget(self.fsm_status_label)
+        
+        # Current state
+        self.current_state_label = QLabel("Current State: initial")
+        self.current_state_label.setStyleSheet("QLabel { font-weight: 600; font-size: 14px; }")
+        fsm_layout.addWidget(self.current_state_label)
+        
+        # Manual navigation guidance
+        guidance_label = QLabel("🧭 Manual Navigation Guidance:")
+        guidance_label.setStyleSheet("QLabel { font-weight: 600; }")
+        fsm_layout.addWidget(guidance_label)
+        
+        self.guidance_area = QPlainTextEdit()
+        self.guidance_area.setReadOnly(True)
+        self.guidance_area.setMaximumHeight(150)
+        self.guidance_area.setFont(QFont("Consolas", 9))
+        fsm_layout.addWidget(self.guidance_area)
+        
+        # FSM controls
+        fsm_controls = QHBoxLayout()
+        
+        self.check_stuck_btn = QPushButton("🔍 Check if FSM Stuck")
+        self.check_stuck_btn.clicked.connect(self.check_fsm_stuck)
+        fsm_controls.addWidget(self.check_stuck_btn)
+        
+        self.force_transition_btn = QPushButton("⚡ Force State Transition")
+        self.force_transition_btn.clicked.connect(self.force_state_transition)
+        fsm_controls.addWidget(self.force_transition_btn)
+        
+        fsm_controls.addStretch()
+        fsm_layout.addLayout(fsm_controls)
+        
+        fsm_group.setLayout(fsm_layout)
+        browser_layout.addWidget(fsm_group)
+        
+        # Target state selection
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("Target State:"))
+        
+        self.target_state_combo = QComboBox()
+        self.target_state_combo.addItems([
+            'initial', 'browse', 'cart', 'checkout', 
+            'payment', 'confirm', 'complete'
+        ])
+        target_layout.addWidget(self.target_state_combo)
+        
+        target_layout.addStretch()
+        browser_layout.addLayout(target_layout)
+        
+        browser_group.setLayout(browser_layout)
+        layout.addWidget(browser_group)
+        
+        # Log area
+        log_group = QGroupBox("📋 Browser Actions Log")
+        log_layout = QVBoxLayout()
+        
+        self.browser_log = QPlainTextEdit()
+        self.browser_log.setReadOnly(True)
+        self.browser_log.setMaximumHeight(150)
+        self.browser_log.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.browser_log)
+        
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+        
+        # Initialize with default guidance
+        self.update_fsm_guidance('initial')
+    
+    def navigate_to_url(self):
+        """Navigate to the specified URL"""
+        url = self.url_input.text().strip()
+        if url:
+            self.browser_log.appendPlainText(f"Navigating to: {url}")
+            self.browser_log.appendPlainText("Use Selenium to perform actual navigation")
+            self.browser_log.appendPlainText("-" * 50)
+            
+            # In real implementation, this would use actual Selenium
+            # driver.get(url)
+    
+    def refresh_page(self):
+        """Refresh the current page"""
+        self.browser_log.appendPlainText("Refreshing current page")
+        self.browser_log.appendPlainText("Use Selenium to perform actual refresh")
+        self.browser_log.appendPlainText("-" * 50)
+    
+    def check_fsm_stuck(self):
+        """Check if the FSM is stuck and provide guidance"""
+        self.browser_log.appendPlainText("Checking FSM stuck status...")
+        
+        # Simulate stuck detection
+        self.fsm_status_label.setText("FSM Status: Checking...")
+        self.fsm_status_label.setStyleSheet("QLabel { font-weight: 600; padding: 8px; background-color: #fff3e0; border-radius: 6px; }")
+        
+        # In real implementation, this would check the actual FSM
+        current_state = self.target_state_combo.currentText()
+        stuck_result = {
+            'stuck': True,
+            'current_state': current_state,
+            'time_in_state': 350.0,
+            'manual_navigation_guidance': self._generate_guidance_for_state(current_state)
+        }
+        
+        if stuck_result['stuck']:
+            self.fsm_status_label.setText(f"FSM Status: STUCK in '{current_state}' for {stuck_result['time_in_state']:.1f}s")
+            self.fsm_status_label.setStyleSheet("QLabel { font-weight: 600; padding: 8px; background-color: #ffebee; border-radius: 6px; color: #c62828; }")
+            
+            guidance = stuck_result['manual_navigation_guidance']
+            self.update_fsm_guidance(current_state, guidance)
+            
+            self.browser_log.appendPlainText(f"FSM is stuck in state: {current_state}")
+            self.browser_log.appendPlainText(f"Time in state: {stuck_result['time_in_state']:.1f}s")
+        else:
+            self.fsm_status_label.setText("FSM Status: Active (Not Stuck)")
+            self.fsm_status_label.setStyleSheet("QLabel { font-weight: 600; padding: 8px; background-color: #e8f5e9; border-radius: 6px; }")
+            self.browser_log.appendPlainText("FSM is not stuck")
+        
+        self.browser_log.appendPlainText("-" * 50)
+    
+    def force_state_transition(self):
+        """Force a state transition to help the FSM learn"""
+        target_state = self.target_state_combo.currentText()
+        current_state = self.target_state_combo.currentText()  # Simplified
+        
+        self.browser_log.appendPlainText(f"Forcing state transition: {current_state} -> {target_state}")
+        self.browser_log.appendPlainText("This teaches the FSM about the transition")
+        
+        # Update current state display
+        self.current_state_label.setText(f"Current State: {target_state}")
+        self.fsm_status_label.setText("FSM Status: Transition Forced")
+        self.fsm_status_label.setStyleSheet("QLabel { font-weight: 600; padding: 8px; background-color: #e3f2fd; border-radius: 6px; }")
+        
+        # Update guidance for new state
+        self.update_fsm_guidance(target_state)
+        
+        self.browser_log.appendPlainText("-" * 50)
+    
+    def _generate_guidance_for_state(self, state):
+        """Generate manual navigation guidance for a specific state"""
+        guidance_templates = {
+            'initial': {
+                'selenium_actions': [
+                    'Navigate to a product page',
+                    'Click on "Add to Cart" button',
+                    'Verify cart state is detected'
+                ],
+                'expected_transitions': ['initial -> browse', 'browse -> cart'],
+                'url_patterns': ['/product', '/item', '/cart']
+            },
+            'browse': {
+                'selenium_actions': [
+                    'Find and click "Add to Cart" on current product page',
+                    'Navigate directly to cart URL if button not found',
+                    'Verify cart state is detected'
+                ],
+                'expected_transitions': ['browse -> cart'],
+                'url_patterns': ['/cart', '/basket', '/bag']
+            },
+            'cart': {
+                'selenium_actions': [
+                    'Click "Checkout" or "Proceed to Checkout" button',
+                    'Navigate to checkout URL if needed',
+                    'Fill in required checkout fields',
+                    'Verify checkout state is detected'
+                ],
+                'expected_transitions': ['cart -> checkout'],
+                'url_patterns': ['/checkout', '/purchase', '/buy']
+            },
+            'checkout': {
+                'selenium_actions': [
+                    'Fill in shipping/billing information',
+                    'Click "Continue to Payment" or similar',
+                    'Navigate to payment URL if stuck',
+                    'Verify payment state is detected'
+                ],
+                'expected_transitions': ['checkout -> payment'],
+                'url_patterns': ['/payment', '/pay', '/billing']
+            },
+            'payment': {
+                'selenium_actions': [
+                    'Enter test payment details',
+                    'Click "Place Order" or "Complete Purchase"',
+                    'Navigate to confirmation page if needed',
+                    'Verify confirm state is detected'
+                ],
+                'expected_transitions': ['payment -> confirm'],
+                'url_patterns': ['/confirm', '/review', '/finalize', '/success']
+            },
+            'confirm': {
+                'selenium_actions': [
+                    'Click "Confirm Order" or "Complete" button',
+                    'Wait for order completion page',
+                    'Navigate to order success URL if needed',
+                    'Verify complete state is detected'
+                ],
+                'expected_transitions': ['confirm -> complete'],
+                'url_patterns': ['/complete', '/success', '/thank-you', '/order']
+            },
+            'complete': {
+                'selenium_actions': [
+                    'Order flow completed successfully',
+                    'Optionally navigate to "Continue Shopping"',
+                    'Start new flow for additional testing'
+                ],
+                'expected_transitions': ['complete -> browse', 'complete -> initial'],
+                'url_patterns': ['/', '/home', '/shop']
+            }
+        }
+        
+        return guidance_templates.get(state, {
+            'selenium_actions': ['Examine current page structure', 'Identify available navigation options'],
+            'expected_transitions': ['unknown -> browse'],
+            'url_patterns': ['/', '/home']
+        })
+    
+    def update_fsm_guidance(self, state, guidance=None):
+        """Update the FSM guidance display"""
+        if guidance is None:
+            guidance = self._generate_guidance_for_state(state)
+        
+        self.current_state_label.setText(f"Current State: {state}")
+        
+        guidance_text = f"Manual Navigation Guidance for '{state}':\n\n"
+        
+        if 'selenium_actions' in guidance:
+            guidance_text += "Selenium Actions:\n"
+            for i, action in enumerate(guidance['selenium_actions'], 1):
+                guidance_text += f"  {i}. {action}\n"
+            guidance_text += "\n"
+        
+        if 'expected_transitions' in guidance:
+            guidance_text += "Expected Transitions:\n"
+            for transition in guidance['expected_transitions']:
+                guidance_text += f"  • {transition}\n"
+            guidance_text += "\n"
+        
+        if 'url_patterns' in guidance:
+            guidance_text += "URL Patterns:\n"
+            for pattern in guidance['url_patterns']:
+                guidance_text += f"  • {pattern}\n"
+        
+        self.guidance_area.setPlainText(guidance_text)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.2 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.3 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -42765,6 +44083,8 @@ class MainWindow(QMainWindow):
         self.add_new_scan_tab()
         self.add_repeater_tab()
         self.add_proxy_tab()
+        self.add_gray_zone_tab()
+        self.add_selenium_browser_tab()
         
         self.dark_mode = False
         self.create_menu_bar()
@@ -43204,6 +44524,28 @@ class MainWindow(QMainWindow):
         
         tab = ProxyTab()
         self.tabs.addTab(tab, "🔗 Proxy")
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+    
+    def add_gray_zone_tab(self):
+        # Check if gray zone tab already exists
+        for i in range(self.tabs.count()):
+            if isinstance(self.tabs.widget(i), GrayZoneTab):
+                self.tabs.setCurrentIndex(i)
+                return
+        
+        tab = GrayZoneTab()
+        self.tabs.addTab(tab, "🔍 Gray Zone")
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+    
+    def add_selenium_browser_tab(self):
+        # Check if selenium browser tab already exists
+        for i in range(self.tabs.count()):
+            if isinstance(self.tabs.widget(i), SeleniumBrowserTab):
+                self.tabs.setCurrentIndex(i)
+                return
+        
+        tab = SeleniumBrowserTab()
+        self.tabs.addTab(tab, "🌐 Selenium Browser")
         self.tabs.setCurrentIndex(self.tabs.count() - 1)
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
@@ -43822,7 +45164,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.2']
+                        ['Tool Version', 'UltraDAST v18.3']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -43933,7 +45275,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.2",
+                            "tool": "UltraDAST v18.3",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -44225,7 +45567,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.2 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.3 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
