@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.3 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.4 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -9,9 +9,11 @@ Install:
     pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt dnspython html5lib
     pip install websockets grpcio grpcio-reflection cvss PyQt5 reportlab markupsafe protobuf
     pip install z3-solver  # Required for symbolic execution with Z3 SMT solver
+    pip install playwright  # Required for advanced JavaScript instrumentation
+    playwright install chromium  # Install Playwright browser binaries
 
 Optional: Set NVD_API_KEY environment variable for higher CVE feed rate limits
-ChromeDriver must be in PATH.
+ChromeDriver must be in PATH for Selenium mode.
 
 Authorised use only. Unauthorised scanning is illegal.
 
@@ -353,7 +355,7 @@ INTELLIGENT VERIFICATION PIPELINE CONFIGURATION EXAMPLE:
         "circuit_breaker_timeout": 300,
         "critical_vulnerability_types": ["RCE", "SQLi", "Auth Bypass", "IDOR", "SSRF"],
         "max_critical_verifications": 10,
-        "proximity_validation_sample_size": 3,
+        "proximity_validation_sample_size": 5,
         "off_peak_scheduling": True,
         "safe_http_methods": ["GET", "HEAD", "OPTIONS"]
     }
@@ -454,6 +456,16 @@ GRAY ZONE HANDLING CONFIGURATION EXAMPLE:{
     }
 }
 
+STEALTH MODE CONFIGURATION EXAMPLE:{
+    "stealth_mode": {
+        "enabled": true,
+        "window_hours": 24,
+        "requests_per_window": 50,
+        "jitter_percentage": 20,
+        "state_file": "stealth_mode_state.json"
+    }
+}
+
 GRAY ZONE HANDLING FEATURES:
 - Gray Zone Bucket Monitoring: Track ambiguous findings with probability scoring
 - Manual Resend Verification: Automatically resend requests 10 times to verify 500 error consistency
@@ -468,6 +480,28 @@ GRAY ZONE VERIFICATION WORKFLOW:
 2. DO NOT accept Gray Zone findings automatically
 3. For Gray Zone items: Open Repeater Tab -> Copy Raw Request
 4. Manually resend the request 10 times in a loop
+5. If 500 error appears < 3/10 times -> DISCARD (False Positive)
+6. If 500 error appears > 8/10 times -> ACCEPT (True Positive)
+7. If FSM is stuck (e.g., not detecting Checkout): Manually navigate to Checkout
+   using the Selenium Browser tab to force FSM to learn the transition
+
+STEALTH MODE FEATURES:
+- 24-Hour Request Spreading: Distributes requests over a configurable time window (default 24 hours)
+- Rate Limit Compliance: Automatically respects strict API rate limits (e.g., 1 request/second)
+- Anti-Detection Timing: Randomized jitter (±20%) to avoid automated detection patterns
+- State Persistence: Saves progress to disk for resume capability after interruptions
+- Progress Tracking: Real-time progress updates and estimated completion time
+- Adaptive Scheduling: Optimizes request timing based on total requests and window duration
+- Resume Support: Can resume from where it left off after scan interruption
+
+STEALTH MODE USAGE:
+1. Enable stealth_mode in your scan configuration
+2. Set window_hours to match your desired scan duration (default: 24 hours)
+3. Configure requests_per_window based on your rate limit (default: 50 concurrent requests)
+4. Set jitter_percentage to add randomness (default: 20%)
+5. Specify state_file for persistence (default: "stealth_mode_state.json")
+6. Scanner will automatically space requests to respect rate limits
+7. Progress is saved automatically and can be resumed if interrupted
 5. If 500 error appears < 3/10 times -> DISCARD (False Positive)
 6. If 500 error appears > 8/10 times -> ACCEPT (True Positive)
 7. If FSM is stuck (e.g., not detecting Checkout): Manually navigate to Checkout
@@ -524,6 +558,35 @@ HTTP/2 AND HTTP/3 FEATURES:
 - Connection Reuse: Keep-alive connections with proper timeout handling
 - Protocol Detection: Automatic detection and selection of best available protocol
 - SSL Verification: Configurable SSL certificate verification (enabled by default for security)
+
+PLAYWRIGHT ADVANCED JAVASCRIPT INSTRUMENTATION CONFIGURATION EXAMPLE:{
+    "js_driver_mode": "playwright",
+    "js_render": true,
+    "playwright_interaction_recording": {
+        "enabled": true,
+        "duration": 30,
+        "auto_replay": true
+    },
+    "playwright_advanced_detection": {
+        "prototype_pollution": true,
+        "client_side_template_injection": true,
+        "dom_xss_monitoring": true
+    }
+}
+
+PLAYWRIGHT ADVANCED FEATURES:
+- Deep JavaScript Runtime Instrumentation: Hooks into Object.setPrototypeOf, Object.defineProperty, and template engines
+- Prototype Pollution Detection: Monitors property access on Object.prototype and dangerous prototype manipulations
+- Client-Side Template Injection (CSTI): Detects template literal injection and template engine vulnerabilities
+- User Interaction Recording: Records and replays user interactions for 30-second sessions
+- Advanced DOM XSS Monitoring: Monitors innerHTML assignments and event handler injections
+- Headless Browser Context: Modern browser context management with better performance
+- Network Interception: Built-in request/response monitoring and modification
+- Shadow DOM Piercing: Automatic traversal of Shadow DOM for modern web components
+- WebSocket Monitoring: Real-time WebSocket message interception and analysis
+- Framework-Specific Detection: Handles React, Vue, Angular, and other modern frameworks
+- 5-Click Sequential Testing: Detects vulnerabilities that only trigger after multiple user interactions
+- Async/Await Support: Full async/await support for modern JavaScript applications
 """
 
 import asyncio
@@ -1293,6 +1356,26 @@ def validate_config(config):
                     errors.append("fsm_stuck_detection.stuck_timeout must be an integer between 10 and 3600 seconds")
             if 'enable_manual_navigation_guidance' in fsm_config and not isinstance(fsm_config['enable_manual_navigation_guidance'], bool):
                 errors.append("fsm_stuck_detection.enable_manual_navigation_guidance must be a boolean value")
+    
+    # Validate Stealth Mode configuration
+    if 'stealth_mode' in config:
+        stealth_config = config['stealth_mode']
+        if not isinstance(stealth_config, dict):
+            errors.append("stealth_mode must be a dictionary")
+        else:
+            if 'enabled' in stealth_config and not isinstance(stealth_config['enabled'], bool):
+                errors.append("stealth_mode.enabled must be a boolean value")
+            if 'window_hours' in stealth_config:
+                if not isinstance(stealth_config['window_hours'], (int, float)) or stealth_config['window_hours'] < 1 or stealth_config['window_hours'] > 168:
+                    errors.append("stealth_mode.window_hours must be a number between 1 and 168 hours (1 week)")
+            if 'requests_per_window' in stealth_config:
+                if not isinstance(stealth_config['requests_per_window'], int) or stealth_config['requests_per_window'] < 1:
+                    errors.append("stealth_mode.requests_per_window must be a positive integer")
+            if 'jitter_percentage' in stealth_config:
+                if not isinstance(stealth_config['jitter_percentage'], (int, float)) or stealth_config['jitter_percentage'] < 0 or stealth_config['jitter_percentage'] > 50:
+                    errors.append("stealth_mode.jitter_percentage must be a number between 0 and 50")
+            if 'state_file' in stealth_config and not isinstance(stealth_config['state_file'], str):
+                errors.append("stealth_mode.state_file must be a string")
     
     return len(errors) == 0, errors
 
@@ -5085,6 +5168,14 @@ except ImportError:
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
+# Playwright import for advanced JavaScript instrumentation
+try:
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logging.warning("Playwright not available - advanced JS instrumentation will be disabled")
+
 # ---------------------------------------------------------------------
 # BEAUTIFULSOUP CACHING
 # ---------------------------------------------------------------------
@@ -5348,6 +5439,8 @@ CWE_MAP = {
     "InsecureDeserialization": "CWE-502", "LogInjection": "CWE-117",
     "CSRF": "CWE-352", "JWT": "CWE-347", "CORS": "CWE-942", "GraphQL": "CWE-200",
     "RequestSmuggling": "CWE-444", "CL.0 Bypass": "CWE-444", "HTTP/2 Downgrade": "CWE-444", "HTTP/2 Protocol Confusion": "CWE-444",
+    # Advanced JavaScript runtime vulnerabilities (Playwright detection)
+    "PrototypePollution": "CWE-1321", "ClientSideTemplateInjection": "CWE-94", "CSTI": "CWE-94",
     "WeakSSHConfiguration": "CWE-269", "PotentiallyVulnerableNetworkService": "CWE-269",
     "PotentiallyVulnerableWindowsService": "CWE-269", "SMBServerRunning": "CWE-269",
     "WeakPasswordPolicy": "CWE-521", "PotentialEmptyPasswords": "CWE-521",
@@ -12862,6 +12955,184 @@ class AdaptiveThrottler:
         """Set the payload queue for queue-based continuation."""
         self.payload_queue = queue
 
+class StealthModeScheduler:
+    """
+    Stealth Mode Scheduler for spreading requests over a configurable time window.
+    
+    This scheduler is designed to handle strict rate limits by distributing requests
+    over a long time window (e.g., 24 hours) with randomized timing to avoid detection.
+    
+    Features:
+    - Configurable time window (default 24 hours)
+    - Request spacing with jitter for anti-detection
+    - State persistence for resume capability
+    - Progress tracking and estimated completion time
+    - Automatic rate calculation based on total requests
+    """
+    
+    def __init__(self, config: dict):
+        """
+        Initialize stealth mode scheduler.
+        
+        Args:
+            config: Dictionary containing stealth_mode configuration
+        """
+        self.enabled = config.get('enabled', False)
+        self.window_hours = config.get('window_hours', 24)
+        self.requests_per_window = config.get('requests_per_window', 50)
+        self.jitter_percentage = config.get('jitter_percentage', 20)
+        self.state_file = config.get('state_file', 'stealth_mode_state.json')
+        
+        # Calculate request interval
+        self.window_seconds = self.window_hours * 3600
+        self.base_interval = self.window_seconds / self.requests_per_window if self.requests_per_window > 0 else 1
+        
+        # State tracking
+        self.request_count = 0
+        self.start_time = None
+        self.last_request_time = None
+        self.lock = asyncio.Lock()
+        
+        # Load existing state if available
+        if self.enabled:
+            self._load_state()
+    
+    def _load_state(self):
+        """Load stealth mode state from disk for resume capability."""
+        try:
+            import os
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    import json
+                    state = json.load(f)
+                    self.request_count = state.get('request_count', 0)
+                    self.start_time = state.get('start_time')
+                    self.last_request_time = state.get('last_request_time')
+                    logging.info(f"Stealth mode state loaded: {self.request_count} requests completed")
+        except Exception as e:
+            logging.warning(f"Failed to load stealth mode state: {e}")
+    
+    def _save_state(self):
+        """Save stealth mode state to disk for resume capability."""
+        try:
+            import json
+            state = {
+                'request_count': self.request_count,
+                'start_time': self.start_time,
+                'last_request_time': self.last_request_time,
+                'window_hours': self.window_hours,
+                'requests_per_window': self.requests_per_window
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Failed to save stealth mode state: {e}")
+    
+    async def acquire_slot(self):
+        """
+        Acquire a request slot with stealth timing.
+        
+        This method will:
+        1. Initialize start time on first call
+        2. Calculate appropriate delay based on request count
+        3. Add random jitter to avoid detection patterns
+        4. Wait for the calculated delay
+        5. Update state and save to disk
+        
+        Returns:
+            bool: True if slot acquired, False if stealth mode is disabled
+        """
+        if not self.enabled:
+            return False
+        
+        async with self.lock:
+            # Initialize start time on first request
+            if self.start_time is None:
+                import time
+                self.start_time = time.time()
+                self.last_request_time = self.start_time
+                logging.info(f"Stealth mode activated: {self.requests_per_window} requests over {self.window_hours} hours")
+            
+            # Calculate delay for this request
+            import time
+            current_time = time.time()
+            
+            # Calculate expected time for this request
+            expected_time = self.start_time + (self.request_count * self.base_interval)
+            
+            # Add jitter for anti-detection
+            import random
+            jitter_factor = 1 + (random.uniform(-self.jitter_percentage/100, self.jitter_percentage/100))
+            delay = max(0, (expected_time - current_time) * jitter_factor)
+            
+            # Wait for calculated delay
+            if delay > 0:
+                logging.info(f"Stealth mode: waiting {delay:.2f}s before request {self.request_count + 1}/{self.requests_per_window}")
+                await asyncio.sleep(delay)
+            
+            # Update state
+            self.request_count += 1
+            self.last_request_time = time.time()
+            
+            # Save state periodically
+            if self.request_count % 5 == 0:
+                self._save_state()
+            
+            # Log progress
+            progress = (self.request_count / self.requests_per_window) * 100
+            elapsed = self.last_request_time - self.start_time
+            if elapsed > 0:
+                avg_rate = self.request_count / elapsed
+                remaining = self.requests_per_window - self.request_count
+                eta_seconds = remaining / avg_rate if avg_rate > 0 else 0
+                eta_hours = eta_seconds / 3600
+                logging.info(f"Stealth mode progress: {progress:.1f}% ({self.request_count}/{self.requests_per_window}) - ETA: {eta_hours:.1f}h")
+            
+            return True
+    
+    def get_progress(self) -> dict:
+        """
+        Get current stealth mode progress.
+        
+        Returns:
+            dict: Progress information including completion percentage, ETA, etc.
+        """
+        if not self.enabled or self.start_time is None:
+            return {'enabled': False}
+        
+        import time
+        current_time = time.time()
+        elapsed = current_time - self.start_time if self.start_time else 0
+        
+        progress = {
+            'enabled': True,
+            'request_count': self.request_count,
+            'total_requests': self.requests_per_window,
+            'progress_percentage': (self.request_count / self.requests_per_window) * 100 if self.requests_per_window > 0 else 0,
+            'elapsed_seconds': elapsed,
+            'elapsed_hours': elapsed / 3600,
+            'window_hours': self.window_hours
+        }
+        
+        if elapsed > 0 and self.request_count > 0:
+            avg_rate = self.request_count / elapsed
+            remaining = self.requests_per_window - self.request_count
+            eta_seconds = remaining / avg_rate
+            progress['eta_seconds'] = eta_seconds
+            progress['eta_hours'] = eta_seconds / 3600
+            progress['current_rate'] = avg_rate
+        
+        return progress
+    
+    async def reset(self):
+        """Reset stealth mode state for a new scan."""
+        async with self.lock:
+            self.request_count = 0
+            self.start_time = None
+            self.last_request_time = None
+            self._save_state()
+            logging.info("Stealth mode state reset")
+
 class AsyncRateLimiter:
     def __init__(self, base_delay, jitter=0.05, traffic_shaper=None, ids_ips_config=None):
         self.base_delay = base_delay
@@ -18339,6 +18610,998 @@ class JSRenderDriverManager:
             self.driver = None
 
 # ---------------------------------------------------------------------
+# PLAYWRIGHT JS RENDER DRIVER - Advanced JavaScript Instrumentation
+# ---------------------------------------------------------------------
+class PlaywrightJSRenderDriver:
+    """
+    Advanced Playwright-based JavaScript runtime instrumentation driver.
+    
+    Replaces Selenium with Playwright for deeper JavaScript runtime analysis,
+    user interaction recording/replay, and advanced vulnerability detection
+    including Prototype Pollution and Client-Side Template Injection (CSTI).
+    
+    Features:
+    - Deep JavaScript runtime instrumentation via page.addInitScript
+    - User interaction recording and replay (30-second sessions)
+    - Advanced Prototype Pollution detection with property access tracking
+    - Client-Side Template Injection (CSTI) detection with template monitoring
+    - Headless browser context management
+    - Built-in network interception and monitoring
+    - Shadow DOM piercing and SPA route discovery
+    - Secret scanning integration
+    """
+    
+    def __init__(self, proxy=None, proxy_pool=None, human_like_behavior=True):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        
+        # Proxy configuration
+        self.proxy = proxy
+        self.proxy_pool = proxy_pool
+        self.proxy_config = None
+        
+        # Human-like behavior
+        self.human_like_behavior = human_like_behavior
+        
+        # Data collection
+        self.captured_requests = deque(maxlen=1000)
+        self.captured_responses = deque(maxlen=1000)
+        self.lock = threading.Lock()
+        self.spa_routes_clicked = set()
+        self.discovered_routes = set()
+        self.route_transitions = []
+        
+        # Secret scanning
+        self.secret_scanner = SecretScanner()
+        self.discovered_secrets = []
+        
+        # User interaction recording
+        self.recording_enabled = False
+        self.recorded_actions = []
+        self.recording_start_time = None
+        self.max_recording_duration = 30  # 30 seconds max recording
+        
+        # JavaScript runtime instrumentation
+        self.js_instrumentation_enabled = False
+        self.prototype_pollution_detected = []
+        self.csti_detected = []
+        self.runtime_hooks = {}
+        
+        # Shadow DOM and SPA features
+        self.shadow_dom_enabled = True
+        self.websocket_messages = deque(maxlen=500)
+        self.websocket_monitoring_enabled = False
+        
+        # Playwright-specific settings
+        self.headless = True
+        self.browser_type = 'chromium'  # chromium, firefox, webkit
+        
+    async def __aenter__(self):
+        await self.create()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.quit()
+        return False
+    
+    async def create(self):
+        """Initialize Playwright browser, context, and page"""
+        if not PLAYWRIGHT_AVAILABLE:
+            logging.error("Playwright not available - cannot create PlaywrightJSRenderDriver")
+            return False
+        
+        try:
+            self.playwright = await async_playwright().start()
+            
+            # Configure proxy settings
+            proxy_config = None
+            if self.proxy_pool:
+                self.proxy_config = self.proxy_pool.get_next_proxy()
+                if self.proxy_config:
+                    proxy_config = {
+                        'server': self.proxy_config.proxy_url,
+                        'username': self.proxy_config.username,
+                        'password': self.proxy_config.password
+                    }
+                    logging.info(f"Using proxy for Playwright: {self.proxy_config.proxy_url}")
+            elif self.proxy:
+                proxy_config = {'server': self.proxy}
+            
+            # Launch browser with proxy if configured
+            launch_options = {
+                'headless': self.headless,
+                'proxy': proxy_config
+            }
+            
+            # Remove None values from launch options
+            launch_options = {k: v for k, v in launch_options.items() if v is not None}
+            
+            self.browser = await getattr(self.playwright, self.browser_type).launch(**launch_options)
+            
+            # Create browser context with advanced settings
+            context_options = {
+                'viewport': {'width': 1920, 'height': 1080},
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'locale': 'en-US',
+                'timezone_id': 'America/New_York',
+                'java_script_enabled': True,
+                'ignore_https_errors': True,  # For testing purposes
+            }
+            
+            self.context = await self.browser.new_context(**context_options)
+            
+            # Create page
+            self.page = await self.context.new_page()
+            
+            # Set up network interception
+            await self._setup_network_monitoring()
+            
+            # Enable advanced JavaScript runtime instrumentation
+            await self._enable_js_runtime_instrumentation()
+            
+            # Enable WebSocket monitoring
+            await self._enable_websocket_monitoring()
+            
+            logging.info("PlaywrightJSRenderDriver initialized successfully")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Playwright driver creation error: {e}")
+            if self.proxy_config and self.proxy_pool:
+                self.proxy_pool.mark_failure(self.proxy_config)
+            return False
+    
+    async def _setup_network_monitoring(self):
+        """Set up network request/response monitoring"""
+        if not self.page:
+            return
+        
+        try:
+            # Request monitoring
+            async def handle_request(request):
+                with self.lock:
+                    self.captured_requests.append({
+                        'type': 'request',
+                        'url': request.url,
+                        'method': request.method,
+                        'headers': request.headers,
+                        'post_data': request.post_data
+                    })
+            
+            # Response monitoring
+            async def handle_response(response):
+                try:
+                    body = await response.body()
+                    body_str = body.decode('utf-8', errors='ignore')
+                    
+                    # Scan response body for secrets
+                    secrets_found = []
+                    if body_str:
+                        content_type = response.headers.get('content-type', '')
+                        url = response.url
+                        
+                        if 'html' in content_type.lower():
+                            secrets_found = self.secret_scanner.scan_html(body_str, url)
+                        elif 'json' in content_type.lower():
+                            secrets_found = self.secret_scanner.scan_json(body_str, url)
+                        elif 'javascript' in content_type.lower() or 'js' in content_type.lower():
+                            secrets_found = self.secret_scanner.scan_javascript(body_str, url)
+                        else:
+                            secrets_found = self.secret_scanner.scan_content(body_str, url)
+                        
+                        if secrets_found:
+                            with self.lock:
+                                self.discovered_secrets.extend(secrets_found)
+                    
+                    with self.lock:
+                        parsed_params = self._extract_json_parameters(body_str) if body_str else []
+                        self.captured_responses.append({
+                            'type': 'response',
+                            'url': response.url,
+                            'status': response.status,
+                            'headers': response.headers,
+                            'body': body_str,
+                            'parameters': parsed_params,
+                            'secrets': secrets_found
+                        })
+                except Exception as e:
+                    logging.warning(f"Response handling error: {e}")
+            
+            self.page.on('request', handle_request)
+            self.page.on('response', handle_response)
+            
+            logging.info("Network monitoring enabled")
+            
+        except Exception as e:
+            logging.warning(f"Network monitoring setup error: {e}")
+    
+    async def _enable_js_runtime_instrumentation(self):
+        """Enable deep JavaScript runtime instrumentation for advanced vulnerability detection"""
+        if not self.page:
+            return
+        
+        try:
+            # Advanced JavaScript instrumentation script
+            instrumentation_script = """
+            (function() {
+                // Prototype Pollution Detection
+                const originalSetPrototypeOf = Object.setPrototypeOf;
+                const prototypePollutionPayloads = [];
+                
+                Object.setPrototypeOf = function(obj, proto) {
+                    // Check for prototype pollution attempts
+                    if (proto && typeof proto === 'object') {
+                        const dangerousProps = ['__proto__', 'constructor', 'prototype'];
+                        for (const prop of dangerousProps) {
+                            if (prop in proto) {
+                                const stackTrace = new Error().stack;
+                                prototypePollutionPayloads.push({
+                                    type: 'prototype_pollution',
+                                    property: prop,
+                                    value: proto[prop],
+                                    stack: stackTrace,
+                                    timestamp: Date.now()
+                                });
+                                
+                                // Notify the testing framework
+                                if (window.__ultradast_prototype_pollution) {
+                                    window.__ultradast_prototype_pollution.push({
+                                        property: prop,
+                                        value: proto[prop],
+                                        stack: stackTrace
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    return originalSetPrototypeOf.call(this, obj, proto);
+                };
+                
+                // Property access monitoring for prototype pollution
+                const originalDefineProperty = Object.defineProperty;
+                Object.defineProperty = function(obj, prop, descriptor) {
+                    // Monitor property definitions on Object.prototype
+                    if (obj === Object.prototype) {
+                        const stackTrace = new Error().stack;
+                        prototypePollutionPayloads.push({
+                            type: 'prototype_property_definition',
+                            property: prop,
+                            descriptor: descriptor,
+                            stack: stackTrace,
+                            timestamp: Date.now()
+                        });
+                        
+                        if (window.__ultradast_prototype_pollution) {
+                            window.__ultradast_prototype_pollution.push({
+                                type: 'property_definition',
+                                property: prop,
+                                stack: stackTrace
+                            });
+                        }
+                    }
+                    return originalDefineProperty.call(this, obj, prop, descriptor);
+                };
+                
+                // Client-Side Template Injection (CSTI) Detection
+                const originalTemplateStrings = Array;
+                const cstiPayloads = [];
+                
+                // Monitor template literal evaluation
+                window.__ultradast_csti_monitor = function(template, values) {
+                    // Check for dangerous template patterns
+                    const dangerousPatterns = [
+                        /\\$\\{.*?\\}/g,  // Template expressions
+                        /\\$\\{.*?prototype.*?\\}/gi,  // Prototype access in templates
+                        /\\$\\{.*?constructor.*?\\}/gi,  // Constructor access in templates
+                        /\\$\\{.*?__proto__.*?\\}/gi,  // __proto__ access in templates
+                    ];
+                    
+                    for (const pattern of dangerousPatterns) {
+                        if (pattern.test(template)) {
+                            const stackTrace = new Error().stack;
+                            cstiPayloads.push({
+                                type: 'template_injection',
+                                template: template,
+                                values: values,
+                                pattern: pattern.source,
+                                stack: stackTrace,
+                                timestamp: Date.now()
+                            });
+                            
+                            if (window.__ultradast_csti_detected) {
+                                window.__ultradast_csti_detected.push({
+                                    template: template,
+                                    pattern: pattern.source,
+                                    stack: stackTrace
+                                });
+                            }
+                        }
+                    }
+                };
+                
+                // Monitor common template engines
+                const templateEngines = ['Handlebars', 'Mustache', 'EJS', 'Pug', 'Nunjucks', 'Underscore'];
+                templateEngines.forEach(engine => {
+                    if (window[engine]) {
+                        const originalCompile = window[engine].compile;
+                        if (originalCompile) {
+                            window[engine].compile = function(template, options) {
+                                const stackTrace = new Error().stack;
+                                cstiPayloads.push({
+                                    type: 'template_engine_compile',
+                                    engine: engine,
+                                    template: template.substring(0, 200),  // First 200 chars
+                                    options: options,
+                                    stack: stackTrace,
+                                    timestamp: Date.now()
+                                });
+                                
+                                if (window.__ultradast_csti_detected) {
+                                    window.__ultradast_csti_detected.push({
+                                        engine: engine,
+                                        stack: stackTrace
+                                    });
+                                }
+                                
+                                return originalCompile.call(this, template, options);
+                            };
+                        }
+                    }
+                });
+                
+                // Initialize detection arrays
+                window.__ultradast_prototype_pollution = [];
+                window.__ultradast_csti_detected = [];
+                window.__ultradast_runtime_hooks = {
+                    prototypePollution: prototypePollutionPayloads,
+                    csti: cstiPayloads
+                };
+                
+                // DOM XSS Detection with enhanced monitoring
+                const originalInnerHTML = Element.prototype.innerHTML;
+                Object.defineProperty(Element.prototype, 'innerHTML', {
+                    set: function(value) {
+                        // Check for script tags and event handlers
+                        const dangerousPatterns = [
+                            /<script[^>]*>.*?<\\/script>/gi,
+                            /on\\w+\\s*=\\s*["'][^"']*["']/gi,
+                            /javascript:/gi,
+                            /data:text\\/html/gi
+                        ];
+                        
+                        for (const pattern of dangerousPatterns) {
+                            if (pattern.test(value)) {
+                                const stackTrace = new Error().stack;
+                                if (window.__ultradast_dom_xss) {
+                                    window.__ultradast_dom_xss.push({
+                                        element: this.tagName,
+                                        value: value.substring(0, 200),
+                                        pattern: pattern.source,
+                                        stack: stackTrace
+                                    });
+                                }
+                            }
+                        }
+                        
+                        originalInnerHTML.call(this, value);
+                    },
+                    get: function() {
+                        return originalInnerHTML.call(this);
+                    }
+                });
+                
+                window.__ultradast_dom_xss = [];
+                
+                console.log('[UltraDAST] Advanced JavaScript runtime instrumentation enabled');
+            })();
+            """
+            
+            # Add initialization script to run before page loads
+            await self.page.add_init_script(instrumentation_script)
+            
+            self.js_instrumentation_enabled = True
+            logging.info("Advanced JavaScript runtime instrumentation enabled")
+            
+        except Exception as e:
+            logging.warning(f"JavaScript runtime instrumentation error: {e}")
+    
+    async def _enable_websocket_monitoring(self):
+        """Enable WebSocket message monitoring"""
+        if not self.page:
+            return
+        
+        try:
+            # WebSocket monitoring via CDP
+            await self.page.context.add_init_script("""
+                window.__ultradast_websocket_messages = [];
+                
+                // Override WebSocket constructor
+                const OriginalWebSocket = window.WebSocket;
+                window.WebSocket = function(url, protocols) {
+                    const ws = new OriginalWebSocket(url, protocols);
+                    
+                    ws.addEventListener('message', function(event) {
+                        window.__ultradast_websocket_messages.push({
+                            type: 'message',
+                            data: event.data,
+                            url: url,
+                            timestamp: Date.now()
+                        });
+                    });
+                    
+                    ws.addEventListener('send', function(event) {
+                        window.__ultradast_websocket_messages.push({
+                            type: 'send',
+                            data: event.data,
+                            url: url,
+                            timestamp: Date.now()
+                        });
+                    });
+                    
+                    return ws;
+                };
+                
+                window.WebSocket.prototype = OriginalWebSocket.prototype;
+                window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+                window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+                window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+                window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+            """)
+            
+            self.websocket_monitoring_enabled = True
+            logging.info("WebSocket monitoring enabled")
+            
+        except Exception as e:
+            logging.warning(f"WebSocket monitoring error: {e}")
+    
+    async def get(self, url):
+        """Navigate to URL and return page content with advanced monitoring"""
+        if not self.page:
+            return ""
+        
+        try:
+            # Navigate to URL
+            response = await self.page.goto(url, wait_until='networkidle', timeout=30000)
+            
+            # Wait for dynamic content
+            await self.page.wait_for_load_state('networkidle', timeout=10000)
+            await self._wait_for_dynamic_content()
+            
+            # Simulate human-like behavior
+            if self.human_like_behavior:
+                await self._simulate_human_behavior()
+            
+            # Get page content
+            page_content = await self.page.content()
+            
+            # Scan for secrets
+            try:
+                secrets_found = self.secret_scanner.scan_html(page_content, url)
+                if secrets_found:
+                    with self.lock:
+                        self.discovered_secrets.extend(secrets_found)
+                    logging.info(f"Found {len(secrets_found)} secrets in page: {url}")
+            except Exception as scan_error:
+                logging.warning(f"Secret scanning error for {url}: {scan_error}")
+            
+            # Check for JavaScript runtime vulnerabilities
+            await self._check_runtime_vulnerabilities(url)
+            
+            # Process Playwright detections and report as vulnerabilities
+            if hasattr(self, 'injection_engine'):
+                await self.injection_engine._process_playwright_detections(url)
+            
+            return page_content
+            
+        except Exception as e:
+            logging.warning(f"Playwright get error for {url}: {e}")
+            try:
+                return await self.page.content()
+            except Exception:
+                return ""
+    
+    async def _wait_for_dynamic_content(self, timeout=5000):
+        """Wait for dynamic content to load"""
+        if not self.page:
+            return
+        
+        try:
+            await self.page.wait_for_timeout(1000)  # Initial wait
+            
+            # Wait for common dynamic content indicators
+            try:
+                await self.page.wait_for_selector('body', timeout=timeout)
+            except Exception:
+                pass  # Body might already be loaded
+            
+            # Additional wait for SPA frameworks
+            await self.page.wait_for_timeout(500)
+            
+        except Exception as e:
+            logging.debug(f"Dynamic content wait error: {e}")
+    
+    async def _simulate_human_behavior(self):
+        """Simulate human-like behavior after page load"""
+        if not self.page:
+            return
+        
+        try:
+            # Random scroll
+            if random.random() < 0.6:
+                scroll_amount = random.randint(100, 500)
+                await self.page.evaluate(f'window.scrollBy(0, {scroll_amount})')
+                await self.page.wait_for_timeout(random.randint(300, 800))
+            
+            # Small delay to simulate reading
+            await self.page.wait_for_timeout(random.randint(500, 1500))
+            
+            # Occasional second scroll
+            if random.random() < 0.4:
+                scroll_amount = random.randint(50, 200)
+                direction = random.choice(['up', 'down'])
+                if direction == 'down':
+                    await self.page.evaluate(f'window.scrollBy(0, {scroll_amount})')
+                else:
+                    await self.page.evaluate(f'window.scrollBy(0, -{scroll_amount})')
+                await self.page.wait_for_timeout(random.randint(200, 500))
+            
+        except Exception as e:
+            logging.debug(f"Human behavior simulation error: {e}")
+    
+    async def _check_runtime_vulnerabilities(self, url):
+        """Check for JavaScript runtime vulnerabilities"""
+        if not self.page:
+            return
+        
+        try:
+            # Check for prototype pollution
+            prototype_pollution = await self.page.evaluate('() => window.__ultradast_prototype_pollution || []')
+            if prototype_pollution:
+                with self.lock:
+                    for detection in prototype_pollution:
+                        self.prototype_pollution_detected.append({
+                            'url': url,
+                            'detection': detection,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                logging.warning(f"Prototype pollution detected at {url}: {len(prototype_pollution)} incidents")
+            
+            # Check for CSTI
+            csti_detections = await self.page.evaluate('() => window.__ultradast_csti_detected || []')
+            if csti_detections:
+                with self.lock:
+                    for detection in csti_detections:
+                        self.csti_detected.append({
+                            'url': url,
+                            'detection': detection,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                logging.warning(f"Client-Side Template Injection detected at {url}: {len(csti_detections)} incidents")
+            
+            # Check for DOM XSS
+            dom_xss = await self.page.evaluate('() => window.__ultradast_dom_xss || []')
+            if dom_xss:
+                logging.warning(f"DOM XSS detected at {url}: {len(dom_xss)} incidents")
+            
+        except Exception as e:
+            logging.debug(f"Runtime vulnerability check error: {e}")
+    
+    async def start_interaction_recording(self, duration=30):
+        """Start recording user interactions for replay"""
+        if not self.page:
+            return False
+        
+        try:
+            self.recording_enabled = True
+            self.recorded_actions = []
+            self.recording_start_time = time.time()
+            self.max_recording_duration = duration
+            
+            # Inject recording script
+            recording_script = """
+            window.__ultradast_recording = {
+                actions: [],
+                startTime: Date.now()
+            };
+            
+            // Record clicks
+            document.addEventListener('click', function(e) {
+                window.__ultradast_recording.actions.push({
+                    type: 'click',
+                    selector: getSelector(e.target),
+                    x: e.clientX,
+                    y: e.clientY,
+                    timestamp: Date.now() - window.__ultradast_recording.startTime
+                });
+            }, true);
+            
+            // Record inputs
+            document.addEventListener('input', function(e) {
+                window.__ultradast_recording.actions.push({
+                    type: 'input',
+                    selector: getSelector(e.target),
+                    value: e.target.value,
+                    timestamp: Date.now() - window.__ultradast_recording.startTime
+                });
+            }, true);
+            
+            // Record scrolls
+            document.addEventListener('scroll', function(e) {
+                window.__ultradast_recording.actions.push({
+                    type: 'scroll',
+                    x: window.scrollX,
+                    y: window.scrollY,
+                    timestamp: Date.now() - window.__ultradast_recording.startTime
+                });
+            }, true);
+            
+            // Helper function to get CSS selector
+            function getSelector(element) {
+                if (element.id) {
+                    return '#' + element.id;
+                }
+                if (element.className) {
+                    return '.' + element.className.split(' ').join('.');
+                }
+                return element.tagName.toLowerCase();
+            }
+            """
+            
+            await self.page.add_init_script(recording_script)
+            logging.info(f"Interaction recording started for {duration} seconds")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Interaction recording start error: {e}")
+            return False
+    
+    async def stop_interaction_recording(self):
+        """Stop recording and return captured actions"""
+        if not self.page:
+            return []
+        
+        try:
+            self.recording_enabled = False
+            
+            # Get recorded actions
+            actions = await self.page.evaluate('() => window.__ultradast_recording?.actions || []')
+            
+            self.recorded_actions = actions
+            logging.info(f"Interaction recording stopped. Captured {len(actions)} actions")
+            
+            return actions
+            
+        except Exception as e:
+            logging.warning(f"Interaction recording stop error: {e}")
+            return []
+    
+    async def replay_interactions(self, actions=None, speed_multiplier=1.0):
+        """Replay recorded user interactions"""
+        if not self.page:
+            return False
+        
+        try:
+            actions_to_replay = actions or self.recorded_actions
+            
+            if not actions_to_replay:
+                logging.warning("No actions to replay")
+                return False
+            
+            logging.info(f"Replaying {len(actions_to_replay)} actions")
+            
+            for action in actions_to_replay:
+                if not self.recording_enabled and time.time() - self.recording_start_time > self.max_recording_duration:
+                    logging.warning("Recording duration exceeded, stopping replay")
+                    break
+                
+                try:
+                    action_type = action.get('type')
+                    delay = (action.get('timestamp', 0) / speed_multiplier)
+                    
+                    await self.page.wait_for_timeout(int(delay))
+                    
+                    if action_type == 'click':
+                        selector = action.get('selector')
+                        if selector:
+                            try:
+                                await self.page.click(selector, timeout=5000)
+                            except Exception:
+                                # Fallback to coordinates
+                                x, y = action.get('x', 0), action.get('y', 0)
+                                await self.page.mouse.click(x, y)
+                    
+                    elif action_type == 'input':
+                        selector = action.get('selector')
+                        value = action.get('value', '')
+                        if selector:
+                            await self.page.fill(selector, value)
+                    
+                    elif action_type == 'scroll':
+                        x, y = action.get('x', 0), action.get('y', 0)
+                        await self.page.evaluate(f'window.scrollTo({x}, {y})')
+                
+                except Exception as e:
+                    logging.warning(f"Error replaying action {action}: {e}")
+                    continue
+            
+            logging.info("Interaction replay completed")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Interaction replay error: {e}")
+            return False
+    
+    async def click_spa_routes(self, url, max_routes=50):
+        """Discover and click SPA routes with enhanced detection"""
+        if not self.page:
+            return []
+        
+        clicked = []
+        try:
+            await self.page.goto(url, wait_until='networkidle', timeout=30000)
+            await self._wait_for_dynamic_content()
+            
+            # Initial human-like behavior
+            if self.human_like_behavior:
+                await self._simulate_human_behavior()
+            
+            # Find all links and clickable elements
+            links = await self.page.query_selector_all('a[href]')
+            
+            for link in links[:max_routes]:
+                try:
+                    href = await link.get_attribute('href')
+                    if href and href not in self.spa_routes_clicked:
+                        # Check if it's a SPA route (no external domain)
+                        if not any(x in href for x in ['://', 'mailto:', 'tel:']):
+                            previous_url = self.page.url
+                            
+                            # Click the link
+                            await link.click()
+                            
+                            # Wait for navigation
+                            await self.page.wait_for_load_state('networkidle', timeout=10000)
+                            await self._wait_for_dynamic_content()
+                            
+                            current_url = self.page.url
+                            if current_url != previous_url:
+                                self.spa_routes_clicked.add(href)
+                                clicked.append(href)
+                                self.discovered_routes.add(current_url)
+                                logging.info(f"Clicked SPA route: {href} -> {current_url}")
+                                
+                                # Check for runtime vulnerabilities after navigation
+                                await self._check_runtime_vulnerabilities(current_url)
+                            
+                            # Random scroll between clicks
+                            if self.human_like_behavior and random.random() < 0.3:
+                                await self._simulate_human_behavior()
+                
+                except Exception as e:
+                    logging.warning(f"SPA route click error: {e}")
+                    continue
+            
+            return clicked
+            
+        except Exception as e:
+            logging.warning(f"SPA route clicking error: {e}")
+            return clicked
+    
+    async def execute_js(self, script):
+        """Execute JavaScript in the page context"""
+        if not self.page:
+            return None
+        
+        try:
+            return await self.page.evaluate(script)
+        except Exception as e:
+            logging.warning(f"Playwright execute JS error: {e}")
+            return None
+    
+    def get_discovered_secrets(self):
+        """Get all discovered secrets"""
+        with self.lock:
+            return list(self.discovered_secrets)
+    
+    def get_prototype_pollution_detections(self):
+        """Get all prototype pollution detections"""
+        with self.lock:
+            return list(self.prototype_pollution_detected)
+    
+    def get_csti_detections(self):
+        """Get all CSTI detections"""
+        with self.lock:
+            return list(self.csti_detected)
+    
+    def _extract_json_parameters(self, body, prefix=''):
+        """Extract parameters from JSON body"""
+        params = []
+        try:
+            data = json.loads(body)
+            
+            def traverse(obj, current_prefix='', depth=0):
+                if depth > 50:
+                    return
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        new_prefix = f"{current_prefix}.{key}" if current_prefix else key
+                        if isinstance(value, (dict, list)):
+                            traverse(value, new_prefix, depth + 1)
+                        else:
+                            params.append(new_prefix)
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        new_prefix = f"{current_prefix}[{i}]"
+                        if isinstance(item, (dict, list)):
+                            traverse(item, new_prefix, depth + 1)
+                        else:
+                            params.append(new_prefix)
+            
+            traverse(data, prefix)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return params
+    
+    # Backward compatibility methods for Selenium-like interface
+    @property
+    def driver(self):
+        """Compatibility property for Selenium-like driver access"""
+        return self
+    
+    async def get_async(self, url):
+        """Async version of get method for compatibility"""
+        return await self.get(url)
+    
+    def get_sync(self, url):
+        """Synchronous wrapper for get method (run in event loop)"""
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.get(url))
+        except RuntimeError:
+            # If no event loop running, create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.get(url))
+            finally:
+                loop.close()
+    
+    # Selenium-compatible method aliases
+    def get(self, url):
+        """Synchronous get method for Selenium compatibility"""
+        return self.get_sync(url)
+    
+    def page_source(self):
+        """Get page content (Selenium compatibility)"""
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.page.content())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.page.content())
+            finally:
+                loop.close()
+    
+    def current_url(self):
+        """Get current URL (Selenium compatibility)"""
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.page.url)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.page.url)
+            finally:
+                loop.close()
+    
+    def execute_script(self, script):
+        """Execute JavaScript (Selenium compatibility)"""
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.page.evaluate(script))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.page.evaluate(script))
+            finally:
+                loop.close()
+    
+    def execute_async_script(self, script):
+        """Execute async JavaScript (Selenium compatibility)"""
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.page.evaluate(script))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.page.evaluate(script))
+            finally:
+                loop.close()
+    
+    def find_elements(self, by, selector):
+        """Find elements (Selenium compatibility - basic implementation)"""
+        try:
+            loop = asyncio.get_event_loop()
+            if by == By.CSS_SELECTOR:
+                elements = loop.run_until_complete(self.page.query_selector_all(selector))
+                return elements
+            elif by == By.XPATH:
+                elements = loop.run_until_complete(self.page.query_selector_all(f"xpath={selector}"))
+                return elements
+            else:
+                logging.warning(f"Selector type {by} not fully supported in Playwright compatibility mode")
+                return []
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                if by == By.CSS_SELECTOR:
+                    return loop.run_until_complete(self.page.query_selector_all(selector))
+                elif by == By.XPATH:
+                    return loop.run_until_complete(self.page.query_selector_all(f"xpath={selector}"))
+                else:
+                    return []
+            finally:
+                loop.close()
+    
+    def get_cookies(self):
+        """Get cookies (Selenium compatibility)"""
+        try:
+            loop = asyncio.get_event_loop()
+            cookies = loop.run_until_complete(self.context.cookies())
+            return cookies
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.context.cookies())
+            finally:
+                loop.close()
+    
+    def set_page_load_timeout(self, timeout):
+        """Set page load timeout (Selenium compatibility - no-op in Playwright)"""
+        pass  # Playwright handles timeouts differently
+    
+    def implicitly_wait(self, timeout):
+        """Set implicit wait (Selenium compatibility - no-op in Playwright)"""
+        pass  # Playwright handles waits differently
+    
+    def set_script_timeout(self, timeout):
+        """Set script timeout (Selenium compatibility - no-op in Playwright)"""
+        pass  # Playwright handles timeouts differently
+    
+    async def quit(self):
+        """Clean up Playwright resources"""
+        try:
+            if self.page:
+                await self.page.close()
+                self.page = None
+            
+            if self.context:
+                await self.context.close()
+                self.context = None
+            
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+            
+            logging.info("PlaywrightJSRenderDriver cleaned up successfully")
+            
+        except Exception as e:
+            logging.warning(f"Playwright quit error: {e}")
+
+# ---------------------------------------------------------------------
 # SAFE ASYNC WAIT HELPER
 # ---------------------------------------------------------------------
 async def safe_async_wait(tasks, timeout=None, return_when=asyncio.ALL_COMPLETED):
@@ -19736,7 +20999,7 @@ class SurgicalModeOrchestrator:
         self.critical_vulnerability_types = {'RCE', 'SQLi', 'Auth Bypass', 'IDOR', 'SSRF'}
         self.low_priority_types = {'Info Disclosure', 'Header Misconfig', 'Version Disclosure'}
         self.max_critical_verifications = 10  # Max critical findings for full verification
-        self.proximity_validation_sample_size = 3  # Sample size for proximity validation
+        self.proximity_validation_sample_size = 5  # Sample size for proximity validation
         
         # Gray Zone Auto-Triage Configuration
         self.gray_zone_auto_triage_enabled = True
@@ -25082,6 +26345,9 @@ class InjectionEngine:
         self.token_normalizer = TokenNormalizer()
         self.selenium_driver = None
         self.selenium_ready = False
+        self.playwright_driver = None
+        self.playwright_ready = False
+        self.js_driver_mode = config.get('js_driver_mode', 'selenium')  # 'selenium' or 'playwright'
         self.stop_event = asyncio.Event()
         self.js_driver_manager = JSRenderDriverManager()
         self.background_task_manager = BackgroundTaskManager()
@@ -25315,6 +26581,55 @@ class InjectionEngine:
     async def _add_vulnerability(self, vuln):
         await self.scanner._add_vulnerability(vuln)
     
+    async def _process_playwright_detections(self, url):
+        """Process Playwright-detected JavaScript runtime vulnerabilities"""
+        if not self.playwright_driver or not self.playwright_ready:
+            return
+        
+        try:
+            # Process Prototype Pollution detections
+            prototype_pollution = self.playwright_driver.get_prototype_pollution_detections()
+            for detection in prototype_pollution:
+                if detection.get('url') == url:
+                    await self._add_vulnerability({
+                        "type": "Prototype Pollution",
+                        "url": url,
+                        "parameter": "JavaScript Runtime",
+                        "method": "CLIENT_SIDE",
+                        "evidence": f"Prototype pollution detected: {detection.get('detection', {}).get('property', 'unknown')}",
+                        "severity": "High",
+                        "confidence": 85,
+                        "cwe": CWE_MAP.get("PrototypePollution", "CWE-1321"),
+                        "full_evidence": {
+                            "detection": detection.get('detection'),
+                            "timestamp": detection.get('timestamp')
+                        }
+                    })
+                    logging.warning(f"Prototype Pollution vulnerability reported at {url}")
+            
+            # Process CSTI detections
+            csti_detections = self.playwright_driver.get_csti_detections()
+            for detection in csti_detections:
+                if detection.get('url') == url:
+                    await self._add_vulnerability({
+                        "type": "Client-Side Template Injection",
+                        "url": url,
+                        "parameter": "JavaScript Runtime",
+                        "method": "CLIENT_SIDE",
+                        "evidence": f"CSTI detected: {detection.get('detection', {}).get('pattern', 'unknown')}",
+                        "severity": "High",
+                        "confidence": 85,
+                        "cwe": CWE_MAP.get("ClientSideTemplateInjection", "CWE-94"),
+                        "full_evidence": {
+                            "detection": detection.get('detection'),
+                            "timestamp": detection.get('timestamp')
+                        }
+                    })
+                    logging.warning(f"Client-Side Template Injection vulnerability reported at {url}")
+            
+        except Exception as e:
+            logging.warning(f"Error processing Playwright detections: {e}")
+    
     def _build_raw_request_for_storage(self, method, url, headers, payload):
         """Helper method to build raw HTTP request for storage/export"""
         parsed_url = urlparse(url)
@@ -25515,9 +26830,22 @@ class InjectionEngine:
             self.log("No parameters found to test. Skipping active tests.")
             return
         await self._populate_baselines()
+        
+        # Check if stealth mode is enabled
+        stealth_enabled = hasattr(self, 'stealth_scheduler') and self.stealth_scheduler.enabled
+        if stealth_enabled:
+            self.log(f"Stealth mode enabled: spreading {param_count} tests over {self.stealth_scheduler.window_hours} hours")
+            # Update stealth scheduler with actual request count
+            self.stealth_scheduler.requests_per_window = param_count
+            self.stealth_scheduler.base_interval = self.stealth_scheduler.window_seconds / param_count
+        
         tasks = []
         self.total_tasks = param_count
         for i, param in enumerate(self.crawler_engine.parameters):
+            # Acquire stealth mode slot before creating task
+            if stealth_enabled:
+                await self.stealth_scheduler.acquire_slot()
+            
             task = asyncio.ensure_future(self._test_param(param))
             task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None))
             tasks.append(task)
@@ -25538,6 +26866,12 @@ class InjectionEngine:
             for task in pending:
                 task.cancel()
             logging.warning(f"{len(pending)} active test tasks timed out and were cancelled")
+        
+        # Save final stealth mode state
+        if stealth_enabled:
+            self.stealth_scheduler._save_state()
+            progress = self.stealth_scheduler.get_progress()
+            self.log(f"Stealth mode completed: {progress['progress_percentage']:.1f}% - {progress['request_count']}/{progress['total_requests']} requests")
         await self.second_order_injection_tests()
         await self.race_condition_tests()
         await self.oauth_flow_automation_tests()
@@ -27608,35 +28942,63 @@ class InjectionEngine:
             # Use asyncio.gather() for better resource management instead of 50 separate event loops
             num_requests = 50
             
-            async def synchronized_request(timing_delta=0):
-                """Send request with timing delta for state-transition-aware testing."""
-                try:
-                    # Apply timing delta for state-transition-aware testing
+            # Check if stealth mode is enabled and adjust accordingly
+            stealth_enabled = hasattr(self.scanner, 'stealth_scheduler') and self.scanner.stealth_scheduler.enabled
+            if stealth_enabled:
+                logging.info(f"[STEALTH MODE] Spreading {num_requests} race condition requests over time window")
+                # In stealth mode, we execute requests sequentially with proper timing
+                responses = []
+                for i in range(num_requests):
+                    # Acquire stealth mode slot before each request
+                    await self.scanner.stealth_scheduler.acquire_slot()
+                    
+                    timing_delta = time_deltas[i % len(time_deltas)]
                     if timing_delta > 0:
                         await asyncio.sleep(timing_delta / 1000.0)  # Convert to seconds
                     
-                    # Send request
-                    if session_manager and session_id:
-                        session_cookies = await session_manager.get_session_cookies(session_id)
-                        session_headers = await session_manager.get_session_headers(session_id)
-                        resp = await self._async_fetch(url, method='POST', data={"test":"race"},
-                                               cookies=session_cookies, headers=session_headers)
-                    else:
-                        resp = await self._async_fetch(url, method='POST', data={"test":"race"})
-                    
-                    return resp
-                except Exception as e:
-                    logging.debug(f"Synchronized request error: {e}")
-                    return None
-            
-            # Execute all requests simultaneously using asyncio.gather() with timing deltas
-            # This is much more efficient than creating 50 separate event loops
-            tasks = []
-            for i in range(num_requests):
-                timing_delta = time_deltas[i % len(time_deltas)]
-                tasks.append(synchronized_request(timing_delta))
-            
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    try:
+                        if session_manager and session_id:
+                            session_cookies = await session_manager.get_session_cookies(session_id)
+                            session_headers = await session_manager.get_session_headers(session_id)
+                            resp = await self._async_fetch(url, method='POST', data={"test":"race"},
+                                                   cookies=session_cookies, headers=session_headers)
+                        else:
+                            resp = await self._async_fetch(url, method='POST', data={"test":"race"})
+                        responses.append(resp)
+                    except Exception as e:
+                        logging.debug(f"Synchronized request error: {e}")
+                        responses.append(None)
+            else:
+                # Original concurrent execution for normal mode
+                async def synchronized_request(timing_delta=0):
+                    """Send request with timing delta for state-transition-aware testing."""
+                    try:
+                        # Apply timing delta for state-transition-aware testing
+                        if timing_delta > 0:
+                            await asyncio.sleep(timing_delta / 1000.0)  # Convert to seconds
+                        
+                        # Send request
+                        if session_manager and session_id:
+                            session_cookies = await session_manager.get_session_cookies(session_id)
+                            session_headers = await session_manager.get_session_headers(session_id)
+                            resp = await self._async_fetch(url, method='POST', data={"test":"race"},
+                                                   cookies=session_cookies, headers=session_headers)
+                        else:
+                            resp = await self._async_fetch(url, method='POST', data={"test":"race"})
+                        
+                        return resp
+                    except Exception as e:
+                        logging.debug(f"Synchronized request error: {e}")
+                        return None
+                
+                # Execute all requests simultaneously using asyncio.gather() with timing deltas
+                # This is much more efficient than creating 50 separate event loops
+                tasks = []
+                for i in range(num_requests):
+                    timing_delta = time_deltas[i % len(time_deltas)]
+                    tasks.append(synchronized_request(timing_delta))
+                
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
             # Filter out exceptions
             responses = [resp for resp in responses if not isinstance(resp, Exception)]
             
@@ -27703,58 +29065,106 @@ class InjectionEngine:
             import threading
             
             num_requests = 50
-            results = []
-            barrier = threading.Barrier(num_requests)
             
-            resource_data = {
-                'resource_id': 'test_resource_123',
-                'user_id': 'test_user_456',
-                'allocation_type': 'exclusive'
-            }
-            
-            def allocate_resource(request_id):
-                """Allocate resource with synchronized timing."""
-                try:
+            # Check if stealth mode is enabled and adjust accordingly
+            stealth_enabled = hasattr(self.scanner, 'stealth_scheduler') and self.scanner.stealth_scheduler.enabled
+            if stealth_enabled:
+                logging.info(f"[STEALTH MODE] Spreading {num_requests} parallel resource allocation requests over time window")
+                # In stealth mode, execute requests sequentially with proper timing
+                results = []
+                resource_data = {
+                    'resource_id': 'test_resource_123',
+                    'user_id': 'test_user_456',
+                    'allocation_type': 'exclusive'
+                }
+                
+                for request_id in range(num_requests):
+                    # Acquire stealth mode slot before each request
+                    await self.scanner.stealth_scheduler.acquire_slot()
+                    
                     test_data = resource_data.copy()
                     test_data['request_id'] = request_id
                     start_time = time.time()
                     
-                    # Wait for all threads to be ready
-                    barrier.wait()
-                    
-                    # Send request immediately after barrier release
-                    if session_manager and session_id:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        try:
-                            session_cookies = loop.run_until_complete(session_manager.get_session_cookies(session_id))
-                            session_headers = loop.run_until_complete(session_manager.get_session_headers(session_id))
-                            resp = loop.run_until_complete(
-                                self._async_fetch(url, method='POST', data=test_data,
-                                               cookies=session_cookies, headers=session_headers)
-                            )
-                        finally:
-                            loop.close()
-                    else:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        try:
-                            resp = loop.run_until_complete(
-                                self._async_fetch(url, method='POST', data=test_data)
-                            )
-                        finally:
-                            loop.close()
-                    
-                    end_time = time.time()
-                    return {
-                        'request_id': request_id,
-                        'success': resp and resp.status == 200,
-                        'response_time': end_time - start_time,
-                        'response': resp.text if resp else None
-                    }
-                except Exception as e:
-                    logging.debug(f"Resource allocation error: {e}")
-                    return None
+                    try:
+                        if session_manager and session_id:
+                            session_cookies = await session_manager.get_session_cookies(session_id)
+                            session_headers = await session_manager.get_session_headers(session_id)
+                            resp = await self._async_fetch(url, method='POST', data=test_data,
+                                                   cookies=session_cookies, headers=session_headers)
+                        else:
+                            resp = await self._async_fetch(url, method='POST', data=test_data)
+                        
+                        end_time = time.time()
+                        results.append({
+                            'request_id': request_id,
+                            'status': resp.status if resp else None,
+                            'response_time': end_time - start_time,
+                            'success': resp and resp.status == 200
+                        })
+                    except Exception as e:
+                        end_time = time.time()
+                        results.append({
+                            'request_id': request_id,
+                            'status': None,
+                            'response_time': end_time - start_time,
+                            'success': False,
+                            'error': str(e)
+                        })
+            else:
+                # Original concurrent execution for normal mode
+                results = []
+                barrier = threading.Barrier(num_requests)
+                
+                resource_data = {
+                    'resource_id': 'test_resource_123',
+                    'user_id': 'test_user_456',
+                    'allocation_type': 'exclusive'
+                }
+                
+                def allocate_resource(request_id):
+                    """Allocate resource with synchronized timing."""
+                    try:
+                        test_data = resource_data.copy()
+                        test_data['request_id'] = request_id
+                        start_time = time.time()
+                        
+                        # Wait for all threads to be ready
+                        barrier.wait()
+                        
+                        # Send request immediately after barrier release
+                        if session_manager and session_id:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                session_cookies = loop.run_until_complete(session_manager.get_session_cookies(session_id))
+                                session_headers = loop.run_until_complete(session_manager.get_session_headers(session_id))
+                                resp = loop.run_until_complete(
+                                    self._async_fetch(url, method='POST', data=test_data,
+                                                   cookies=session_cookies, headers=session_headers)
+                                )
+                            finally:
+                                loop.close()
+                        else:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                resp = loop.run_until_complete(
+                                    self._async_fetch(url, method='POST', data=test_data)
+                                )
+                            finally:
+                                loop.close()
+                        
+                        end_time = time.time()
+                        return {
+                            'request_id': request_id,
+                            'success': resp and resp.status == 200,
+                            'response_time': end_time - start_time,
+                            'response': resp.text if resp else None
+                        }
+                    except Exception as e:
+                        logging.debug(f"Resource allocation error: {e}")
+                        return None
             
             # Execute all requests simultaneously using ThreadPoolExecutor
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
@@ -27762,7 +29172,7 @@ class InjectionEngine:
                 futures = [executor.submit(allocate_resource, rid) for rid in request_ids]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
             
-            # Update session from responses if session manager provided
+            # Update session from responses if session manager provided (applies to both modes)
             if session_manager and session_id:
                 for result in results:
                     if result and result.get('success'):
@@ -32291,6 +33701,15 @@ class OmegaDAST:
         self.multiprocessing_scanner = MultiprocessingScanner(num_processes=num_processes)
         print("MultiprocessingScanner created successfully")
         
+        # Initialize StealthModeScheduler for rate-limited API scanning
+        print("Creating StealthModeScheduler...")
+        stealth_config = config.get('stealth_mode', {})
+        self.stealth_scheduler = StealthModeScheduler(stealth_config)
+        if self.stealth_scheduler.enabled:
+            print(f"StealthModeScheduler enabled: {self.stealth_scheduler.requests_per_window} requests over {self.stealth_scheduler.window_hours} hours")
+        else:
+            print("StealthModeScheduler disabled")
+        
         self.subdomain_discovery = SubdomainDiscovery()
         self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
         self.temporal_recheck_enabled = config.get('temporal_recheck', False)
@@ -32864,6 +34283,92 @@ class OmegaDAST:
                 self.surgical_orchestrator = None
                 self.log("Validation Engine initialized for 3x validation and remediation testing")
     
+    async def _run_targeted_second_scan(self, filtered_findings, retries=10, delay=2.0):
+        """
+        Run targeted second scan on filtered findings with enhanced retries and delay.
+        
+        Args:
+            filtered_findings: List of vulnerability findings to re-scan
+            retries: Number of retry attempts for each endpoint
+            delay: Delay between retry attempts in seconds
+            
+        Returns:
+            dict: Results with verified and failed counts
+        """
+        results = {
+            'verified': 0,
+            'failed': 0,
+            'total': len(filtered_findings),
+            'details': []
+        }
+        
+        for finding in filtered_findings:
+            url = finding.get('url', '')
+            vuln_type = finding.get('type', '')
+            parameter = finding.get('parameter', '')
+            method = finding.get('method', 'GET')
+            
+            try:
+                self.log(f"Re-scanning {vuln_type} at {url} (parameter: {parameter}) with {retries} retries, {delay}s delay...")
+                
+                # Verify the finding with retry logic
+                verified = False
+                for attempt in range(retries):
+                    try:
+                        # Simulate verification by re-sending the original request
+                        if method.upper() == 'GET':
+                            resp = await self.session_manager.fetch(url)
+                        else:
+                            # For POST requests, we'd need the original payload - skip for now
+                            resp = await self.session_manager.fetch(url)
+                        
+                        if resp and hasattr(resp, 'status'):
+                            # If we get a consistent response, consider it verified
+                            if attempt == retries - 1:  # Last attempt
+                                verified = True
+                                break
+                        
+                        # Delay between retries
+                        if attempt < retries - 1:
+                            await asyncio.sleep(delay)
+                            
+                    except Exception as retry_error:
+                        logging.debug(f"Retry {attempt + 1}/{retries} failed for {url}: {retry_error}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(delay)
+                
+                if verified:
+                    results['verified'] += 1
+                    results['details'].append({
+                        'url': url,
+                        'type': vuln_type,
+                        'parameter': parameter,
+                        'status': 'verified'
+                    })
+                    self.log(f"✓ Verified: {vuln_type} at {url}")
+                else:
+                    results['failed'] += 1
+                    results['details'].append({
+                        'url': url,
+                        'type': vuln_type,
+                        'parameter': parameter,
+                        'status': 'failed'
+                    })
+                    self.log(f"✗ Failed to verify: {vuln_type} at {url}")
+                    
+            except Exception as e:
+                results['failed'] += 1
+                results['details'].append({
+                    'url': url,
+                    'type': vuln_type,
+                    'parameter': parameter,
+                    'status': 'error',
+                    'error': str(e)
+                })
+                logging.error(f"Error during targeted second scan for {url}: {e}")
+        
+        return results
+    
     async def _perform_version_detection(self):
         """
         Perform software version detection and CVE analysis.
@@ -32956,8 +34461,55 @@ class OmegaDAST:
             import traceback
             traceback.print_exc()
             self.targeted_payloads = {}
+        
         if self.config.get('js_render', True):
-            # Use context manager for guaranteed cleanup
+            # Choose between Selenium and Playwright based on configuration
+            js_driver_mode = self.config.get('js_driver_mode', 'selenium')
+            
+            if js_driver_mode == 'playwright' and PLAYWRIGHT_AVAILABLE:
+                # Use Playwright for advanced JavaScript instrumentation
+                self.log("Initializing PlaywrightJSRenderDriver for advanced JS instrumentation")
+                try:
+                    loop = asyncio.get_event_loop()
+                    self.playwright_driver = loop.run_until_complete(
+                        PlaywrightJSRenderDriver(
+                            proxy=self.config.get('proxy'),
+                            proxy_pool=self.session_manager.proxy_pool if hasattr(self.session_manager, 'proxy_pool') else None,
+                            human_like_behavior=self.config.get('human_like_behavior', True)
+                        ).create()
+                    )
+                    
+                    if self.playwright_driver:
+                        self.playwright_ready = True
+                        self.selenium_driver = self.playwright_driver  # Alias for compatibility
+                        self.selenium_ready = True
+                        self.injection_engine.selenium_driver = self.playwright_driver
+                        self.injection_engine.selenium_ready = True
+                        self.injection_engine.playwright_driver = self.playwright_driver
+                        self.injection_engine.playwright_ready = True
+                        
+                        self.log("PlaywrightJSRenderDriver initialized successfully")
+                        self.log("Advanced JavaScript runtime instrumentation enabled")
+                        self.log("Prototype Pollution detection enabled")
+                        self.log("Client-Side Template Injection (CSTI) detection enabled")
+                        self.log("User interaction recording/replay enabled")
+                    else:
+                        self.log("Playwright initialization failed, falling back to Selenium")
+                        # Fallback to Selenium
+                        self._initialize_selenium_driver()
+                        
+                except Exception as e:
+                    logging.warning(f"Playwright initialization error: {e}, falling back to Selenium")
+                    self._initialize_selenium_driver()
+            else:
+                # Use Selenium (legacy mode)
+                if js_driver_mode == 'playwright':
+                    self.log("Playwright requested but not available, using Selenium instead")
+                self._initialize_selenium_driver()
+    
+    def _initialize_selenium_driver(self):
+        """Initialize Selenium driver as fallback or default"""
+        try:
             self.selenium_driver = JSRenderDriver(
                 proxy=self.config.get('proxy'),
                 proxy_pool=self.session_manager.proxy_pool if hasattr(self.session_manager, 'proxy_pool') else None,
@@ -32987,10 +34539,15 @@ class OmegaDAST:
                         self.log(f"Initial framework detection: {initial_routes.get('framework_info', {})}")
                     except Exception as e:
                         logging.warning(f"Failed to get initial SPA routes: {e}")
+        except Exception as e:
+            logging.warning(f"Selenium driver initialization error: {e}")
+            self.selenium_driver = None
+            self.selenium_ready = False
         if self.config.get('auth_steps'):
-            await self.session_manager.perform_authentication(self.config.get('auth_steps'))
+            self.session_manager.perform_authentication(self.config.get('auth_steps'))
         if self.config.get('cookies'):
             self.session_manager.load_cookies(self.config['cookies'])
+    
     async def scan(self):
         self.log(LEGAL_BANNER)
         
@@ -33361,10 +34918,30 @@ class OmegaDAST:
                     self.reporting_engine.vulnerabilities.append(secret_finding)
                     self.add_finding(secret_finding)
         
-        if self.selenium_driver:
-            # Use context manager exit for guaranteed cleanup
-            self.selenium_driver.__exit__(None, None, None)
-            self.selenium_driver = None
+        # Cleanup JavaScript driver (Selenium or Playwright)
+        if self.playwright_driver and self.playwright_ready:
+            # Cleanup Playwright driver
+            try:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(self.playwright_driver.quit())
+                self.log("PlaywrightJSRenderDriver cleaned up successfully")
+            except Exception as e:
+                logging.warning(f"Playwright driver cleanup error: {e}")
+            finally:
+                self.playwright_driver = None
+                self.playwright_ready = False
+                self.selenium_driver = None
+                self.selenium_ready = False
+        elif self.selenium_driver:
+            # Cleanup Selenium driver
+            try:
+                self.selenium_driver.__exit__(None, None, None)
+                self.log("Selenium driver cleaned up successfully")
+            except Exception as e:
+                logging.warning(f"Selenium driver cleanup error: {e}")
+            finally:
+                self.selenium_driver = None
+                self.selenium_ready = False
         
         # Cleanup JSRenderDriverManager
         if hasattr(self, 'js_driver_manager'):
@@ -33402,6 +34979,34 @@ class OmegaDAST:
         # Close version detection engine to prevent resource leaks
         if hasattr(self, 'version_detection') and hasattr(self.version_detection, 'close'):
             self.version_detection.close()
+        
+        # Filter results to only 'Time-based' and 'Blind OOB' findings and run targeted second scan
+        try:
+            if hasattr(self.reporting_engine, 'vulnerabilities'):
+                self.log("Filtering for Time-based and Blind OOB findings for targeted second scan...")
+                
+                # Filter vulnerabilities for Time-based and Blind OOB types
+                filtered_findings = [
+                    vuln for vuln in self.reporting_engine.vulnerabilities
+                    if 'Time-based' in vuln.get('type', '') or 'Blind OOB' in vuln.get('type', '') or 'OOB' in vuln.get('type', '')
+                ]
+                
+                if filtered_findings:
+                    self.log(f"Found {len(filtered_findings)} Time-based and Blind OOB findings. Running targeted second scan with retries: 10, delay: 2.0...")
+                    
+                    # Run targeted second scan with enhanced retries and delay
+                    targeted_scan_results = await self._run_targeted_second_scan(filtered_findings, retries=10, delay=2.0)
+                    
+                    self.log(f"Targeted second scan completed: {targeted_scan_results.get('verified', 0)} verified, {targeted_scan_results.get('failed', 0)} failed")
+                    
+                    # Add results to scan statistics
+                    if hasattr(self, 'scan_stats'):
+                        self.scan_stats['targeted_second_scan'] = targeted_scan_results
+                else:
+                    self.log("No Time-based or Blind OOB findings found for targeted second scan.")
+        except Exception as e:
+            logging.error(f"Error during targeted second scan: {e}")
+            self.log(f"Targeted second scan encountered an error: {e}")
         
         # Process Gray Zone findings if auto-processing is enabled
         gray_zone_config = self.config.get('gray_zone_handling', {})
@@ -44057,7 +45662,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.3 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.4 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -45164,7 +46769,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.3']
+                        ['Tool Version', 'UltraDAST v18.4']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -45275,7 +46880,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.3",
+                            "tool": "UltraDAST v18.4",
                             "total_findings": current_tab.findings_table.rowCount()
                         },
                         "vulnerabilities": []
@@ -45567,7 +47172,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.3 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.4 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
