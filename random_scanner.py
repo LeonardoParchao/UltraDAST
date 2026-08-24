@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v19.0 – The Unstoppable Pentester Platform
+ULTRA-DAST v19.1 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -642,7 +642,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque, OrderedDict
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse, quote, unquote
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable, Pattern
 import warnings
@@ -6875,6 +6875,69 @@ def validate_sqli_error_message(error_message: str) -> dict:
         result['reason'] = f'Multiple fallback SQLi patterns matched: {", ".join(matched_descriptions)}'
         return result
     
+    # Enhanced custom framework error patterns (less strict for modern frameworks)
+    custom_framework_patterns = [
+        # Custom framework error messages that indicate SQLi but don't follow standard formats
+        (r'database.*query.*failed', 0.45, 'custom framework query failure'),
+        (r'syntax.*error.*near.*[\'"]', 0.5, 'syntax error with quote context'),
+        (r'query.*execution.*failed', 0.4, 'query execution failure'),
+        (r'sql.*statement.*error', 0.45, 'SQL statement error'),
+        (r'invalid.*sql.*syntax', 0.5, 'invalid SQL syntax'),
+        (r'malformed.*query', 0.4, 'malformed query'),
+        (r'unexpected.*token.*in.*query', 0.45, 'unexpected token in query'),
+        (r'error.*executing.*query', 0.4, 'query execution error'),
+        (r'failed.*to.*execute.*sql', 0.45, 'failed SQL execution'),
+        (r'database.*operation.*failed', 0.35, 'database operation failure'),
+        (r'query.*builder.*error', 0.4, 'query builder error'),
+        (r'orm.*query.*error', 0.4, 'ORM query error'),
+        (r'active.*record.*error', 0.4, 'Active Record error'),
+        (r'entity.*framework.*error', 0.4, 'Entity Framework error'),
+        (r'hibernate.*error', 0.45, 'Hibernate error'),
+        (r'jpa.*error', 0.4, 'JPA error'),
+        (r'django.*db.*error', 0.45, 'Django database error'),
+        (r'rails.*db.*error', 0.45, 'Rails database error'),
+        (r'pdo.*exception', 0.5, 'PDO exception'),
+        (r'mysqli.*error', 0.5, 'MySQLi error'),
+        (r'pg.*error', 0.45, 'PostgreSQL error'),
+        (r'sqlite.*error', 0.45, 'SQLite error'),
+        (r'mongo.*error', 0.4, 'MongoDB error'),
+        (r'cassandra.*error', 0.4, 'Cassandra error'),
+    ]
+    
+    # Check custom framework patterns with additional context requirements
+    for pattern, confidence, description in custom_framework_patterns:
+        if re.search(pattern, error_lower):
+            # Require additional database-related context for custom patterns
+            if re.search(r'(sql|database|query|table|column|row|select|insert|update|delete|where|join)', error_lower):
+                result['is_valid_sqli'] = True
+                result['confidence'] = confidence
+                result['reason'] = f'Custom framework SQL error: {description}'
+                result['database_type'] = 'custom_framework'
+                return result
+    
+    # Final fallback: Very generic patterns that require strong context
+    generic_patterns = [
+        (r'error', 0.2, 'generic error'),
+        (r'exception', 0.25, 'generic exception'),
+        (r'failed', 0.2, 'generic failure'),
+    ]
+    
+    generic_matches = 0
+    generic_total_confidence = 0.0
+    
+    for pattern, confidence, description in generic_patterns:
+        if re.search(pattern, error_lower):
+            generic_matches += 1
+            generic_total_confidence += confidence
+    
+    # Only accept generic patterns if there are database terms present
+    if generic_matches >= 2 and re.search(r'(sql|database|query|table|column|row|select|insert|update|delete)', error_lower):
+        result['is_valid_sqli'] = True
+        result['confidence'] = min(generic_total_confidence / generic_matches, 0.3)  # Cap at 0.3
+        result['reason'] = f'Generic error patterns with database context: {generic_matches} matches'
+        result['database_type'] = 'unknown'
+        return result
+    
     # No valid SQLi indicators found
     result['reason'] = 'No valid SQLi error patterns detected'
     return result
@@ -7810,11 +7873,21 @@ class ContextAwareSemanticMutator:
         self.database_cache[cache_key] = db_type
         return db_type
     
-    def mutate_sql_payload(self, payload, db_type='mysql', waf_type='generic'):
+    def mutate_sql_payload(self, payload, db_type='mysql', waf_type='generic', max_variants=15):
         """
         Mutate SQL payload based on database type and WAF detection.
         
         Uses grammar-based transformations rather than static string replacement.
+        Now with max_variants parameter to prevent excessive payload generation.
+        
+        Args:
+            payload: Original SQL payload
+            db_type: Database type (mysql, postgresql, sqlite, oracle, sqlserver)
+            waf_type: WAF type for evasion techniques
+            max_variants: Maximum number of variants to generate (default: 15)
+            
+        Returns:
+            List of payload variants
         """
         if db_type not in self.grammar_templates:
             db_type = 'mysql'  # Default to MySQL if unknown
@@ -7822,91 +7895,154 @@ class ContextAwareSemanticMutator:
         templates = self.grammar_templates[db_type]
         variants = []
         
-        # Grammar-based transformations
+        # Grammar-based transformations (limited to prevent explosion)
         if 'conditional_comment' in templates and db_type == 'mysql':
-            # MySQL-specific conditional comments
+            # MySQL-specific conditional comments (limit to 2 keywords)
             keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR']
+            keyword_count = 0
             for keyword in keywords:
-                if keyword.lower() in payload.lower():
+                if keyword.lower() in payload.lower() and keyword_count < 2:
                     mutated = payload.lower().replace(keyword.lower(), templates['conditional_comment'](keyword))
                     variants.append(mutated)
+                    keyword_count += 1
+                    if len(variants) >= max_variants:
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'version_comment' in templates and db_type == 'mysql':
-            # MySQL version-specific comments
+        if 'version_comment' in templates and db_type == 'mysql' and len(variants) < max_variants:
+            # MySQL version-specific comments (limit to 1 keyword)
             keywords = ['SELECT', 'UNION', 'FROM', 'WHERE']
             for keyword in keywords:
                 if keyword.lower() in payload.lower():
                     mutated = payload.lower().replace(keyword.lower(), templates['version_comment'](keyword))
                     variants.append(mutated)
+                    break  # Only apply once
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'hex_encoding' in templates:
-            # Hex encoding for string literals
+        if 'hex_encoding' in templates and len(variants) < max_variants:
+            # Hex encoding for string literals (limit to 1 string)
             if "'" in payload or '"' in payload:
-                # Extract string literals and encode them
                 import re
                 strings = re.findall(r"['\"]([^'\"]*)['\"]", payload)
+                encoded_count = 0
                 for s in strings:
-                    if len(s) > 2:  # Only encode longer strings
+                    if len(s) > 2 and encoded_count < 1:  # Only encode 1 string
                         hex_encoded = templates['hex_encoding'](s)
                         mutated = payload.replace(f"'{s}'", hex_encoded).replace(f'"{s}"', hex_encoded)
                         variants.append(mutated)
+                        encoded_count += 1
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'char_encoding' in templates and db_type == 'mysql':
-            # CHAR encoding for MySQL
+        if 'char_encoding' in templates and db_type == 'mysql' and len(variants) < max_variants:
+            # CHAR encoding for MySQL (limit to 1 string)
             if "'" in payload or '"' in payload:
                 import re
                 strings = re.findall(r"['\"]([^'\"]*)['\"]", payload)
+                encoded_count = 0
                 for s in strings:
-                    if len(s) > 1 and len(s) < 10:  # Only encode short strings
+                    if len(s) > 1 and len(s) < 10 and encoded_count < 1:  # Only encode 1 short string
                         char_encoded = templates['char_encoding'](s)
                         mutated = payload.replace(f"'{s}'", char_encoded).replace(f'"{s}"', char_encoded)
                         variants.append(mutated)
+                        encoded_count += 1
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'dollar_quoting' in templates and db_type == 'postgresql':
+        if 'dollar_quoting' in templates and db_type == 'postgresql' and len(variants) < max_variants:
             # PostgreSQL dollar quoting
             if "'" in payload:
                 mutated = payload.replace("'", "$$")
                 variants.append(mutated)
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'square_brackets' in templates and db_type == 'sqlserver':
-            # SQL Server square brackets for identifiers
+        if 'square_brackets' in templates and db_type == 'sqlserver' and len(variants) < max_variants:
+            # SQL Server square brackets for identifiers (limit to 2 keywords)
             keywords = ['SELECT', 'FROM', 'WHERE', 'INSERT', 'UPDATE', 'DELETE']
+            keyword_count = 0
             for keyword in keywords:
-                if keyword.lower() in payload.lower():
+                if keyword.lower() in payload.lower() and keyword_count < 2:
                     mutated = payload.lower().replace(keyword.lower(), templates['square_brackets'](keyword.lower()))
                     variants.append(mutated)
+                    keyword_count += 1
+                    if len(variants) >= max_variants:
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        # Advanced whitespace obfuscation based on WAF
-        waf_specific_whitespace = self._get_waf_specific_whitespace(waf_type, db_type)
-        for ws in waf_specific_whitespace:
-            mutated = payload.replace(' ', ws)
-            variants.append(mutated)
+        # Advanced whitespace obfuscation based on WAF (limit to 2 variants)
+        if len(variants) < max_variants:
+            waf_specific_whitespace = self._get_waf_specific_whitespace(waf_type, db_type)
+            ws_count = 0
+            for ws in waf_specific_whitespace:
+                if ws_count >= 2:  # Limit to 2 whitespace variants
+                    break
+                mutated = payload.replace(' ', ws)
+                variants.append(mutated)
+                ws_count += 1
+                if len(variants) >= max_variants:
+                    break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        # Case transformations
-        if 'case_mixed' in templates:
-            keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR', 'INSERT', 'UPDATE', 'DELETE']
-            for keyword in keywords:
-                if keyword.lower() in payload.lower():
-                    mixed_case = templates['case_mixed'](keyword)
-                    mutated = payload.lower().replace(keyword.lower(), mixed_case)
-                    variants.append(mutated)
+        # Case transformations (limit to 2 variants)
+        if len(variants) < max_variants:
+            if 'case_mixed' in templates:
+                keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR', 'INSERT', 'UPDATE', 'DELETE']
+                case_count = 0
+                for keyword in keywords:
+                    if keyword.lower() in payload.lower() and case_count < 1:
+                        mixed_case = templates['case_mixed'](keyword)
+                        mutated = payload.lower().replace(keyword.lower(), mixed_case)
+                        variants.append(mutated)
+                        case_count += 1
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
-        if 'case_random' in templates:
-            keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR']
-            for keyword in keywords:
-                if keyword.lower() in payload.lower():
-                    random_case = templates['case_random'](keyword)
-                    mutated = payload.lower().replace(keyword.lower(), random_case)
-                    variants.append(mutated)
+        if len(variants) < max_variants:
+            if 'case_random' in templates:
+                keywords = ['SELECT', 'UNION', 'FROM', 'WHERE', 'AND', 'OR']
+                case_count = 0
+                for keyword in keywords:
+                    if keyword.lower() in payload.lower() and case_count < 1:
+                        random_case = templates['case_random'](keyword)
+                        mutated = payload.lower().replace(keyword.lower(), random_case)
+                        variants.append(mutated)
+                        case_count += 1
+                        break
+            if len(variants) >= max_variants:
+                return self._deduplicate_and_limit(variants, max_variants)
         
         # Ensure original payload is included
         variants.append(payload)
         
-        # If no variants were generated, try WAF evasion fallbacks
-        if len(variants) <= 1:
+        # If few variants were generated, try limited WAF evasion fallbacks
+        if len(variants) <= 3:
             context = {'db_type': db_type, 'waf_type': waf_type}
             fallback_variants = self.try_waf_evasion_fallbacks(payload, context)
-            variants.extend(fallback_variants)
+            # Limit fallbacks to 3 variants
+            variants.extend(fallback_variants[:3])
+        
+        return self._deduplicate_and_limit(variants, max_variants)
+    
+    def _deduplicate_and_limit(self, variants, max_variants):
+        """Helper method to deduplicate and limit variants"""
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_variants = []
+        for variant in variants:
+            if variant not in seen:
+                seen.add(variant)
+                unique_variants.append(variant)
+                if len(unique_variants) >= max_variants:
+                    break
+        return unique_variants
         
         # Remove duplicates and return
         return list(set(variants))
@@ -8450,7 +8586,7 @@ class ContextAwareSemanticMutator:
 def sql_comment_obfuscation(payload):
     """SQL comment obfuscation (legacy - use ContextAwareSemanticMutator instead)."""
     mutator = ContextAwareSemanticMutator()
-    return mutator.mutate_sql_payload(payload, 'mysql', 'generic')
+    return mutator.mutate_sql_payload(payload, 'mysql', 'generic', max_variants=10)
 
 def sql_whitespace_obfuscation(payload):
     """SQL whitespace obfuscation (legacy - use ContextAwareSemanticMutator instead)."""
@@ -8463,7 +8599,7 @@ def sql_whitespace_obfuscation(payload):
 def sql_keyword_obfuscation(payload):
     """SQL keyword obfuscation (legacy - use ContextAwareSemanticMutator instead)."""
     mutator = ContextAwareSemanticMutator()
-    return mutator.mutate_sql_payload(payload, 'mysql', 'generic')
+    return mutator.mutate_sql_payload(payload, 'mysql', 'generic', max_variants=10)
 
 # ---------------------------------------------------------------------
 # DYNAMIC PAYLOAD GENERATOR
@@ -8682,7 +8818,7 @@ class DynamicPayloadGenerator:
         This replaces the old static obfuscation methods with context-aware semantic mutations.
         """
         if self.semantic_mutator:
-            return self.semantic_mutator.mutate_sql_payload(base_payload, db_type, waf_type)
+            return self.semantic_mutator.mutate_sql_payload(base_payload, db_type, waf_type, max_variants=10)
         return []
     
     def generate_framework_specific_payload(self, vuln_type, framework):
@@ -9960,12 +10096,14 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
         # Intentionally empty to reduce log noise - HTTP server logging is handled elsewhere
 
 def start_oob_server(bind="127.0.0.1", preferred_port=None):
-    """Start OOB server with error handling for port conflicts."""
+    """Start OOB server with error handling for port conflicts using multithreaded server."""
     try:
         port = PortAllocator.get_available_port(preferred_port)
-        server = HTTPServer((bind, port), OOBCallbackHandler)
+        # Use ThreadingHTTPServer for concurrent request handling
+        server = ThreadingHTTPServer((bind, port), OOBCallbackHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        logging.info(f"OOB server started on {bind}:{port} with multithreaded support")
         return server, port
     except OSError as e:
         logging.error(f"Failed to start OOB server on {bind}:{preferred_port or 'any port'}: {e}")
@@ -9973,10 +10111,10 @@ def start_oob_server(bind="127.0.0.1", preferred_port=None):
         if preferred_port:
             try:
                 port = PortAllocator.get_available_port(None)
-                server = HTTPServer((bind, port), OOBCallbackHandler)
+                server = ThreadingHTTPServer((bind, port), OOBCallbackHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
-                logging.warning(f"OOB server started on alternative port {port}")
+                logging.warning(f"OOB server started on alternative port {port} with multithreaded support")
                 return server, port
             except OSError as e2:
                 logging.error(f"Failed to start OOB server on alternative port: {e2}")
@@ -11241,7 +11379,8 @@ def start_https_oob_server(bind="127.0.0.1", preferred_port=None, cert_file=None
         import ssl
         from http.server import HTTPServer
         port = PortAllocator.get_available_port(preferred_port)
-        server = HTTPServer((bind, port), HTTPSOOBHandler)
+        # Use ThreadingHTTPServer for concurrent request handling
+        server = ThreadingHTTPServer((bind, port), HTTPSOOBHandler)
         if not cert_file or not key_file:
             cert_file = "oob_cert.pem"
             key_file = "oob_key.pem"
@@ -19980,7 +20119,8 @@ class MITMProxyHandler:
         self.lock = threading.Lock()
     def start(self):
         try:
-            self.server = HTTPServer(('0.0.0.0', self.port), self._create_handler())
+            # Use ThreadingHTTPServer for concurrent request handling
+            self.server = ThreadingHTTPServer(('0.0.0.0', self.port), self._create_handler())
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
             return True
@@ -24174,70 +24314,120 @@ class Detector:
         Check if payload resides inside a text() node using HTML5 parser and XPath.
         If payload is exclusively inside @value or @data-*, return False (drop finding).
         Prioritize event-handler attributes over value attributes to avoid false negatives.
+        
+        Enhanced to handle URL-encoded, HTML-entity-encoded, and JSON-stringified payloads.
         """
+        def check_with_payloadVariants(html_content: str, payload_variants: list) -> bool:
+            """Helper function to check multiple payload variants"""
+            try:
+                tree = html5lib.parse(html_content, treebuilder="etree", namespaceHTMLElements=False)
+                from lxml import etree
+                
+                # Event handler attributes that can execute JavaScript (dangerous)
+                event_handlers = {'onerror', 'onclick', 'onload', 'onmouseover', 'onmouseout',
+                                'onfocus', 'onblur', 'onsubmit', 'onchange', 'ondblclick',
+                                'onkeydown', 'onkeyup', 'onkeypress', 'onmousedown', 'onmouseup',
+                                'onmouseenter', 'onmouseleave', 'oncontextmenu', 'onanimationend',
+                                'onanimationiteration', 'onanimationstart', 'ontransitionend',
+                                'oncopy', 'oncut', 'onpaste', 'onbeforeinput', 'oninput',
+                                'onreset', 'onscroll', 'onwheel', 'ontoggle', 'onpointerdown',
+                                'onpointerup', 'onpointermove', 'onpointercancel', 'ongotpointercapture',
+                                'onlostpointercapture', 'onpointerenter', 'onpointerleave'}
+                
+                # Modern framework event handlers (Alpine.js @click, Vue.js v-on:click, etc.)
+                modern_framework_handlers = {'@click', '@submit', '@input', '@change', '@keydown', '@keyup',
+                                           '@focus', '@blur', '@mouseover', '@mouseout', '@mouseenter', '@mouseleave',
+                                           '@wheel', '@scroll', '@submit', '@reset', '@load', '@error',
+                                           'v-on:click', 'v-on:submit', 'v-on:input', 'v-on:change', 'v-on:keydown',
+                                           'v-on:keyup', 'v-on:focus', 'v-on:blur', 'v-on:mouseover', 'v-on:mouseout',
+                                           'v-on:mouseenter', 'v-on:mouseleave', 'v-on:wheel', 'v-on:scroll',
+                                           'v-on:submit', 'v-on:reset', 'v-on:load', 'v-on:error'}
+                
+                # Check each payload variant
+                for current_payload in payload_variants:
+                    # Check if payload is in attribute values
+                    attr_nodes = tree.xpath("//*[@*[contains(., $payload)]]", payload=current_payload)
+                    if attr_nodes:
+                        # Check if it's in event handler attributes (HIGH PRIORITY - dangerous)
+                        for elem in attr_nodes:
+                            for attr_name, attr_value in elem.attrib.items():
+                                if current_payload in attr_value and (attr_name.lower() in event_handlers or attr_name in modern_framework_handlers):
+                                    return True  # Payload in event handler - valid XSS
+                    
+                    # Check if payload is in text nodes (good - potential XSS)
+                    text_nodes = tree.xpath("//text()[contains(., $payload)]", payload=current_payload)
+                    if text_nodes:
+                        # Verify it's not just in attribute values
+                        if not attr_nodes:
+                            return True  # Only in text nodes - valid XSS
+                    
+                    # Check if payload is in attribute values (bad - self-XSS or benign)
+                    if attr_nodes:
+                        # Check if it's in safe attributes
+                        for elem in attr_nodes:
+                            for attr_name, attr_value in elem.attrib.items():
+                                if current_payload in attr_value:
+                                    # Check if it's in modern framework event handlers (dangerous)
+                                    if attr_name in modern_framework_handlers:
+                                        return True  # Payload in modern framework handler - valid XSS
+                                    # Check if it's in data-* or react-* attributes (safe)
+                                    if attr_name.startswith('data-') or attr_name.startswith('react-') or attr_name.startswith('_ng'):
+                                        return False  # Payload in safe attribute - drop finding
+                                    # Check if it's in value attribute (input fields - likely self-XSS)
+                                    if attr_name == 'value':
+                                        return False  # Payload in value attribute - drop finding
+                
+                # If payload is in text nodes, it's valid
+                return bool(text_nodes)
+                
+            except Exception as e:
+                logging.warning(f"HTML5 parser error in SPA filtering: {e}")
+                # Fallback: check if any payload variant exists in HTML
+                return any(p in html_content for p in payload_variants)
+        
+        # Generate payload variants to handle different encodings
+        payload_variants = [payload]  # Start with original payload
+        
         try:
-            tree = html5lib.parse(html, treebuilder="etree", namespaceHTMLElements=False)
-            from lxml import etree
+            # Add URL-decoded variant
+            from urllib.parse import unquote
+            url_decoded = unquote(payload)
+            if url_decoded != payload:
+                payload_variants.append(url_decoded)
             
-            # Event handler attributes that can execute JavaScript (dangerous)
-            event_handlers = {'onerror', 'onclick', 'onload', 'onmouseover', 'onmouseout',
-                            'onfocus', 'onblur', 'onsubmit', 'onchange', 'ondblclick',
-                            'onkeydown', 'onkeyup', 'onkeypress', 'onmousedown', 'onmouseup',
-                            'onmouseenter', 'onmouseleave', 'oncontextmenu', 'onanimationend',
-                            'onanimationiteration', 'onanimationstart', 'ontransitionend',
-                            'oncopy', 'oncut', 'onpaste', 'onbeforeinput', 'oninput',
-                            'onreset', 'onscroll', 'onwheel', 'ontoggle', 'onpointerdown',
-                            'onpointerup', 'onpointermove', 'onpointercancel', 'ongotpointercapture',
-                            'onlostpointercapture', 'onpointerenter', 'onpointerleave'}
+            # Add HTML-entity-decoded variant
+            import html as html_lib
+            html_decoded = html_lib.unescape(payload)
+            if html_decoded != payload:
+                payload_variants.append(html_decoded)
             
-            # Modern framework event handlers (Alpine.js @click, Vue.js v-on:click, etc.)
-            modern_framework_handlers = {'@click', '@submit', '@input', '@change', '@keydown', '@keyup',
-                                       '@focus', '@blur', '@mouseover', '@mouseout', '@mouseenter', '@mouseleave',
-                                       '@wheel', '@scroll', '@submit', '@reset', '@load', '@error',
-                                       'v-on:click', 'v-on:submit', 'v-on:input', 'v-on:change', 'v-on:keydown',
-                                       'v-on:keyup', 'v-on:focus', 'v-on:blur', 'v-on:mouseover', 'v-on:mouseout',
-                                       'v-on:mouseenter', 'v-on:mouseleave', 'v-on:wheel', 'v-on:scroll',
-                                       'v-on:submit', 'v-on:reset', 'v-on:load', 'v-on:error'}
+            # Add double-encoded variants (common in some applications)
+            double_url_decoded = unquote(unquote(payload))
+            if double_url_decoded != payload and double_url_decoded != url_decoded:
+                payload_variants.append(double_url_decoded)
             
-            # Check if payload is in attribute values
-            attr_nodes = tree.xpath("//*[@*[contains(., $payload)]]", payload=payload)
-            if attr_nodes:
-                # Check if it's in event handler attributes (HIGH PRIORITY - dangerous)
-                for elem in attr_nodes:
-                    for attr_name, attr_value in elem.attrib.items():
-                        if payload in attr_value and (attr_name.lower() in event_handlers or attr_name in modern_framework_handlers):
-                            return True  # Payload in event handler - valid XSS
-            
-            # Check if payload is in text nodes (good - potential XSS)
-            text_nodes = tree.xpath("//text()[contains(., $payload)]", payload=payload)
-            if text_nodes:
-                # Verify it's not just in attribute values
-                if not attr_nodes:
-                    return True  # Only in text nodes - valid XSS
-            
-            # Check if payload is in attribute values (bad - self-XSS or benign)
-            if attr_nodes:
-                # Check if it's in safe attributes
-                for elem in attr_nodes:
-                    for attr_name, attr_value in elem.attrib.items():
-                        if payload in attr_value:
-                            # Check if it's in modern framework event handlers (dangerous)
-                            if attr_name in modern_framework_handlers:
-                                return True  # Payload in modern framework handler - valid XSS
-                            # Check if it's in data-* or react-* attributes (safe)
-                            if attr_name.startswith('data-') or attr_name.startswith('react-') or attr_name.startswith('_ng'):
-                                return False  # Payload in safe attribute - drop finding
-                            # Check if it's in value attribute (input fields - likely self-XSS)
-                            if attr_name == 'value':
-                                return False  # Payload in value attribute - drop finding
-            
-            # If payload is in text nodes, it's valid
-            return bool(text_nodes)
+            # Add JSON-stringified variant (if payload looks like it could be JSON-encoded)
+            if payload.startswith('"') and payload.endswith('"'):
+                try:
+                    import json
+                    json_decoded = json.loads(payload)
+                    if isinstance(json_decoded, str) and json_decoded != payload:
+                        payload_variants.append(json_decoded)
+                except (json.JSONDecodeError, ValueError):
+                    pass
             
         except Exception as e:
-            logging.warning(f"HTML5 parser error in SPA filtering: {e}")
-            # Fallback: check if payload exists in HTML
-            return payload in html
+            logging.debug(f"Error generating payload variants: {e}")
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_variants = []
+        for variant in payload_variants:
+            if variant not in seen:
+                seen.add(variant)
+                unique_variants.append(variant)
+        
+        return check_with_payloadVariants(html, unique_variants)
     
     @staticmethod
     def _normalize_spa_attributes(html: str) -> str:
@@ -29088,20 +29278,21 @@ class HeuristicRegressionOracle:
         endpoint_key = f"{method}:{url}"
         return self.noise_profiles.get(endpoint_key)
     
-    async def enter_regression_mode(self, url, method, payload, headers=None, data=None, json_data=None):
+    async def enter_regression_mode(self, url, method, payload, headers=None, data=None, json_data=None, check_business_logic=False):
         """
-        Step C: Regression Mode - Verify consistency of 500 errors.
+        Step C: Regression Mode - Verify consistency of errors.
         
-        When a 500 error is detected, send the exact same payload multiple times
-        with delays to verify it's not a transient network issue.
+        When a 500 error is detected OR business logic anomaly is suspected,
+        send the exact same payload multiple times with delays to verify it's not a transient issue.
         
         Args:
             url: Target endpoint URL
             method: HTTP method
-            payload: The payload that triggered the 500 error
+            payload: The payload that triggered the error/anomaly
             headers: Request headers
             data: Form data
             json_data: JSON data
+            check_business_logic: If True, also check for business logic anomalies (e.g., 200 OK with race conditions)
             
         Returns:
             Dictionary with regression test results
@@ -29112,12 +29303,13 @@ class HeuristicRegressionOracle:
         endpoint_key = f"{method}:{url}"
         noise_profile = self.get_noise_profile(url, method)
         
-        logging.info(f"HeuristicRegressionOracle: Entering regression mode for {endpoint_key}")
+        logging.info(f"HeuristicRegressionOracle: Entering regression mode for {endpoint_key} (business_logic={check_business_logic})")
         self.regression_mode = True
         self.current_payload = payload
         
         regression_results = []
         confirmed_errors = 0
+        confirmed_anomalies = 0
         
         for attempt in range(self.regression_retries):
             try:
@@ -29128,22 +29320,58 @@ class HeuristicRegressionOracle:
                 )
                 elapsed = time.time() - start_time
                 
+                # Check for 500 errors (traditional regression testing)
                 if resp and resp.status >= 500:
                     confirmed_errors += 1
                     regression_results.append({
                         'attempt': attempt + 1,
                         'status': resp.status,
                         'response_time': elapsed,
-                        'is_error': True
+                        'is_error': True,
+                        'anomaly_type': 'server_error'
                     })
                     logging.warning(f"Regression attempt {attempt + 1}: 500 error confirmed "
                                   f"(status={resp.status}, time={elapsed:.3f}s)")
+                # Check for business logic anomalies (e.g., 200 OK with potential race conditions)
+                elif check_business_logic and resp and resp.status == 200:
+                    # Look for signs of business logic issues in response
+                    response_text = resp._body if hasattr(resp, '_body') else ''
+                    anomaly_indicators = [
+                        'duplicate', 'already exists', 'race', 'concurrent', 
+                        'double', 'multiple', 'conflict', 'inconsistent'
+                    ]
+                    
+                    has_anomaly = any(indicator in response_text.lower() for indicator in anomaly_indicators)
+                    
+                    if has_anomaly:
+                        confirmed_anomalies += 1
+                        regression_results.append({
+                            'attempt': attempt + 1,
+                            'status': resp.status,
+                            'response_time': elapsed,
+                            'is_error': False,
+                            'anomaly_type': 'business_logic',
+                            'evidence': 'Business logic anomaly indicators found in response'
+                        })
+                        logging.warning(f"Regression attempt {attempt + 1}: Business logic anomaly confirmed "
+                                      f"(status={resp.status}, time={elapsed:.3f}s)")
+                    else:
+                        regression_results.append({
+                            'attempt': attempt + 1,
+                            'status': resp.status,
+                            'response_time': elapsed,
+                            'is_error': False,
+                            'anomaly_type': 'none'
+                        })
+                        logging.info(f"Regression attempt {attempt + 1}: No anomaly detected "
+                                   f"(status={resp.status}, time={elapsed:.3f}s)")
                 else:
                     regression_results.append({
                         'attempt': attempt + 1,
                         'status': resp.status if resp else 'error',
                         'response_time': elapsed,
-                        'is_error': False
+                        'is_error': False,
+                        'anomaly_type': 'none'
                     })
                     logging.info(f"Regression attempt {attempt + 1}: Error disappeared "
                                f"(status={resp.status if resp else 'error'}, time={elapsed:.3f}s)")
@@ -29158,6 +29386,7 @@ class HeuristicRegressionOracle:
                     'status': 'exception',
                     'response_time': 0,
                     'is_error': False,
+                    'anomaly_type': 'exception',
                     'error': str(e)
                 })
                 logging.debug(f"Regression attempt {attempt + 1} failed with exception: {e}")
@@ -29165,25 +29394,30 @@ class HeuristicRegressionOracle:
         self.regression_mode = False
         self.current_payload = None
         
-        # Determine if the error is consistent
-        is_confirmed = confirmed_errors >= self.regression_retries * 0.5  # At least 50% consistency
+        # Determine if the error/anomaly is consistent
+        total_confirmed = confirmed_errors + confirmed_anomalies
+        is_confirmed = total_confirmed >= self.regression_retries * 0.5  # At least 50% consistency
         
         result = {
             'is_confirmed': is_confirmed,
             'confirmed_errors': confirmed_errors,
+            'confirmed_anomalies': confirmed_anomalies,
+            'total_confirmed': total_confirmed,
             'total_attempts': self.regression_retries,
             'regression_results': regression_results,
-            'noise_profile': noise_profile
+            'noise_profile': noise_profile,
+            'check_business_logic': check_business_logic
         }
         
         if is_confirmed:
-            result['reason'] = f'Error confirmed in {confirmed_errors}/{self.regression_retries} attempts'
+            result['reason'] = f'Anomaly confirmed in {total_confirmed}/{self.regression_retries} attempts ' \
+                            f'({confirmed_errors} server errors, {confirmed_anomalies} business logic anomalies)'
             logging.warning(f"HeuristicRegressionOracle: Confirmed anomaly for {endpoint_key} - "
-                          f"{confirmed_errors}/{self.regression_retries} attempts failed")
+                          f"{total_confirmed}/{self.regression_retries} attempts failed")
         else:
-            result['reason'] = f'Error was transient - only {confirmed_errors}/{self.regression_retries} attempts failed'
+            result['reason'] = f'Anomaly was transient - only {total_confirmed}/{self.regression_retries} attempts failed'
             logging.info(f"HeuristicRegressionOracle: Transient error for {endpoint_key} - "
-                        f"only {confirmed_errors}/{self.regression_retries} attempts failed")
+                        f"only {total_confirmed}/{self.regression_retries} attempts failed")
             self.filtered_errors += 1  # Track filtered transient errors
         
         return result
@@ -30514,7 +30748,7 @@ class InjectionEngine:
                                 
                                 # Use context-aware semantic mutator
                                 if self.semantic_mutator:
-                                    semantic_variants = self.semantic_mutator.mutate_sql_payload(payload, db_type, waf_type)
+                                    semantic_variants = self.semantic_mutator.mutate_sql_payload(payload, db_type, waf_type, max_variants=10)
                                 else:
                                     semantic_variants = []
                                 for variant in semantic_variants:
@@ -30631,17 +30865,25 @@ class InjectionEngine:
                     await self.heuristic_oracle.build_noise_profile(url, method)
                 
                 # Enter regression mode to verify consistency
+                # Enable business logic checking for SQL injection to catch race conditions that return 200 OK
+                check_business_logic = (vuln_type == 'SQL Injection')
                 regression_result = await self.heuristic_oracle.enter_regression_mode(
                     url, method, payload, 
                     headers=param.get('headers'),
                     data=param.get('data') if ptype != 'json' else None,
-                    json_data=param.get('data') if ptype == 'json' else None
+                    json_data=param.get('data') if ptype == 'json' else None,
+                    check_business_logic=check_business_logic
                 )
                 
-                # Only proceed with vulnerability detection if error is confirmed
+                # Only proceed with vulnerability detection if error or anomaly is confirmed
                 if not regression_result['is_confirmed']:
-                    logging.info(f"HeuristicRegressionOracle: Transient 500 error ignored for {url}")
+                    logging.info(f"HeuristicRegressionOracle: Transient error ignored for {url}")
                     return resp  # Return response but don't proceed with detection
+                
+                # Log business logic anomaly if detected
+                if regression_result.get('confirmed_anomalies', 0) > 0:
+                    logging.warning(f"HeuristicRegressionOracle: Business logic anomaly confirmed for {url} - "
+                                  f"{regression_result['confirmed_anomalies']} anomalies detected")
                 
                 # Save confirmed anomaly to database
                 await self.heuristic_oracle.save_confirmed_anomaly(
@@ -31131,17 +31373,25 @@ class InjectionEngine:
             logging.info(f"HeuristicRegressionOracle: 500 error detected for {url} with {vuln_type} payload")
             
             # Enter regression mode to verify consistency
+            # Enable business logic checking for SQL injection to catch race conditions that return 200 OK
+            check_business_logic = (vuln_type == 'SQL Injection')
             regression_result = await self.heuristic_oracle.enter_regression_mode(
                 url, method, payload, 
                 headers=param.get('headers'),
                 data=param.get('data') if ptype != 'json' else None,
-                json_data=param.get('data') if ptype == 'json' else None
+                json_data=param.get('data') if ptype == 'json' else None,
+                check_business_logic=check_business_logic
             )
             
-            # Only proceed with vulnerability detection if error is confirmed
+            # Only proceed with vulnerability detection if error or anomaly is confirmed
             if not regression_result['is_confirmed']:
-                logging.info(f"HeuristicRegressionOracle: Transient 500 error ignored for {url}")
+                logging.info(f"HeuristicRegressionOracle: Transient error ignored for {url}")
                 return  # Return early for transient errors
+            
+            # Log business logic anomaly if detected
+            if regression_result.get('confirmed_anomalies', 0) > 0:
+                logging.warning(f"HeuristicRegressionOracle: Business logic anomaly confirmed for {url} - "
+                              f"{regression_result['confirmed_anomalies']} anomalies detected")
             
             # Save confirmed anomaly to database
             await self.heuristic_oracle.save_confirmed_anomaly(
@@ -31154,14 +31404,20 @@ class InjectionEngine:
                           f"(payload: {payload[:50]}...)")
             
             # Add anomaly as a finding to the vulnerabilities list
+            # Determine if this is a server error or business logic anomaly
+            anomaly_type = "Server Error" if regression_result.get('confirmed_errors', 0) > 0 else "Business Logic Anomaly"
+            evidence = f"Confirmed {anomaly_type}: {resp.status} response reproducible in regression testing. "
+            if regression_result.get('confirmed_anomalies', 0) > 0:
+                evidence += f"Business logic indicators detected in response. "
+            evidence += f"Response time: {elapsed:.3f}s. Payload triggered consistent anomaly."
+            
             await self._add_vulnerability({
-                "type": "Heuristic Regression Anomaly",
+                "type": f"Heuristic Regression {anomaly_type}",
                 "url": url,
                 "parameter": param.get('name', 'unknown'),
                 "method": method,
                 "payload": payload,
-                "evidence": f"Confirmed anomaly: {resp.status} error reproducible in regression testing. "
-                          f"Response time: {elapsed:.3f}s. Payload triggered consistent server error.",
+                "evidence": evidence,
                 "severity": "Medium",
                 "confidence": 90,
                 "cwe": "CWE-754",  # Improper Check for Unusual or Exceptional Conditions
@@ -42017,6 +42273,9 @@ class OmegaDAST:
                         await self.fuzz_graphql_schema(gql_url, schema)
             except Exception as e:
                 logging.warning(f"GraphQL introspection error for {ep}: {e}")
+                # Fallback: Run basic GraphQL testing when introspection is disabled
+                self.log("GraphQL introspection failed, running fallback tests with common field names")
+                await self._fallback_graphql_testing(gql_url)
     
     def _analyze_graphql_schema(self, schema_data, schema):
         """Perform comprehensive analysis of GraphQL schema including types, fields, arguments, and directives."""
@@ -42159,6 +42418,148 @@ class OmegaDAST:
         # Enhanced depth-bomb testing with complexity calculation
         await self._test_graphql_complexity_based_depth_bomb(endpoint)
         await self._test_graphql_self_referencing_fragment_dos(endpoint)
+    
+    async def _fallback_graphql_testing(self, endpoint):
+        """
+        Fallback GraphQL testing when introspection is disabled.
+        Uses common field names and patterns discovered through field suggestion attacks.
+        """
+        logging.info(f"Running fallback GraphQL testing for {endpoint}")
+        
+        # Common GraphQL field names discovered across many applications
+        common_query_fields = [
+            'user', 'users', 'profile', 'profiles', 'account', 'accounts',
+            'product', 'products', 'order', 'orders', 'customer', 'customers',
+            'admin', 'admins', 'role', 'roles', 'permission', 'permissions',
+            'session', 'sessions', 'token', 'tokens', 'secret', 'secrets',
+            'config', 'configuration', 'settings', 'preferences', 'data',
+            'fetchProfile', 'getUser', 'getUsers', 'fetchUser', 'listUsers',
+            'getProduct', 'getProducts', 'fetchProduct', 'listProducts',
+            'getOrder', 'getOrders', 'fetchOrder', 'listOrders',
+            'login', 'register', 'authenticate', 'authorize', 'logout'
+        ]
+        
+        # Common mutation fields
+        common_mutation_fields = [
+            'createUser', 'updateUser', 'deleteUser', 'removeUser',
+            'createProduct', 'updateProduct', 'deleteProduct', 'removeProduct',
+            'createOrder', 'updateOrder', 'deleteOrder', 'removeOrder',
+            'login', 'register', 'logout', 'changePassword', 'resetPassword',
+            'updateProfile', 'deleteAccount', 'updateSettings'
+        ]
+        
+        # Test payloads for injection
+        injection_payloads = [
+            "<script>alert(1)</script>",
+            "' OR 1=1--",
+            "../../../etc/passwd",
+            "${7*7}",
+            "{{constructor.constructor('return process')().env}}",
+            "__typename"
+        ]
+        
+        # Check if GraphQL variables support is enabled
+        graphql_variables_support = self.config.get('graphql_variables_support', True)
+        
+        # Test common query fields
+        for field in common_query_fields[:20]:  # Limit to prevent excessive requests
+            try:
+                # Try basic query to see if field exists
+                query = f"{{ {field} {{ __typename }} }}"
+                resp = await self._async_fetch(endpoint, method='POST', json_data={'query': query})
+                
+                if resp and resp.status == 200:
+                    response_text = resp._body
+                    
+                    # Check if field exists (no errors in response)
+                    if 'errors' not in response_text.lower() and field.lower() in response_text.lower():
+                        logging.info(f"Discovered GraphQL field: {field}")
+                        
+                        # Test for injection vulnerabilities on discovered field
+                        for payload in injection_payloads:
+                            # Test with inline payload
+                            injection_query = f"{{ {field}(input: \"{payload}\") {{ __typename }} }}"
+                            injection_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': injection_query})
+                            
+                            if injection_resp and injection_resp.status == 200:
+                                if payload in injection_resp._body:
+                                    await self._add_vulnerability({
+                                        "type": "GraphQL Injection",
+                                        "url": endpoint,
+                                        "parameter": field,
+                                        "evidence": f"Payload reflected in field {field}: {payload}",
+                                        "severity": "High",
+                                        "confidence": 75,
+                                        "cwe": CWE_MAP["GraphQL"]
+                                    })
+                        
+                        # Test with variables if enabled
+                        if graphql_variables_support:
+                            variable_query = f"query($input: String) {{ {field}(input: $input) {{ __typename }} }}"
+                            for payload in injection_payloads:
+                                variables_resp = await self._async_fetch(endpoint, method='POST', json_data={
+                                    'query': variable_query,
+                                    'variables': {'input': payload}
+                                })
+                                
+                                if variables_resp and variables_resp.status == 200:
+                                    if payload in variables_resp._body:
+                                        await self._add_vulnerability({
+                                            "type": "GraphQL Injection",
+                                            "url": endpoint,
+                                            "parameter": field,
+                                            "evidence": f"Payload reflected via variables in field {field}: {payload}",
+                                            "severity": "High",
+                                            "confidence": 80,
+                                            "cwe": CWE_MAP["GraphQL"]
+                                        })
+                
+            except Exception as e:
+                logging.debug(f"Error testing GraphQL field {field}: {e}")
+                continue
+        
+        # Test common mutation fields
+        for field in common_mutation_fields[:15]:  # Limit mutations to prevent state changes
+            try:
+                # Try basic mutation to see if field exists
+                query = f"mutation {{ {field} {{ __typename }} }}"
+                resp = await self._async_fetch(endpoint, method='POST', json_data={'query': query})
+                
+                if resp and resp.status == 200:
+                    response_text = resp._body
+                    
+                    # Check if field exists (no errors in response)
+                    if 'errors' not in response_text.lower() and field.lower() in response_text.lower():
+                        logging.info(f"Discovered GraphQL mutation: {field}")
+                        
+                        # Test for injection vulnerabilities on discovered mutation
+                        for payload in injection_payloads[:3]:  # Limit payload testing for mutations
+                            injection_query = f"mutation {{ {field}(input: \"{payload}\") {{ __typename }} }}"
+                            injection_resp = await self._async_fetch(endpoint, method='POST', json_data={'query': injection_query})
+                            
+                            if injection_resp and injection_resp.status == 200:
+                                if payload in injection_resp._body:
+                                    await self._add_vulnerability({
+                                        "type": "GraphQL Injection",
+                                        "url": endpoint,
+                                        "parameter": field,
+                                        "evidence": f"Payload reflected in mutation {field}: {payload}",
+                                        "severity": "High",
+                                        "confidence": 75,
+                                        "cwe": CWE_MAP["GraphQL"]
+                                    })
+                
+            except Exception as e:
+                logging.debug(f"Error testing GraphQL mutation {field}: {e}")
+                continue
+        
+        # Run field suggestion attack to discover more fields
+        await self._test_graphql_field_suggestion(endpoint)
+        
+        # Run basic batching tests (these don't require schema knowledge)
+        await self._test_graphql_batching(endpoint)
+        
+        logging.info(f"Fallback GraphQL testing completed for {endpoint}")
     
     async def _test_graphql_batching(self, endpoint):
         batch_limit = min(self.graphql_batch_limit, 100)  # Use configured limit, max 100 for safety
@@ -51501,7 +51902,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v19.0 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v19.1 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -52640,7 +53041,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v19.0']
+                        ['Tool Version', 'UltraDAST v19.1']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -52826,7 +53227,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v19.0",
+                            "tool": "UltraDAST v19.1",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -53116,7 +53517,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v19.0 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v19.1 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
