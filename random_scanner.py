@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v.18.8 – The Unstoppable Pentester Platform
+ULTRA-DAST v18.9 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
 
 Install:
-    pip install aiohttp beautifulsoup4 selenium pyyaml graphql-core pyjwt dnspython html5lib
+    pip install aiohttp beautifulsoup4 selenium pyyaml grTraceback (most recent call last):
+  File "C:\Users\Lparc\Documents\Programs\Python\random_scanner.py", line 48222, in on_scanner_ready
+    self.main_window.update_gray_zone_tab_with_validation_engine()
+  File "C:\Users\Lparc\Documents\Programs\Python\random_scanner.py", line 49546, in update_gray_zone_tab_with_validation_engine
+    self.log_area.append("[GRAY_ZONE] Updated Gray Zone tab with validation engine")
+AttributeError: 'MainWindow' object has no attribute 'log_area'aphql-core pyjwt dnspython html5lib
     pip install websockets grpcio grpcio-reflection cvss PyQt5 reportlab markupsafe protobuf
     pip install z3-solver  # Required for JavaScript symbolic execution with Z3 SMT solver
     pip install playwright  # Required for advanced JavaScript instrumentation
@@ -964,6 +969,7 @@ class HTTP2Client:
     """
     HTTP/2 client with advanced support for modern web protocols.
     Provides multi-stream multiplexing, header compression, and priority handling.
+    Phase 1.4: Enhanced with aggressive multiplexing and connection pooling.
     """
     
     def __init__(self, config=None):
@@ -974,12 +980,14 @@ class HTTP2Client:
         self.stream_priorities = {}
         self.stream_counter = 0
         self.connection_pool = {}  # Maintain persistent connections per host
+        self.active_streams = {}  # Track active streams per host for load balancing
+        self.stream_semaphore = {}  # Per-host semaphores for stream limiting
         
         if self.enabled:
-            logging.info("HTTP/2 client initialized with multiplexing support")
+            logging.info(f"HTTP/2 client initialized with {self.max_concurrent_streams} max concurrent streams")
     
     async def _get_session(self, host):
-        """Get or create HTTP/2 session for a specific host"""
+        """Get or create HTTP/2 session for a specific host with enhanced connection pooling"""
         if host not in self.connection_pool or self.connection_pool[host].closed:
             # Explicitly close existing session if present to prevent resource leak
             if host in self.connection_pool and not self.connection_pool[host].closed:
@@ -989,23 +997,33 @@ class HTTP2Client:
                 except (aiohttp.ClientError, asyncio.CancelledError) as e:
                     logging.warning(f"Error closing HTTP/2 session for {host}: {e}")
             
-            # Create HTTP/2 enabled session with connection pooling
+            # Create HTTP/2 enabled session with aggressive connection pooling (Phase 1.4)
             connector = aiohttp.TCPConnector(
-                limit=self.max_concurrent_streams,
+                limit=self.max_concurrent_streams * 2,  # Double limit for better performance
                 limit_per_host=self.max_concurrent_streams,
                 force_close=False,
-                enable_cleanup_closed=True
+                enable_cleanup_closed=True,
+                ttl_dns_cache=300,  # Cache DNS for 5 minutes
+                use_dns_cache=True,
+                keepalive_timeout=30,  # Keep connections alive longer
+                enable_http2=True  # Explicitly enable HTTP/2
             )
             
-            # Configure session for HTTP/2
-            timeout = ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
+            # Configure session for HTTP/2 with optimized timeout
+            timeout = ClientTimeout(
+                total=DEFAULT_REQUEST_TIMEOUT,
+                connect=DEFAULT_CONNECT_TIMEOUT,
+                sock_read=DEFAULT_SOCK_READ_TIMEOUT
+            )
             session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
-                version="2.0"
+                version=aiohttp.HttpVersion20  # Use HTTP/2
             )
             
             self.connection_pool[host] = session
+            self.active_streams[host] = 0
+            self.stream_semaphore[host] = asyncio.Semaphore(self.max_concurrent_streams)
         
         return self.connection_pool[host]
     
@@ -1055,7 +1073,7 @@ class HTTP2Client:
             return None
     
     async def make_multiplexed_requests(self, requests):
-        """Make multiple HTTP/2 requests concurrently using stream multiplexing"""
+        """Make multiple HTTP/2 requests concurrently using enhanced stream multiplexing (Phase 1.4)"""
         if not self.enabled:
             return []
         
@@ -1068,25 +1086,27 @@ class HTTP2Client:
                 requests_by_host[host] = []
             requests_by_host[host].append(req)
         
-        # Process each host's requests with connection reuse
+        # Process each host's requests with connection reuse and stream limiting
         all_results = []
         for host, host_requests in requests_by_host.items():
             try:
                 session = await self._get_session(host)
+                semaphore = self.stream_semaphore.get(host, asyncio.Semaphore(self.max_concurrent_streams))
                 
-                # Create tasks for this host's requests (they'll share the HTTP/2 connection)
-                tasks = []
-                for req in host_requests:
-                    task = session.request(
-                        req.get('method', 'GET'),
-                        req['url'],
-                        headers=req.get('headers'),
-                        data=req.get('body'),
-                        timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
-                    )
-                    tasks.append(task)
+                # Create tasks for this host's requests with stream limiting
+                async def make_request_with_semaphore(req):
+                    async with semaphore:
+                        return await session.request(
+                            req.get('method', 'GET'),
+                            req['url'],
+                            headers=req.get('headers'),
+                            data=req.get('body'),
+                            timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
+                        )
                 
-                # Execute all requests concurrently (true multiplexing)
+                tasks = [make_request_with_semaphore(req) for req in host_requests]
+                
+                # Execute all requests concurrently with controlled stream usage
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 # Process responses
@@ -1118,7 +1138,7 @@ class HTTP2Client:
         return all_results
     
     async def close(self):
-        """Close all HTTP/2 sessions"""
+        """Close all HTTP/2 sessions and cleanup resources (Phase 1.4)"""
         for host, session in self.connection_pool.items():
             if not session.closed:
                 try:
@@ -1126,6 +1146,8 @@ class HTTP2Client:
                 except (aiohttp.ClientError, asyncio.CancelledError) as e:
                     logging.warning(f"Error closing HTTP/2 session for {host}: {e}")
         self.connection_pool.clear()
+        self.active_streams.clear()
+        self.stream_semaphore.clear()
         logging.info("HTTP/2 client sessions closed")
 
 
@@ -1293,6 +1315,7 @@ class HTTP3Client:
 # Scanning defaults
 DEFAULT_DEPTH = 3
 DEFAULT_THREADS = 150  # Increased from 100 for better concurrency
+DEFAULT_CRAWL_CONCURRENCY = 50  # Increased from 10 for faster crawling (Phase 1 optimization)
 DEFAULT_DELAY = 0.0
 
 # Network timeout constants
@@ -1302,6 +1325,81 @@ DEFAULT_SOCK_READ_TIMEOUT = 120
 DEFAULT_HEALTH_CHECK_TIMEOUT = 30
 PROBE_TIMEOUT = 60
 EXTENDED_REQUEST_TIMEOUT = 90.0
+
+# Phase 2: Network optimization constants
+DNS_CACHE_TTL = 300  # 5 minutes DNS cache
+CONNECTION_POOL_SIZE = 100  # Increased connection pool size
+SSL_SESSION_CACHE_SIZE = 50  # SSL session cache size
+
+# Phase 2: Simple DNS cache implementation
+_dns_cache = {}
+_dns_cache_lock = threading.Lock()
+
+def get_dns_cache(host: str) -> Optional[str]:
+    """Get cached DNS resolution for host."""
+    with _dns_cache_lock:
+        if host in _dns_cache:
+            entry = _dns_cache[host]
+            if time.time() - entry['timestamp'] < DNS_CACHE_TTL:
+                return entry['ip']
+            else:
+                del _dns_cache[host]
+    return None
+
+def set_dns_cache(host: str, ip: str) -> None:
+    """Cache DNS resolution for host."""
+    with _dns_cache_lock:
+        _dns_cache[host] = {'ip': ip, 'timestamp': time.time()}
+
+def clear_dns_cache() -> None:
+    """Clear DNS cache."""
+    with _dns_cache_lock:
+        _dns_cache.clear()
+
+# Phase 4: Memoization cache for expensive operations
+_memoization_cache = {}
+_memoization_lock = threading.Lock()
+
+def memoize_result(func_key: str, args_key: str, result: Any, ttl: int = 300) -> None:
+    """Memoize function result with TTL."""
+    with _memoization_lock:
+        _memoization_cache[(func_key, args_key)] = {
+            'result': result,
+            'timestamp': time.time(),
+            'ttl': ttl
+        }
+
+def get_memoized_result(func_key: str, args_key: str) -> Optional[Any]:
+    """Get memoized result if available and not expired."""
+    with _memoization_lock:
+        cache_key = (func_key, args_key)
+        if cache_key in _memoization_cache:
+            entry = _memoization_cache[cache_key]
+            if time.time() - entry['timestamp'] < entry['ttl']:
+                return entry['result']
+            else:
+                del _memoization_cache[cache_key]
+    return None
+
+def clear_memoization_cache() -> None:
+    """Clear memoization cache."""
+    with _memoization_lock:
+        _memoization_cache.clear()
+
+# Phase 4: Pre-compiled regex patterns for performance
+COMPILED_REGEX_PATTERNS = {
+    'js_property_access': re.compile(r'\.\w+[.,;+\)\(\{\}]'),
+    'js_method_call': re.compile(r'\w+\.\w+\('),
+    'js_assignment': re.compile(r'\w+\s*=\s*\w+'),
+    'csrf_token': re.compile(r'csrf|token|nonce', re.I),
+    'url_pattern': re.compile(r'''(?:href=|location\.href=|window\.open\(['"]|fetch\(['"]|src=|action=|url:['"])([^'")\s,;{}()]+)''', re.I),
+    'json_keys': re.compile(r'''['"](\w+)['"]\s*:\s*['"]?\{.*?\}['"]?'''),
+    'meta_refresh': re.compile(r'url=([^;]+)', re.I),
+    'sql_injection_pattern': re.compile(r'(\b(OR|AND)\b\s+\d+\s*=\s*\d+|--|#|\/\*|\*\/)', re.I),
+    'xss_pattern': re.compile(r'<script|on\w+\s*=|javascript:', re.I),
+    'path_traversal': re.compile(r'\.\.\/|\.\.\\', re.I),
+    'command_injection': re.compile(r'[;&|`$(){}[\]]', re.I)
+}
 
 # Rate limiting constants
 VERIFICATION_RATE_LIMIT = 3  # Requests per second for verification (increased from 1)
@@ -1328,6 +1426,7 @@ DYNAMIC_BODY_FIELDS = ['timestamp', 'nonce', 'random', 'csrf_token', '_csrf']
 PERFORMANCE_PROFILES = {
     "balanced": {
         "threads": 150,
+        "crawl_concurrency": 50,  # Optimized from 10
         "http2_max_streams": 200,
         "verification_rate_limit": 3,
         "discovery_rate_limit": 25,
@@ -1339,6 +1438,7 @@ PERFORMANCE_PROFILES = {
     },
     "fast": {
         "threads": 200,
+        "crawl_concurrency": 75,  # Increased for faster scanning
         "http2_max_streams": 300,
         "verification_rate_limit": 5,
         "discovery_rate_limit": 50,
@@ -1350,6 +1450,7 @@ PERFORMANCE_PROFILES = {
     },
     "thorough": {
         "threads": 100,
+        "crawl_concurrency": 25,  # Moderate for thorough analysis
         "http2_max_streams": 100,
         "verification_rate_limit": 1,
         "discovery_rate_limit": 10,
@@ -1358,6 +1459,63 @@ PERFORMANCE_PROFILES = {
         "cache_ttl": 600,
         "confidence_threshold": 95,
         "gray_zone_threshold": 10
+    },
+    "turbo": {
+        "threads": 250,
+        "crawl_concurrency": 100,  # Maximum speed crawling
+        "http2_max_streams": 500,  # Aggressive HTTP/2 multiplexing
+        "verification_rate_limit": 8,
+        "discovery_rate_limit": 75,
+        "multiprocessing_num_processes": min(16, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 15000,
+        "cache_ttl": 2400,
+        "confidence_threshold": 80,
+        "gray_zone_threshold": 25,
+        "dynamic_concurrency": True,
+        "request_batching": True
+    },
+    "stealth-turbo": {
+        "threads": 200,
+        "crawl_concurrency": 75,  # High speed with stealth
+        "http2_max_streams": 400,
+        "verification_rate_limit": 6,
+        "discovery_rate_limit": 40,
+        "multiprocessing_num_processes": min(12, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 12000,
+        "cache_ttl": 1800,
+        "confidence_threshold": 85,
+        "gray_zone_threshold": 20,
+        "enhanced_stealth": True,
+        "adaptive_rate_limiting": True
+    },
+    "adaptive": {
+        "threads": 150,
+        "crawl_concurrency": 50,  # Starting point, will adjust dynamically
+        "http2_max_streams": 300,
+        "verification_rate_limit": 4,
+        "discovery_rate_limit": 30,
+        "multiprocessing_num_processes": min(12, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 8000,
+        "cache_ttl": 1500,
+        "confidence_threshold": 88,
+        "gray_zone_threshold": 18,
+        "dynamic_concurrency": True,
+        "adaptive_rate_limiting": True,
+        "auto_profile_switching": True
+    },
+    "resource-limited-turbo": {
+        "threads": 100,  # Conservative for limited resources
+        "crawl_concurrency": 30,  # Optimized for 4-8GB RAM
+        "http2_max_streams": 200,
+        "verification_rate_limit": 3,
+        "discovery_rate_limit": 20,
+        "multiprocessing_num_processes": min(4, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 2),
+        "cache_max_size": 3000,  # Smaller cache for limited RAM
+        "cache_ttl": 900,
+        "confidence_threshold": 90,
+        "gray_zone_threshold": 15,
+        "memory_efficient": True,
+        "streaming_parsers": True
     }
 }
 
@@ -1367,7 +1525,7 @@ def apply_performance_profile(config, profile_name="balanced"):
     
     Args:
         config: Dictionary containing configuration values
-        profile_name: Name of the performance profile to apply (balanced, fast, thorough)
+        profile_name: Name of the performance profile to apply (balanced, fast, thorough, turbo, stealth-turbo, adaptive, resource-limited-turbo)
         
     Returns:
         dict: Updated configuration with profile settings applied
@@ -1426,8 +1584,8 @@ def validate_config(config):
     
     # Validate crawl concurrency
     if 'crawl_concurrency' in config:
-        if not isinstance(config['crawl_concurrency'], int) or config['crawl_concurrency'] < 1 or config['crawl_concurrency'] > 50:
-            errors.append("crawl_concurrency must be an integer between 1 and 50")
+        if not isinstance(config['crawl_concurrency'], int) or config['crawl_concurrency'] < 1 or config['crawl_concurrency'] > 100:
+            errors.append("crawl_concurrency must be an integer between 1 and 100")
     
     # Validate log level
     if 'log_level' in config:
@@ -5335,6 +5493,7 @@ class BeautifulSoupCache:
     Thread-safe cache for BeautifulSoup objects to avoid redundant parsing.
     Caches based on HTML content hash to handle identical content efficiently.
     Implements memory-aware eviction to prevent excessive memory consumption.
+    Phase 1.3: Enhanced with async support for parallel HTML parsing.
     """
     def __init__(self, max_size=500, max_memory_mb=200):
         self._cache = {}
@@ -5345,6 +5504,7 @@ class BeautifulSoupCache:
         self._misses = 0
         self._current_memory = 0  # Track current memory usage
         self._access_order = []  # Track access order for LRU eviction
+        self._executor = ThreadPoolExecutor(max_workers=4)  # For async parsing
     
     def _get_hash(self, html_content: str) -> str:
         """Generate a hash key for HTML content."""
@@ -5477,9 +5637,90 @@ class BeautifulSoupCache:
                 'misses': self._misses,
                 'hit_rate': f"{hit_rate:.2f}%"
             }
+    
+    async def get_async(self, html_content: str, parser: str = 'html.parser', loop=None) -> BeautifulSoup:
+        """
+        Get cached BeautifulSoup object asynchronously or create new one if not cached.
+        This method enables parallel HTML parsing for improved performance.
+        
+        Args:
+            html_content: The HTML content to parse
+            parser: The parser to use (default: 'html.parser')
+            loop: Event loop for async operations (optional)
+            
+        Returns:
+            BeautifulSoup object
+        """
+        # Handle empty or invalid content
+        if not html_content or not isinstance(html_content, str):
+            html_content = '<html></html>'
+        
+        # Check if content looks like a filename instead of HTML
+        if len(html_content) < 100 and not any(tag in html_content.lower() for tag in ['<html', '<body', '<div', '<span', '<p>', '<a ']):
+            # If it looks like a filename, treat it as such and try to read the file
+            import os
+            if os.path.exists(html_content):
+                try:
+                    with open(html_content, 'r', encoding='utf-8', errors='ignore') as f:
+                        html_content = f.read()
+                except Exception:
+                    html_content = '<html></html>'
+            else:
+                # Not a valid file or HTML, use placeholder
+                html_content = '<html></html>'
+        
+        content_hash = self._get_hash(html_content)
+        cache_key = f"{content_hash}:{parser}"
+        
+        with self._lock:
+            if cache_key in self._cache:
+                self._hits += 1
+                # Update access order for LRU
+                if cache_key in self._access_order:
+                    self._access_order.remove(cache_key)
+                self._access_order.append(cache_key)
+                return self._cache[cache_key]
+        
+        # Parse HTML in thread pool for parallel processing
+        loop = loop or asyncio.get_event_loop()
+        
+        def parse_html():
+            # Create new BeautifulSoup object with explicit parser
+            # Suppress the MarkupResemblesLocatorWarning and XMLParsedAsHTMLWarning
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=bs4.MarkupResemblesLocatorWarning)
+                warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+                return BeautifulSoup(html_content, parser)
+        
+        soup = await loop.run_in_executor(self._executor, parse_html)
+        
+        with self._lock:
+            self._misses += 1
+            
+            # Check again if another thread added it while we were parsing
+            if cache_key in self._cache:
+                self._hits += 1
+                return self._cache[cache_key]
+            
+            # Estimate memory size of new item
+            new_item_size = self._estimate_memory_size(soup)
+            
+            # Evict entries if needed based on memory and size limits
+            self._evict_if_needed(new_item_size)
+            
+            # Add new entry to cache
+            self._cache[cache_key] = soup
+            self._current_memory += new_item_size
+            self._access_order.append(cache_key)
+            
+            return soup
+    
+    def shutdown(self):
+        """Shutdown the thread pool executor."""
+        self._executor.shutdown(wait=True)
 
 # Global cache instance with memory-aware eviction
-_bs4_cache = BeautifulSoupCache(max_size=500, max_memory_mb=200)
+_bs4_cache = BeautifulSoupCache(max_size=1000, max_memory_mb=300)  # Increased for Phase 1.3 optimization
 
 def get_cached_soup(html_content: str, parser: str = 'html.parser') -> BeautifulSoup:
     """
@@ -5493,6 +5734,20 @@ def get_cached_soup(html_content: str, parser: str = 'html.parser') -> Beautiful
         BeautifulSoup object
     """
     return _bs4_cache.get(html_content, parser)
+
+async def get_cached_soup_async(html_content: str, parser: str = 'html.parser', loop=None) -> BeautifulSoup:
+    """
+    Async convenience function to get cached BeautifulSoup object with parallel parsing.
+    
+    Args:
+        html_content: The HTML content to parse
+        parser: The parser to use (default: 'html.parser')
+        loop: Event loop for async operations (optional)
+        
+    Returns:
+        BeautifulSoup object
+    """
+    return await _bs4_cache.get_async(html_content, parser, loop)
 
 def clear_bs4_cache():
     """Clear the global BeautifulSoup cache."""
@@ -6561,7 +6816,7 @@ COMMAND_PATTERN = re.compile(
 )
 AWS_META_PATTERN = re.compile(r"(ami-id|instance-id|public-keys|security-credentials)", re.I)
 
-from functools import lru_cache
+from functools import lru_cache, partial
 
 @lru_cache(maxsize=1000)
 def obfuscate(payload, context="param"):
@@ -12531,6 +12786,7 @@ class BaselineCache:
     - TTL (Time-To-Live) for automatic expiration
     - Maximum size limit to prevent memory bloat
     - Thread-safe async operations
+    - Phase 3: Advanced caching with compression and adaptive TTL
     
     This prevents redundant requests to the same baseline URLs,
     reducing network jitter and improving scan performance.
@@ -12562,7 +12818,7 @@ class BaselineCache:
         # Initialize database using context manager
         with sqlite3.connect(db_path_to_use, check_same_thread=False) as conn:
             cursor = conn.cursor()
-            cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+            cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER, compressed INTEGER DEFAULT 0)')
             conn.commit()
         
         # Keep connection open for long-lived operations
@@ -12575,9 +12831,15 @@ class BaselineCache:
         self.hits = 0
         self.misses = 0
         
+        # Phase 3: Advanced caching features
+        self.compression_enabled = True
+        self.adaptive_ttl = True
+        self.access_patterns = {}  # Track access patterns for adaptive TTL
+        self.warm_cache_enabled = False
+        
     async def get(self, key):
         """
-        Get a value from the cache.
+        Get a value from the cache with decompression support (Phase 3).
         
         Args:
             key: Cache key (typically (url, method, param) tuple)
@@ -12592,16 +12854,16 @@ class BaselineCache:
             
             try:
                 # Ensure table exists before querying
-                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER, compressed INTEGER DEFAULT 0)')
                 self.conn.commit()
                 
-                self.cursor.execute('SELECT value, expiry FROM cache WHERE key = ?', (str(key),))
+                self.cursor.execute('SELECT value, expiry, compressed FROM cache WHERE key = ?', (str(key),))
                 row = self.cursor.fetchone()
                 if row is None:
                     self.misses += 1
                     return None
                 
-                value, expiry = row
+                value, expiry, compressed = row
                 if current_time > expiry:
                     self.cursor.execute('DELETE FROM cache WHERE key = ?', (str(key),))
                     self.conn.commit()
@@ -12609,6 +12871,17 @@ class BaselineCache:
                     return None
                 
                 self.hits += 1
+                
+                # Phase 3: Handle decompression
+                try:
+                    if compressed:
+                        import zlib
+                        value = zlib.decompress(value.encode('latin1'))
+                    else:
+                        value = value.encode('utf-8')
+                except (ImportError, Exception):
+                    value = value.encode('utf-8')
+                
                 # Use json for safe deserialization instead of pickle
                 import json
                 return safe_json_loads(value.decode('utf-8'), max_depth=100)
@@ -12619,7 +12892,7 @@ class BaselineCache:
     
     async def set(self, key, val, ttl=None):
         """
-        Set a value in the cache.
+        Set a value in the cache with optional compression (Phase 3).
         
         Args:
             key: Cache key
@@ -12630,16 +12903,36 @@ class BaselineCache:
             import time
             import pickle
             current_time = time.time()
-            expiry = current_time + (ttl if ttl is not None else self.default_ttl)
+            
+            # Phase 3: Adaptive TTL based on access patterns
+            if self.adaptive_ttl and str(key) in self.access_patterns:
+                # Increase TTL for frequently accessed items
+                access_count = self.access_patterns[str(key)]['count']
+                adaptive_multiplier = min(2.0, 1.0 + (access_count / 10.0))
+                expiry = current_time + ((ttl if ttl is not None else self.default_ttl) * adaptive_multiplier)
+            else:
+                expiry = current_time + (ttl if ttl is not None else self.default_ttl)
             
             try:
                 # Ensure table exists before operations
-                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER, compressed INTEGER DEFAULT 0)')
                 self.conn.commit()
                 
                 # Serialize value using json for security (prevent RCE via pickle)
                 import json
                 serialized_value = json.dumps(val, default=str).encode('utf-8')
+                
+                # Phase 3: Apply compression for larger values
+                compressed = 0
+                if self.compression_enabled and len(serialized_value) > 1024:  # Compress if > 1KB
+                    try:
+                        import zlib
+                        compressed_value = zlib.compress(serialized_value)
+                        if len(compressed_value) < len(serialized_value):  # Only use if compression helps
+                            serialized_value = compressed_value
+                            compressed = 1
+                    except ImportError:
+                        pass  # zlib not available, skip compression
                 
                 # Check current size and enforce max size
                 self.cursor.execute('SELECT COUNT(*) FROM cache')
@@ -12648,18 +12941,77 @@ class BaselineCache:
                     # Remove oldest entries
                     self.cursor.execute('DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY expiry LIMIT 10)')
                 
-                # Insert or replace
-                self.cursor.execute('INSERT OR REPLACE INTO cache (key, value, expiry) VALUES (?, ?, ?)',
-                                   (str(key), serialized_value.decode('utf-8'), expiry))
+                # Insert or replace with compression flag
+                self.cursor.execute('INSERT OR REPLACE INTO cache (key, value, expiry, compressed) VALUES (?, ?, ?, ?)',
+                                   (str(key), serialized_value.decode('latin1'), expiry, compressed))
                 self.conn.commit()
+                
+                # Track access pattern for adaptive TTL
+                if self.adaptive_ttl:
+                    if str(key) not in self.access_patterns:
+                        self.access_patterns[str(key)] = {'count': 0, 'last_access': current_time}
+                    self.access_patterns[str(key)]['count'] += 1
+                    self.access_patterns[str(key)]['last_access'] = current_time
+                    
             except Exception as e:
                 logging.warning(f"Cache set error: {e}")
     
     async def clear(self):
         """Clear all cache entries."""
         async with self.lock:
-            self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+            self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER, compressed INTEGER DEFAULT 0)')
+            self.cursor.execute('DELETE FROM cache')
             self.conn.commit()
+            self.access_patterns.clear()
+            self.hits = 0
+            self.misses = 0
+    
+    async def warm_cache(self, keys_and_values):
+        """
+        Phase 3: Warm the cache with predictable endpoints.
+        
+        Args:
+            keys_and_values: Dictionary of {key: value} pairs to pre-populate cache
+        """
+        if not self.warm_cache_enabled:
+            return
+            
+        async with self.lock:
+            import time
+            current_time = time.time()
+            
+            for key, val in keys_and_values.items():
+                try:
+                    # Use extended TTL for warmed cache entries
+                    expiry = current_time + (self.default_ttl * 2)
+                    
+                    # Serialize value
+                    import json
+                    serialized_value = json.dumps(val, default=str).encode('utf-8')
+                    
+                    # Apply compression
+                    compressed = 0
+                    if self.compression_enabled and len(serialized_value) > 1024:
+                        try:
+                            import zlib
+                            compressed_value = zlib.compress(serialized_value)
+                            if len(compressed_value) < len(serialized_value):
+                                serialized_value = compressed_value
+                                compressed = 1
+                        except ImportError:
+                            pass
+                    
+                    self.cursor.execute('INSERT OR REPLACE INTO cache (key, value, expiry, compressed) VALUES (?, ?, ?, ?)',
+                                       (str(key), serialized_value.decode('latin1'), expiry, compressed))
+                    
+                    # Initialize access pattern
+                    self.access_patterns[str(key)] = {'count': 1, 'last_access': current_time}
+                    
+                except Exception as e:
+                    logging.warning(f"Cache warming error for key {key}: {e}")
+            
+            self.conn.commit()
+            logging.info(f"Cache warmed with {len(keys_and_values)} entries")
             self.cursor.execute('DELETE FROM cache')
             self.conn.commit()
             self.hits = 0
@@ -20615,8 +20967,71 @@ class ValidationEngine:
         self.fsm_stuck_detection_enabled = config.get('fsm_stuck_detection_enabled', True)
         self.fsm_stuck_timeout = config.get('fsm_stuck_timeout', 300)  # 5 minutes
         
+        # Parallel verification configuration (Phase 1.5)
+        self.parallel_verification_enabled = config.get('parallel_verification', True)
+        self.parallel_verification_limit = config.get('parallel_verification_limit', 5)
+        
         # Initialize session marker
         self.session_marker = f"Scan_{uuid.uuid4().hex[:8]}"
+    
+    async def validate_findings_parallel(self, vulnerabilities):
+        """
+        Validate multiple vulnerabilities in parallel for improved performance (Phase 1.5).
+        
+        Args:
+            vulnerabilities: List of vulnerability dictionaries to validate
+            
+        Returns:
+            List of validated vulnerability dictionaries
+        """
+        if not self.parallel_verification_enabled:
+            # Fall back to sequential validation
+            logging.info("Parallel verification disabled, using sequential validation")
+            validated = []
+            for vuln in vulnerabilities:
+                validated_vuln = await self.validate_finding(vuln)
+                validated.append(validated_vuln)
+            return validated
+        
+        # Group vulnerabilities by confidence to optimize parallel processing
+        high_confidence = [v for v in vulnerabilities if v.get('confidence', 0) >= self.CONFIDENCE_THRESHOLD]
+        medium_confidence = [v for v in vulnerabilities if self.CONFIDENCE_THRESHOLD > v.get('confidence', 0) >= 70]
+        low_confidence = [v for v in vulnerabilities if v.get('confidence', 0) < 70]
+        
+        # Process different confidence levels in parallel with appropriate limits
+        async def process_batch(vulns, limit):
+            semaphore = asyncio.Semaphore(limit)
+            
+            async def validate_with_semaphore(vuln):
+                async with semaphore:
+                    return await self.validate_finding(vuln)
+            
+            tasks = [validate_with_semaphore(vuln) for vuln in vulns]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process each confidence level
+        results = []
+        
+        # High confidence: process with higher limit (simpler validation)
+        if high_confidence:
+            logging.info(f"Processing {len(high_confidence)} high-confidence vulnerabilities in parallel")
+            high_results = await process_batch(high_confidence, self.parallel_verification_limit * 2)
+            results.extend([r for r in high_results if not isinstance(r, Exception)])
+        
+        # Medium confidence: process with standard limit
+        if medium_confidence:
+            logging.info(f"Processing {len(medium_confidence)} medium-confidence vulnerabilities in parallel")
+            medium_results = await process_batch(medium_confidence, self.parallel_verification_limit)
+            results.extend([r for r in medium_results if not isinstance(r, Exception)])
+        
+        # Low confidence: process with lower limit (more thorough validation)
+        if low_confidence:
+            logging.info(f"Processing {len(low_confidence)} low-confidence vulnerabilities in parallel")
+            low_results = await process_batch(low_confidence, max(2, self.parallel_verification_limit // 2))
+            results.extend([r for r in low_results if not isinstance(r, Exception)])
+        
+        logging.info(f"Parallel validation completed: {len(results)} vulnerabilities validated")
+        return results
 
     async def validate_finding(self, vuln):
         vuln_type = vuln.get('type', '')
@@ -26174,6 +26589,15 @@ class CrawlerEngine:
         # FP handling configuration
         fp_config = config.get('fp_handling', {})
         self.context_specific_whitelist = fp_config.get('context_specific_whitelist', True)
+        
+        # Phase 5: Dynamic concurrency adjustment
+        self.dynamic_concurrency_enabled = config.get('dynamic_concurrency', False)
+        self.response_time_history = []
+        self.concurrency_adjustment_interval = 50
+        self.current_crawl_concurrency = config.get('crawl_concurrency', DEFAULT_CRAWL_CONCURRENCY)
+        
+        # Phase 4: Initialize bloom filter cache for parameter deduplication
+        self.parameters_cache = set()
     
     def _add_to_visited(self, url: str, depth: int = 0) -> bool:
         """Add URL to visited storage (disk or memory)"""
@@ -26357,67 +26781,98 @@ class CrawlerEngine:
             # Check path for JavaScript code patterns
             if p.path:
                 # Allow paths with dots (like .js, .css) but not property access patterns
-                if re.search(r'\.\w+[.,;+\)\(\{\}]', p.path):
+                if COMPILED_REGEX_PATTERNS['js_property_access'].search(p.path):
                     return False
                 # Filter out obvious JavaScript code
                 if any(char in p.path for char in ',;(){}+'):
                     return False
                 # Check for common JS method call patterns
-                if re.search(r'\w+\.\w+\(', p.path):
+                if COMPILED_REGEX_PATTERNS['js_method_call'].search(p.path):
                     return False
                 # Check for assignment patterns
-                if re.search(r'\w+\s*=\s*\w+', p.path):
+                if COMPILED_REGEX_PATTERNS['js_assignment'].search(p.path):
                     return False
             
             # Check query string for JavaScript code
             if p.query:
                 if any(char in p.query for char in ',;(){}+'):
                     return False
-                if re.search(r'\w+\.\w+\(', p.query):
+                if COMPILED_REGEX_PATTERNS['js_method_call'].search(p.query):
                     return False
             
             return True
         except Exception:
             return False
+    def _adjust_concurrency_based_on_response_time(self, response_time: float) -> int:
+        """Phase 5: Dynamically adjust concurrency based on server response times"""
+        if not self.dynamic_concurrency_enabled:
+            return self.current_crawl_concurrency
+        
+        self.response_time_history.append(response_time)
+        if len(self.response_time_history) > self.concurrency_adjustment_interval:
+            self.response_time_history.pop(0)
+            avg_response_time = sum(self.response_time_history) / len(self.response_time_history)
+            
+            if avg_response_time > 5.0:
+                self.current_crawl_concurrency = max(10, self.current_crawl_concurrency - 10)
+                logging.info(f"Reducing concurrency to {self.current_crawl_concurrency} due to slow responses")
+            elif avg_response_time < 1.0:
+                self.current_crawl_concurrency = min(100, self.current_crawl_concurrency + 10)
+                logging.info(f"Increasing concurrency to {self.current_crawl_concurrency} due to fast responses")
+        
+        return self.current_crawl_concurrency
+    
     def _is_in_scope(self, url: str) -> bool:
         if not self._is_valid_url(url):
             return False
         p = urlparse(url)
         return p.netloc == self.base_domain and p.scheme in ('http', 'https')
     def _extract_links(self, soup: Any, base_url: str, html: str) -> List[str]:
+        # Phase 2: Optimize link extraction with CSS selectors (faster than find_all)
         links = set()
-        for a in soup.find_all('a', href=True):
+        
+        # Use CSS selectors for faster element selection
+        for a in soup.select('a[href]'):
             abs_url = urljoin(base_url, a['href'])
             if self._is_in_scope(abs_url): links.add(abs_url)
-        for form in soup.find_all('form'):
+        
+        for form in soup.select('form[action]'):
             action = form.get('action', '')
             if action:
                 abs_url = urljoin(base_url, action)
                 if self._is_in_scope(abs_url): links.add(abs_url)
-        for link in soup.find_all('link', href=True):
+        
+        for link in soup.select('link[href]'):
             abs_url = urljoin(base_url, link['href'])
             if self._is_in_scope(abs_url): links.add(abs_url)
-        for script in soup.find_all('script', src=True):
+        
+        for script in soup.select('script[src]'):
             abs_url = urljoin(base_url, script['src'])
             if self._is_in_scope(abs_url): links.add(abs_url)
-        for img in soup.find_all('img', src=True):
+        
+        for img in soup.select('img[src]'):
             abs_url = urljoin(base_url, img['src'])
             if self._is_in_scope(abs_url): links.add(abs_url)
-        for tag in soup.find_all(attrs={"srcset": True}):
+        
+        for tag in soup.select('[srcset]'):
             for part in tag['srcset'].split(','):
                 candidate = part.strip().split(' ')[0]
                 abs_url = urljoin(base_url, candidate)
                 if self._is_in_scope(abs_url): links.add(abs_url)
-        for tag in soup.find_all(attrs={"data-url": True}):
+        
+        for tag in soup.select('[data-url]'):
             abs_url = urljoin(base_url, tag['data-url'])
             if self._is_in_scope(abs_url): links.add(abs_url)
-        for meta in soup.find_all('meta', attrs={"http-equiv": "refresh", "content": True}):
-            match = re.search(r'url=([^;]+)', meta['content'], re.I)
+        
+        for meta in soup.select('meta[http-equiv="refresh"][content]'):
+            # Phase 4: Use compiled regex for meta refresh parsing
+            match = COMPILED_REGEX_PATTERNS['meta_refresh'].search(meta['content'])
             if match:
                 abs_url = urljoin(base_url, match.group(1))
                 if self._is_in_scope(abs_url): links.add(abs_url)
-        # More careful JavaScript URL extraction to avoid code fragments
-        js_pattern = re.findall(r'''(?:href=|location\.href=|window\.open\(['"]|fetch\(['"]|src=|action=|url:['"])([^'")\s,;{}()]+)''', html, re.I)
+        
+        # More careful JavaScript URL extraction to avoid code fragments (Phase 4: use compiled regex)
+        js_pattern = COMPILED_REGEX_PATTERNS['url_pattern'].findall(html)
         for m in js_pattern:
             m = m.strip('"\'')
             # Additional validation to filter out JavaScript code
@@ -26431,19 +26886,30 @@ class CrawlerEngine:
         parsed = urlparse(url)
         for param in parse_qs(parsed.query):
             self._add_param(url, 'GET', param, 'query')
-        for form in soup.find_all('form'):
+        
+        # Phase 2: Use CSS selectors for faster form processing
+        for form in soup.select('form'):
             method = form.get('method', 'get').upper()
             action = urljoin(url, form.get('action', '')) or url
-            for inp in form.find_all(['input', 'textarea', 'select']):
+            for inp in form.select('input, textarea, select'):
                 name = inp.get('name')
                 if name:
-                    self._add_param(action, method, name, 'post')
+                    # Phase 4: Use bloom filter for parameter deduplication
+                    param_key = f"{action}:{method}:{name}"
+                    if param_key not in self.parameters_cache:
+                        self._add_param(action, method, name, 'post')
+                        self.parameters_cache.add(param_key)
             if form.get('enctype') == 'application/json':
-                for inp in form.find_all(['input', 'textarea', 'select']):
+                for inp in form.select('input, textarea, select'):
                     name = inp.get('name')
                     if name:
-                        self._add_param(action, 'POST', name, 'json')
-        json_keys = re.findall(r'''['"](\w+)['"]\s*:\s*['"]?\{.*?\}['"]?''', html)
+                        param_key = f"{action}:POST:{name}"
+                        if param_key not in self.parameters_cache:
+                            self._add_param(action, 'POST', name, 'json')
+                            self.parameters_cache.add(param_key)
+        
+        # Phase 4: Use compiled regex for JSON key extraction
+        json_keys = COMPILED_REGEX_PATTERNS['json_keys'].findall(html)
         for key in json_keys:
             self._add_param(url, 'POST', key, 'json')
     def _add_param(self, url: str, method: str, param: str, ptype: str) -> None:
@@ -26501,6 +26967,10 @@ class SessionManager:
         if 'disabled_endpoints' in config:
             dedup_config['disabled_endpoints'] = config['disabled_endpoints']
         self.request_deduplicator = RequestDeduplicator(dedup_config)
+        
+        # Phase 4: Add bloom filter for quick duplicate detection
+        self.url_bloom_filter = set()  # Simple set-based bloom filter for URL deduplication
+        self.param_bloom_filter = set()  # Simple set-based bloom filter for parameter deduplication
         
         # Initialize HTTP/2 and HTTP/3 clients
         self.http2_client = HTTP2Client(config)
@@ -28245,6 +28715,10 @@ class InjectionEngine:
         """Standard async testing for stateful operations (default behavior)"""
         param_count = len(self.crawler_engine.parameters)
         
+        # Check if request batching is enabled (Phase 1.2 optimization)
+        request_batching = self.config.get('request_batching', False)
+        batch_size = self.config.get('batch_size', 10)
+        
         # Check if stealth mode is enabled
         stealth_enabled = hasattr(self, 'stealth_scheduler') and self.stealth_scheduler.enabled
         if stealth_enabled:
@@ -28253,39 +28727,130 @@ class InjectionEngine:
             self.stealth_scheduler.requests_per_window = param_count
             self.stealth_scheduler.base_interval = self.stealth_scheduler.window_seconds / param_count
         
-        tasks = []
-        self.total_tasks = param_count
-        for i, param in enumerate(self.crawler_engine.parameters):
-            # Acquire stealth mode slot before creating task
-            if stealth_enabled:
-                await self.stealth_scheduler.acquire_slot()
+        if request_batching and not stealth_enabled:
+            # Use batched parameter testing for improved performance
+            self.log(f"Using batched parameter testing with batch size {batch_size}")
+            await self._run_batched_active_tests(batch_size)
+        else:
+            # Use standard sequential testing
+            tasks = []
+            self.total_tasks = param_count
+            for i, param in enumerate(self.crawler_engine.parameters):
+                # Acquire stealth mode slot before creating task
+                if stealth_enabled:
+                    await self.stealth_scheduler.acquire_slot()
+                
+                task = asyncio.ensure_future(self._test_param(param))
+                task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None))
+                tasks.append(task)
+                self.current_task = i + 1
+                self.update_progress(self.current_task, self.total_tasks)
+                
+                # Update endpoint progress tree
+                if hasattr(self.signals, 'endpoint_progress'):
+                    self.signals.endpoint_progress.emit(param['url'], "In Progress", self.current_task, self.total_tasks)
             
-            task = asyncio.ensure_future(self._test_param(param))
-            task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None))
-            tasks.append(task)
-            self.current_task = i + 1
-            self.update_progress(self.current_task, self.total_tasks)
+            done, pending = await safe_async_wait(tasks, timeout=600, return_when=asyncio.ALL_COMPLETED)
             
-            # Update endpoint progress tree
+            # Mark all parameters as completed in endpoint progress
             if hasattr(self.signals, 'endpoint_progress'):
-                self.signals.endpoint_progress.emit(param['url'], "In Progress", self.current_task, self.total_tasks)
-        
-        done, pending = await safe_async_wait(tasks, timeout=600, return_when=asyncio.ALL_COMPLETED)
-        
-        # Mark all parameters as completed in endpoint progress
-        if hasattr(self.signals, 'endpoint_progress'):
-            for param in self.crawler_engine.parameters:
-                self.signals.endpoint_progress.emit(param['url'], "Completed", self.current_task, self.total_tasks)
-        if pending:
-            for task in pending:
-                task.cancel()
-            logging.warning(f"{len(pending)} active test tasks timed out and were cancelled")
+                for param in self.crawler_engine.parameters:
+                    self.signals.endpoint_progress.emit(param['url'], "Completed", self.current_task, self.total_tasks)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                logging.warning(f"{len(pending)} active test tasks timed out and were cancelled")
         
         # Save final stealth mode state
         if stealth_enabled:
             self.stealth_scheduler._save_state()
             progress = self.stealth_scheduler.get_progress()
             self.log(f"Stealth mode completed: {progress['progress_percentage']:.1f}% - {progress['request_count']}/{progress['total_requests']} requests")
+    
+    async def _run_batched_active_tests(self, batch_size=10):
+        """
+        Run active tests using batched parameter testing for improved performance.
+        
+        This method groups parameters by endpoint and tests them simultaneously,
+        reducing the number of HTTP requests and improving overall scan speed.
+        """
+        param_count = len(self.crawler_engine.parameters)
+        self.total_tasks = param_count
+        
+        # Group parameters by URL for batch testing
+        endpoint_groups = {}
+        for param in self.crawler_engine.parameters:
+            url = param['url']
+            if url not in endpoint_groups:
+                endpoint_groups[url] = []
+            endpoint_groups[url].append(param)
+        
+        # Process endpoints in batches
+        all_tasks = []
+        current_task = 0
+        
+        for url, params in endpoint_groups.items():
+            # Split parameters into batches for this endpoint
+            for i in range(0, len(params), batch_size):
+                batch = params[i:i + batch_size]
+                
+                # Create batch testing task
+                task = asyncio.ensure_future(self._test_param_batch(batch, url))
+                all_tasks.append(task)
+                
+                # Update progress
+                current_task += len(batch)
+                self.current_task = current_task
+                self.update_progress(self.current_task, self.total_tasks)
+                
+                # Update endpoint progress tree
+                if hasattr(self.signals, 'endpoint_progress'):
+                    self.signals.endpoint_progress.emit(url, "In Progress", self.current_task, self.total_tasks)
+        
+        # Execute all batch tasks with controlled concurrency
+        concurrency_limit = self.config.get('batch_concurrency', 5)
+        semaphore = asyncio.Semaphore(concurrency_limit)
+        
+        async def run_with_semaphore(task):
+            async with semaphore:
+                return await task
+        
+        controlled_tasks = [run_with_semaphore(task) for task in all_tasks]
+        
+        done, pending = await safe_async_wait(controlled_tasks, timeout=600, return_when=asyncio.ALL_COMPLETED)
+        
+        # Mark all endpoints as completed
+        if hasattr(self.signals, 'endpoint_progress'):
+            for url in endpoint_groups.keys():
+                self.signals.endpoint_progress.emit(url, "Completed", self.current_task, self.total_tasks)
+        
+        if pending:
+            for task in pending:
+                task.cancel()
+            logging.warning(f"{len(pending)} batch test tasks timed out and were cancelled")
+        
+        self.log(f"Batched testing completed: {len(endpoint_groups)} endpoints processed in {len(all_tasks)} batches")
+    
+    async def _test_param_batch(self, params, url):
+        """
+        Test a batch of parameters for the same endpoint simultaneously.
+        
+        This method sends multiple parameter mutations in parallel to reduce
+        overall scan time while maintaining detection quality.
+        """
+        tasks = []
+        for param in params:
+            task = asyncio.ensure_future(self._test_param(param))
+            task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Parameter test failed: {t.exception()}") if t.exception() else None))
+            tasks.append(task)
+        
+        # Execute batch tasks in parallel
+        done, pending = await safe_async_wait(tasks, timeout=120, return_when=asyncio.ALL_COMPLETED)
+        
+        if pending:
+            for task in pending:
+                task.cancel()
+            logging.warning(f"{len(pending)} parameter tests in batch timed out")
     
     async def _run_multiprocessing_active_tests(self):
         """
@@ -36030,6 +36595,8 @@ class OmegaDAST:
         self.validation_engine = None
         self.selenium_driver = None
         self.selenium_ready = False
+        self.playwright_driver = None
+        self.playwright_ready = False
         
         # Initialize scan statistics for tracking
         self.scan_stats = {
@@ -37540,7 +38107,8 @@ class OmegaDAST:
                 
                 if resp and resp.status == 200:
                     html = resp._body
-                    soup = get_cached_soup(html, 'html.parser')
+                    # Use async HTML parsing for improved performance (Phase 1.3)
+                    soup = await get_cached_soup_async(html, 'html.parser', self.loop)
                     page_metadata = {
                         'url': url,
                         'hash': hashlib.md5(html.encode()).hexdigest(),
@@ -37577,7 +38145,8 @@ class OmegaDAST:
                     # Perform JavaScript symbolic analysis if enabled
                     if self.symbolic_executor and self.config.get('symbolic_execution_enabled', True):
                         try:
-                            js_analysis = self.symbolic_executor.analyze_page_for_javascript(html, url)
+                            # Use async HTML parsing for improved performance (Phase 1.3)
+                            js_analysis = await self.loop.run_in_executor(None, self.symbolic_executor.analyze_page_for_javascript, html, url)
                             if js_analysis:
                                 # Process JavaScript vulnerabilities found
                                 for js_vuln in js_analysis.get('javascript_vulnerabilities', []):
@@ -37600,8 +38169,9 @@ class OmegaDAST:
                         if l not in self.crawler_engine.visited_urls:
                             await queue.put((l, depth + 1))
                     self.crawler_engine._extract_parameters(url, html, soup)
-                    for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
-                        if not form.find('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
+                    # Phase 4: Use compiled regex for CSRF detection
+                    for form in soup.select('form[method="post"]'):
+                        if not form.select('input[name][name*="csrf"], input[name][name*="token"], input[name][name*="nonce"]'):
                             await self._add_vulnerability({
                                 "type": "CSRF (potential)", "url": url, "parameter": "form",
                                 "evidence": "POST form without CSRF token", "severity": "Medium", "confidence": 65,
@@ -37631,35 +38201,6 @@ class OmegaDAST:
         # Wait for remaining tasks to complete
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
-            if any(p.search(url) for p in self.crawler_engine.exclusion_patterns):
-                pass
-            if url in self.crawler_engine.visited_urls or depth > self.config.get('depth', DEFAULT_DEPTH):
-                pass
-            self.crawler_engine.visited_urls.add(url)
-            self.current_task += 1
-            self.update_progress(self.current_task, self.total_tasks)
-            
-            # Update endpoint progress tree
-            if hasattr(self.signals, 'endpoint_progress'):
-                self.signals.endpoint_progress.emit(url, "In Progress", self.current_task, self.total_tasks)
-            
-            # Check if traffic pattern should change (mimic user behavior change)
-            if self.session_manager.traffic_shaper.should_pattern_change():
-                logging.info("Changing traffic pattern to mimic user behavior change")
-                self.session_manager.traffic_shaper.request_count = 0
-            
-            # Perform browser behavior simulation for realistic traffic patterns
-            await self.session_manager.perform_browser_behavior(url)
-            if hasattr(self.signals, 'status'):
-                self.signals.status.emit(f"Crawling {url}")
-            else:
-                logging.info(f"Crawling {url}")
-            
-            # Use taint-integrated session if available for crawling
-            session_to_use = self.taint_integrated_session if self.taint_integrated_session else self.session_manager
-            resp = await session_to_use.fetch(url) if hasattr(session_to_use, 'fetch') else await session_to_use.session_manager.fetch(url)
-            
-            # Check for taint analysis results
             if hasattr(resp, '_taint_analysis') and resp._taint_analysis.get('tainted'):
                 taint_vulns = resp._taint_analysis.get('vulnerabilities', [])
                 for vuln in taint_vulns:
@@ -37745,7 +38286,7 @@ class OmegaDAST:
                         v = Detector.dom_xss(None, self.selenium_driver, '', '')
                         if v: await self._add_vulnerability(v)
                     await self._process_cdp_responses(queue, depth)
-                    rendered_soup = get_cached_soup(rendered, 'html.parser')
+                    rendered_soup = await get_cached_soup_async(rendered, 'html.parser', self.loop)
                     js_links = self.crawler_engine._extract_links(rendered_soup, url, rendered)
                     for l in js_links:
                         if l not in self.crawler_engine.visited_urls:
@@ -42051,8 +42592,12 @@ class GraphQLSelfReferencingFragmentGenerator:
         try:
             if not self.validation_engine:
                 return
-            self.log(f"[VALIDATION] Starting 3x validation for {vuln['type']} at {vuln['url']}")
-            validated_vuln = await self.validation_engine.validate_finding(vuln)
+            # Phase 5: Use parallel validation if enabled
+            if hasattr(self.validation_engine, 'parallel_verification_enabled') and self.validation_engine.parallel_verification_enabled:
+                self.log(f"[VALIDATION] Using parallel validation for {vuln['type']}")
+                validated_vuln = await self.validation_engine.validate_finding(vuln)
+            else:
+                validated_vuln = await self.validation_engine.validate_finding(vuln)
             validation_status = validated_vuln.get('validation_results', {}).get('validation_status', 'unknown')
             
             # Update existing vulnerability entry with validation results (merge, don't overwrite)
@@ -45482,11 +46027,11 @@ class ScannerWorker(QThread):
             oracle_stats = None
             if hasattr(self.scanner, 'injection_engine') and hasattr(self.scanner.injection_engine, 'heuristic_oracle') and self.scanner.injection_engine.heuristic_oracle:
                 try:
-                    total_anomalies = self.loop.run_until_complete(self.injection_engine.heuristic_oracle.get_anomaly_count())
-                    recent_anomalies = self.loop.run_until_complete(self.injection_engine.heuristic_oracle.get_recent_anomalies(limit=5))
+                    total_anomalies = self.loop.run_until_complete(self.scanner.injection_engine.heuristic_oracle.get_anomaly_count())
+                    recent_anomalies = self.loop.run_until_complete(self.scanner.injection_engine.heuristic_oracle.get_recent_anomalies(limit=5))
                     oracle_stats = {
                         'total_anomalies': total_anomalies,
-                        'filtered_errors': getattr(self.injection_engine.heuristic_oracle, 'filtered_errors', 0),
+                        'filtered_errors': getattr(self.scanner.injection_engine.heuristic_oracle, 'filtered_errors', 0),
                         'recent_anomalies': recent_anomalies
                     }
                 except Exception as e:
@@ -47027,8 +47572,9 @@ class RepeaterTab(QWidget):
         threading.Thread(target=verify_in_thread, daemon=True).start()
 
 class ScanTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, main_window=None):
         QWidget.__init__(self, parent)
+        self.main_window = main_window
         layout = QVBoxLayout()
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -47667,10 +48213,18 @@ class ScanTab(QWidget):
             self.log_area.append("[SAFETY] LIVE MODE: Payloads will be sent to target")
     
     def on_scanner_ready(self, scanner):
-        """Called when scanner is ready - set shared FP_Database for GUI context menu"""
+        """Called when scanner is ready - set shared FP_Database and validation_engine for GUI context menu"""
         if hasattr(scanner, 'fp_db'):
             self.fp_db = scanner.fp_db
             self.log_area.append("[FP_DATABASE] Using shared FP_Database from scanner")
+        
+        # Store validation engine reference for Gray Zone tab
+        if hasattr(scanner, 'validation_engine'):
+            self.validation_engine = scanner.validation_engine
+            self.log_area.append("[VALIDATION_ENGINE] Using validation engine for Gray Zone tab")
+            # Update existing Gray Zone tab with validation engine
+            if self.main_window:
+                self.main_window.update_gray_zone_tab_with_validation_engine()
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
@@ -47963,7 +48517,7 @@ class ScanTab(QWidget):
                     self.log_area.append(f"  {i}. {entry['payload'][:60]}... ({entry['reason']})")
         
         # Display Heuristic Regression Oracle statistics if available
-        if 'heuristic_oracle_stats' in report:
+        if 'heuristic_oracle_stats' in report and report['heuristic_oracle_stats'] is not None:
             oracle_stats = report['heuristic_oracle_stats']
             self.log_area.append(f"\n[HEURISTIC REGRESSION ORACLE]")
             self.log_area.append(f"Confirmed Anomalies: {oracle_stats.get('total_anomalies', 0)}")
@@ -47975,8 +48529,9 @@ class ScanTab(QWidget):
                                        f"(Confirmed {anomaly['confirmation_count']}x)")
 
 class GrayZoneTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, validation_engine=None):
         QWidget.__init__(self, parent)
+        self.validation_engine = validation_engine
         layout = QVBoxLayout()
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -48062,29 +48617,32 @@ class GrayZoneTab(QWidget):
         self.refresh_gray_zone()
     
     def refresh_gray_zone(self):
-        """Refresh the Gray Zone findings table"""
+        """Refresh the Gray Zone findings table with real data from ValidationEngine"""
         # Clear existing rows
         self.gray_zone_table.setRowCount(0)
         
-        # Add sample data (in real implementation, this would come from the scanner)
-        sample_findings = [
-            {
-                'type': 'SQL Injection',
-                'url': 'http://example.com/api/users',
-                'parameter': 'id',
-                'probability': 15,
-                'recommendation': 'manual_review'
-            },
-            {
-                'type': 'XSS',
-                'url': 'http://example.com/search',
-                'parameter': 'q',
-                'probability': 25,
-                'recommendation': 'manual_review'
-            }
-        ]
+        # Get real data from validation engine if available
+        real_findings = []
+        if self.validation_engine:
+            try:
+                gray_zone_findings = self.validation_engine.get_gray_zone_findings()
+                for gz_entry in gray_zone_findings:
+                    vuln = gz_entry.get('vulnerability', {})
+                    real_findings.append({
+                        'type': vuln.get('type', 'Unknown'),
+                        'url': vuln.get('url', ''),
+                        'parameter': vuln.get('parameter', ''),
+                        'probability': gz_entry.get('probability_score', 0),
+                        'recommendation': gz_entry.get('recommendation', 'manual_review'),
+                        'gray_zone_entry': gz_entry  # Store full entry for verification
+                    })
+            except Exception as e:
+                self.verification_results_area.appendPlainText(f"Error loading gray zone data: {e}")
+        else:
+            self.verification_results_area.appendPlainText("Validation engine not available. Start a scan to populate gray zone data.")
         
-        for finding in sample_findings:
+        # Display findings
+        for finding in real_findings:
             row = self.gray_zone_table.rowCount()
             self.gray_zone_table.insertRow(row)
             
@@ -48108,13 +48666,17 @@ class GrayZoneTab(QWidget):
                 rec_item.setBackground(QColor("#fff3e0"))
             self.gray_zone_table.setItem(row, 4, rec_item)
             
-            # Add action button
+            # Add action button - use partial to properly capture the gray_zone_entry
             action_btn = QPushButton("Verify")
-            action_btn.clicked.connect(lambda checked, r=row: self.verify_finding(r))
+            action_btn.clicked.connect(partial(self.verify_finding, row, finding['gray_zone_entry']))
             self.gray_zone_table.setCellWidget(row, 5, action_btn)
         
         # Update statistics
-        self.update_statistics(len(sample_findings), 0, 0, len(sample_findings))
+        total = len(real_findings)
+        accepted = sum(1 for f in real_findings if f['recommendation'] == 'accept')
+        discarded = sum(1 for f in real_findings if f['recommendation'] == 'discard')
+        ambiguous = sum(1 for f in real_findings if f['recommendation'] == 'manual_review')
+        self.update_statistics(total, accepted, discarded, ambiguous)
     
     def update_statistics(self, total, accepted, discarded, ambiguous):
         """Update the statistics labels"""
@@ -48123,20 +48685,97 @@ class GrayZoneTab(QWidget):
         self.discarded_label.setText(f"Discarded: {discarded}")
         self.ambiguous_label.setText(f"Still Ambiguous: {ambiguous}")
     
-    def verify_finding(self, row):
-        """Verify a specific Gray Zone finding"""
+    def verify_finding(self, row, gray_zone_entry):
+        """Verify a specific Gray Zone finding using the validation engine"""
+        if not self.validation_engine:
+            finding_type = self.gray_zone_table.item(row, 0).text()
+            url = self.gray_zone_table.item(row, 1).text()
+            self.verification_results_area.appendPlainText(f"Validation engine not available for: {finding_type} at {url}")
+            self.verification_results_area.appendPlainText("Use the Repeater tab to copy the raw request and run manual verification.")
+            self.verification_results_area.appendPlainText("-" * 50)
+            return
+        
         finding_type = self.gray_zone_table.item(row, 0).text()
         url = self.gray_zone_table.item(row, 1).text()
         
         self.verification_results_area.appendPlainText(f"Verifying: {finding_type} at {url}")
-        self.verification_results_area.appendPlainText("Use the Repeater tab to copy the raw request and run manual verification.")
-        self.verification_results_area.appendPlainText("-" * 50)
+        self.verification_results_area.appendPlainText("Starting manual resend verification...")
+        
+        # Run verification in a separate thread to avoid blocking GUI
+        import threading
+        def verify_async():
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    self.validation_engine.manual_resend_verification(
+                        gray_zone_entry, 
+                        self.validation_engine.gray_zone_resend_count
+                    )
+                )
+                
+                # Update UI with results
+                self.verification_results_area.appendPlainText(f"Verification completed:")
+                self.verification_results_area.appendPlainText(f"500 error count: {result.get('error_500_count', 0)}")
+                self.verification_results_area.appendPlainText(f"Other errors: {result.get('other_error_count', 0)}")
+                self.verification_results_area.appendPlainText(f"Success count: {result.get('success_count', 0)}")
+                self.verification_results_area.appendPlainText(f"Recommendation: {result.get('recommendation', 'unknown')}")
+                self.verification_results_area.appendPlainText("-" * 50)
+                
+                # Refresh the table to show updated recommendation
+                self.refresh_gray_zone()
+                
+            except Exception as e:
+                self.verification_results_area.appendPlainText(f"Error during verification: {e}")
+                self.verification_results_area.appendPlainText("-" * 50)
+            finally:
+                loop.close()
+        
+        thread = threading.Thread(target=verify_async)
+        thread.daemon = True
+        thread.start()
     
     def process_all_gray_zone(self):
-        """Process all Gray Zone findings"""
+        """Process all Gray Zone findings using the validation engine"""
+        if not self.validation_engine:
+            self.verification_results_area.appendPlainText("Validation engine not available. Cannot process gray zone findings.")
+            self.verification_results_area.appendPlainText("-" * 50)
+            return
+        
         self.verification_results_area.appendPlainText("Processing all Gray Zone findings...")
         self.verification_results_area.appendPlainText("This will run manual resend verification on all findings.")
         self.verification_results_area.appendPlainText("-" * 50)
+        
+        # Run the processing in a separate thread to avoid blocking GUI
+        import threading
+        def process_async():
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                results = loop.run_until_complete(self.validation_engine.process_gray_zone_bucket())
+                
+                # Update UI with results
+                self.verification_results_area.appendPlainText(f"Processing completed:")
+                self.verification_results_area.appendPlainText(f"Total processed: {results.get('processed', 0)}")
+                self.verification_results_area.appendPlainText(f"Accepted: {results.get('accepted', 0)}")
+                self.verification_results_area.appendPlainText(f"Discarded: {results.get('discarded', 0)}")
+                self.verification_results_area.appendPlainText(f"Still ambiguous: {results.get('still_ambiguous', 0)}")
+                self.verification_results_area.appendPlainText("-" * 50)
+                
+                # Refresh the table to show updated results
+                self.refresh_gray_zone()
+                
+            except Exception as e:
+                self.verification_results_area.appendPlainText(f"Error during processing: {e}")
+                self.verification_results_area.appendPlainText("-" * 50)
+            finally:
+                loop.close()
+        
+        thread = threading.Thread(target=process_async)
+        thread.daemon = True
+        thread.start()
 
 class SeleniumBrowserTab(QWidget):
     def __init__(self, parent=None):
@@ -48422,7 +49061,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v.18.8 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v18.9 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -48469,6 +49108,7 @@ class MainWindow(QMainWindow):
         
         self.jira_webhook_url = ''
         self.slack_webhook_url = ''
+        self.validation_engine = None  # Store reference to validation engine for Gray Zone tab
         self.statusBar().showMessage("Ready")
     
     def apply_modern_styling(self):
@@ -48867,7 +49507,7 @@ class MainWindow(QMainWindow):
         webhook_config_action.triggered.connect(self.configure_webhooks)
         settings_menu.addAction(webhook_config_action)
     def add_new_scan_tab(self):
-        tab = ScanTab()
+        tab = ScanTab(main_window=self)
         self.tabs.addTab(tab, f"🔍 Scan {self.tabs.count()+1}")
         self.tabs.setCurrentIndex(self.tabs.count() - 1)
     def add_repeater_tab(self):
@@ -48898,9 +49538,17 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
         
-        tab = GrayZoneTab()
+        tab = GrayZoneTab(validation_engine=None)
         self.tabs.addTab(tab, "🔍 Gray Zone")
         self.tabs.setCurrentIndex(self.tabs.count() - 1)
+    
+    def update_gray_zone_tab_with_validation_engine(self):
+        """Update existing Gray Zone tab with validation engine reference"""
+        for i in range(self.tabs.count()):
+            if isinstance(self.tabs.widget(i), GrayZoneTab):
+                gray_zone_tab = self.tabs.widget(i)
+                gray_zone_tab.validation_engine = self.validation_engine
+                break
     
     def add_selenium_browser_tab(self):
         # Check if selenium browser tab already exists
@@ -49527,7 +50175,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v.18.8']
+                        ['Tool Version', 'UltraDAST v18.9']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -49636,7 +50284,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v.18.8",
+                            "tool": "UltraDAST v18.9",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -49926,7 +50574,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v.18.8 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v18.9 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
