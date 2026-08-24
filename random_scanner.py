@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v18.7 – The Unstoppable Pentester Platform
+ULTRA-DAST v.18.8 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -349,10 +349,10 @@ INTELLIGENT VERIFICATION PIPELINE CONFIGURATION EXAMPLE:
 {
     "intelligent_verification": {
         "enabled": true,
-        "confidence_threshold": 95,
-        "gray_zone_threshold": 10,
-        "verification_rate_limit": 1,
-        "discovery_rate_limit": 10,
+        "confidence_threshold": 90,  # Reduced from 95 for faster verification
+        "gray_zone_threshold": 15,  # Increased from 10 for faster gray zone processing
+        "verification_rate_limit": 3,  # Increased from 1 for faster verification
+        "discovery_rate_limit": 25,  # Increased from 10 for faster discovery
         "circuit_breaker_timeout": 300,
         "critical_vulnerability_types": ["RCE", "SQLi", "Auth Bypass", "IDOR", "SSRF"],
         "max_critical_verifications": 10,
@@ -969,7 +969,7 @@ class HTTP2Client:
     def __init__(self, config=None):
         self.config = config or {}
         self.enabled = config.get('http2_enabled', True)
-        self.max_concurrent_streams = config.get('http2_max_streams', 100)
+        self.max_concurrent_streams = config.get('http2_max_streams', 200)  # Increased from 100
         self.session = None
         self.stream_priorities = {}
         self.stream_counter = 0
@@ -1292,7 +1292,7 @@ class HTTP3Client:
 
 # Scanning defaults
 DEFAULT_DEPTH = 3
-DEFAULT_THREADS = 100
+DEFAULT_THREADS = 150  # Increased from 100 for better concurrency
 DEFAULT_DELAY = 0.0
 
 # Network timeout constants
@@ -1304,8 +1304,8 @@ PROBE_TIMEOUT = 60
 EXTENDED_REQUEST_TIMEOUT = 90.0
 
 # Rate limiting constants
-VERIFICATION_RATE_LIMIT = 1  # Requests per second for verification
-DISCOVERY_RATE_LIMIT = 10  # Requests per second for discovery
+VERIFICATION_RATE_LIMIT = 3  # Requests per second for verification (increased from 1)
+DISCOVERY_RATE_LIMIT = 25  # Requests per second for discovery (increased from 10)
 CIRCUIT_BREAKER_TIMEOUT = 300  # Seconds to wait after 429/503
 
 # Process and threading constants
@@ -1317,12 +1317,75 @@ RECURSION_LIMIT = 10000
 DEFAULT_TTL_ESTIMATE_LINUX = 64
 
 # Cache and storage constants
-DEFAULT_CACHE_MAX_SIZE = 1000
-DEFAULT_CACHE_TTL = 300
+DEFAULT_CACHE_MAX_SIZE = 5000  # Increased from 1000 for better caching
+DEFAULT_CACHE_TTL = 1200  # Increased from 300 (20 minutes)
 
 # Dynamic parameter filtering constants
 DYNAMIC_QUERY_PARAMS = ['timestamp', 'nonce', 'random', 'csrf_token', '_']
 DYNAMIC_BODY_FIELDS = ['timestamp', 'nonce', 'random', 'csrf_token', '_csrf']
+
+# Performance profiles for optimization
+PERFORMANCE_PROFILES = {
+    "balanced": {
+        "threads": 150,
+        "http2_max_streams": 200,
+        "verification_rate_limit": 3,
+        "discovery_rate_limit": 25,
+        "multiprocessing_num_processes": min(12, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 5000,
+        "cache_ttl": 1200,
+        "confidence_threshold": 90,
+        "gray_zone_threshold": 15
+    },
+    "fast": {
+        "threads": 200,
+        "http2_max_streams": 300,
+        "verification_rate_limit": 5,
+        "discovery_rate_limit": 50,
+        "multiprocessing_num_processes": min(16, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 10000,
+        "cache_ttl": 1800,
+        "confidence_threshold": 85,
+        "gray_zone_threshold": 20
+    },
+    "thorough": {
+        "threads": 100,
+        "http2_max_streams": 100,
+        "verification_rate_limit": 1,
+        "discovery_rate_limit": 10,
+        "multiprocessing_num_processes": min(8, multiprocessing.cpu_count() if 'multiprocessing' in globals() else 4),
+        "cache_max_size": 1000,
+        "cache_ttl": 600,
+        "confidence_threshold": 95,
+        "gray_zone_threshold": 10
+    }
+}
+
+def apply_performance_profile(config, profile_name="balanced"):
+    """
+    Apply a performance profile to the configuration.
+    
+    Args:
+        config: Dictionary containing configuration values
+        profile_name: Name of the performance profile to apply (balanced, fast, thorough)
+        
+    Returns:
+        dict: Updated configuration with profile settings applied
+    """
+    if profile_name not in PERFORMANCE_PROFILES:
+        logging.warning(f"Unknown performance profile '{profile_name}', using 'balanced'")
+        profile_name = "balanced"
+    
+    profile = PERFORMANCE_PROFILES[profile_name]
+    updated_config = config.copy()
+    
+    # Apply profile settings, but don't override explicit user settings
+    for key, value in profile.items():
+        if key not in updated_config:
+            updated_config[key] = value
+    
+    logging.info(f"Applied performance profile: {profile_name}")
+    return updated_config
 
 # Configuration validation
 def validate_config(config):
@@ -1354,6 +1417,23 @@ def validate_config(config):
     if 'request_timeout' in config:
         if not isinstance(config['request_timeout'], (int, float)) or config['request_timeout'] < 1:
             errors.append("request_timeout must be a positive number")
+    
+    # Validate performance profile
+    if 'performance_profile' in config:
+        valid_profiles = ['balanced', 'fast', 'thorough']
+        if config['performance_profile'] not in valid_profiles:
+            errors.append(f"performance_profile must be one of {valid_profiles}")
+    
+    # Validate crawl concurrency
+    if 'crawl_concurrency' in config:
+        if not isinstance(config['crawl_concurrency'], int) or config['crawl_concurrency'] < 1 or config['crawl_concurrency'] > 50:
+            errors.append("crawl_concurrency must be an integer between 1 and 50")
+    
+    # Validate log level
+    if 'log_level' in config:
+        valid_log_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if config['log_level'].upper() not in valid_log_levels:
+            errors.append(f"log_level must be one of {valid_log_levels}")
     
     # Validate cache configuration
     if 'dedup_cache_size' in config:
@@ -5354,9 +5434,10 @@ class BeautifulSoupCache:
             self._misses += 1
             
             # Create new BeautifulSoup object with explicit parser
-            # Suppress the MarkupResemblesLocatorWarning
+            # Suppress the MarkupResemblesLocatorWarning and XMLParsedAsHTMLWarning
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=bs4.MarkupResemblesLocatorWarning)
+                warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
                 soup = BeautifulSoup(html_content, 'html.parser')
             
             # Estimate memory size of new item
@@ -12510,6 +12591,10 @@ class BaselineCache:
             current_time = time.time()
             
             try:
+                # Ensure table exists before querying
+                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+                self.conn.commit()
+                
                 self.cursor.execute('SELECT value, expiry FROM cache WHERE key = ?', (str(key),))
                 row = self.cursor.fetchone()
                 if row is None:
@@ -12548,6 +12633,10 @@ class BaselineCache:
             expiry = current_time + (ttl if ttl is not None else self.default_ttl)
             
             try:
+                # Ensure table exists before operations
+                self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+                self.conn.commit()
+                
                 # Serialize value using json for security (prevent RCE via pickle)
                 import json
                 serialized_value = json.dumps(val, default=str).encode('utf-8')
@@ -12569,6 +12658,8 @@ class BaselineCache:
     async def clear(self):
         """Clear all cache entries."""
         async with self.lock:
+            self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+            self.conn.commit()
             self.cursor.execute('DELETE FROM cache')
             self.conn.commit()
             self.hits = 0
@@ -12579,6 +12670,8 @@ class BaselineCache:
         async with self.lock:
             import time
             current_time = time.time()
+            self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+            self.conn.commit()
             self.cursor.execute('DELETE FROM cache WHERE expiry < ?', (current_time,))
             self.conn.commit()
             return self.cursor.rowcount
@@ -12586,6 +12679,8 @@ class BaselineCache:
     def _is_expired(self, key):
         """Check if a cache entry has expired."""
         import time
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+        self.conn.commit()
         self.cursor.execute('SELECT expiry FROM cache WHERE key = ?', (str(key),))
         row = self.cursor.fetchone()
         if row is None:
@@ -12594,6 +12689,8 @@ class BaselineCache:
     
     def _remove(self, key):
         """Remove a specific entry from the cache."""
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)')
+        self.conn.commit()
         self.cursor.execute('DELETE FROM cache WHERE key = ?', (str(key),))
         self.conn.commit()
     
@@ -13190,12 +13287,12 @@ class AsyncRateLimiter:
                 self.payload_queue = PayloadQueue(max_queue_size=queue_size)
                 
                 # Initialize token bucket
-                rate = ids_ips_config.get('max_requests_per_second', 10)
-                capacity = ids_ips_config.get('burst_capacity', 20)
+                rate = ids_ips_config.get('max_requests_per_second', 25)  # Increased from 10
+                capacity = ids_ips_config.get('burst_capacity', 50)  # Increased from 20
                 self.token_bucket = TokenBucket(rate=rate, capacity=capacity)
                 
                 # Initialize adaptive throttler with payload queue
-                min_rate = ids_ips_config.get('min_requests_per_second', 0.5)
+                min_rate = ids_ips_config.get('min_requests_per_second', 1.0)  # Increased from 0.5
                 abs_max_rate = ids_ips_config.get('absolute_max_requests_per_second', 100)
                 self.adaptive_throttler = AdaptiveThrottler(
                     base_rate=rate,
@@ -14559,8 +14656,8 @@ async def paired_request_sampling(session, benign_url, malicious_url, benign_par
         except Exception as e:
             logging.debug(f"Benign request {i+1} failed: {e}")
         
-        # Small delay to allow connection reuse
-        await asyncio.sleep(0.01)
+        # Small delay to allow connection reuse (reduced from 0.01 for performance)
+        await asyncio.sleep(0.001)
         
         # Malicious request
         try:
@@ -14576,8 +14673,8 @@ async def paired_request_sampling(session, benign_url, malicious_url, benign_par
         except Exception as e:
             logging.debug(f"Malicious request {i+1} failed: {e}")
         
-        # Small delay to allow connection reuse
-        await asyncio.sleep(0.01)
+        # Small delay to allow connection reuse (reduced from 0.01 for performance)
+        await asyncio.sleep(0.001)
     
     # Calculate medians if we have enough samples
     if len(benign_times) >= 3 and len(malicious_times) >= 3:
@@ -30629,8 +30726,9 @@ class InjectionEngine:
                         logging.debug(f"Resource allocation error: {e}")
                         return None
             
-            # Execute all requests simultaneously using ThreadPoolExecutor
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+            # Execute all requests simultaneously using ThreadPoolExecutor with capped workers
+            max_workers = min(num_requests, 30)  # Cap at 30 to prevent resource contention
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 request_ids = [f"alloc_{i}_{uuid.uuid4().hex[:8]}" for i in range(num_requests)]
                 futures = [executor.submit(allocate_resource, rid) for rid in request_ids]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
@@ -30764,8 +30862,9 @@ class InjectionEngine:
                     logging.debug(f"State transition error: {e}")
                     return None
             
-            # Execute all requests simultaneously using ThreadPoolExecutor
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+            # Execute all requests simultaneously using ThreadPoolExecutor with capped workers
+            max_workers = min(num_requests, 30)  # Cap at 30 to prevent resource contention
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(transition_state, f"state_{i}", state) 
                           for i, state in enumerate(target_states)]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
@@ -30867,8 +30966,9 @@ class InjectionEngine:
                     logging.debug(f"Idempotency test error: {e}")
                     return None
             
-            # Execute all requests simultaneously using ThreadPoolExecutor
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+            # Execute all requests simultaneously using ThreadPoolExecutor with capped workers
+            max_workers = min(num_requests, 30)  # Cap at 30 to prevent resource contention
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(identical_request, i) for i in range(num_requests)]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
             
@@ -30963,8 +31063,9 @@ class InjectionEngine:
                     logging.debug(f"Timing test error: {e}")
                     return (None, None)
             
-            # Execute all requests simultaneously using ThreadPoolExecutor
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+            # Execute all requests simultaneously using ThreadPoolExecutor with capped workers
+            max_workers = min(num_requests, 30)  # Cap at 30 to prevent resource contention
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(timed_request) for _ in range(num_requests)]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
             
@@ -35861,7 +35962,7 @@ class OmegaDAST:
         
         # Initialize MultiprocessingScanner for parallel scanning (before InjectionEngine)
         print("Creating MultiprocessingScanner...")
-        num_processes = config.get('multiprocessing_num_processes', multiprocessing.cpu_count())
+        num_processes = config.get('multiprocessing_num_processes', min(12, multiprocessing.cpu_count()))  # Cap at 12
         self.multiprocessing_scanner = MultiprocessingScanner(num_processes=num_processes)
         print("MultiprocessingScanner created successfully")
         
@@ -36139,7 +36240,16 @@ class OmegaDAST:
             except (ImportError, RuntimeError):
                 gui_mode = False
             
-            log_level = logging.WARNING if gui_mode else logging.INFO
+            # Allow configurable log level with performance-optimized default
+            log_level_config = config.get('log_level', 'WARNING')  # Default to WARNING for performance
+            log_level_map = {
+                'DEBUG': logging.DEBUG,
+                'INFO': logging.INFO,
+                'WARNING': logging.WARNING,
+                'ERROR': logging.ERROR,
+                'CRITICAL': logging.CRITICAL
+            }
+            log_level = log_level_map.get(log_level_config.upper(), logging.WARNING)
             
             logging.basicConfig(
                 level=log_level,
@@ -37382,6 +37492,122 @@ class OmegaDAST:
     async def crawl(self):
         queue = asyncio.Queue()
         await queue.put((self.target, 0))
+        
+        # Add concurrency control for crawler (configurable, default 10 concurrent URLs)
+        crawl_concurrency = self.config.get('crawl_concurrency', 10)
+        crawl_semaphore = asyncio.Semaphore(crawl_concurrency)
+        active_tasks = set()
+        
+        async def process_url_concurrent(url, depth):
+            async with crawl_semaphore:
+                # Original processing logic (unchanged)
+                if any(p.search(url) for p in self.crawler_engine.exclusion_patterns):
+                    return
+                if url in self.crawler_engine.visited_urls or depth > self.config.get('depth', DEFAULT_DEPTH):
+                    return
+                self.crawler_engine.visited_urls.add(url)
+                self.current_task += 1
+                self.update_progress(self.current_task, self.total_tasks)
+                
+                # Update endpoint progress tree
+                if hasattr(self.signals, 'endpoint_progress'):
+                    self.signals.endpoint_progress.emit(url, "In Progress", self.current_task, self.total_tasks)
+                
+                # Check if traffic pattern should change (mimic user behavior change)
+                if self.session_manager.traffic_shaper.should_pattern_change():
+                    logging.info("Changing traffic pattern to mimic user behavior change")
+                    self.session_manager.traffic_shaper.request_count = 0
+                
+                # Perform browser behavior simulation for realistic traffic patterns
+                await self.session_manager.perform_browser_behavior(url)
+                if hasattr(self.signals, 'status'):
+                    self.signals.status.emit(f"Crawling {url}")
+                else:
+                    logging.info(f"Crawling {url}")
+                
+                # Use taint-integrated session if available for crawling
+                session_to_use = self.taint_integrated_session if self.taint_integrated_session else self.session_manager
+                resp = await session_to_use.fetch(url) if hasattr(session_to_use, 'fetch') else await session_to_use.session_manager.fetch(url)
+                
+                # Check for taint analysis results
+                if hasattr(resp, '_taint_analysis') and resp._taint_analysis.get('tainted'):
+                    taint_vulns = resp._taint_analysis.get('vulnerabilities', [])
+                    for vuln in taint_vulns:
+                        vuln['discovery_phase'] = 'crawling'
+                        self.reporting_engine.vulnerabilities.append(vuln)
+                        self.log(f"[TAINT during crawl] {vuln['type']} at {url}")
+                        self.add_finding(vuln)
+                
+                if resp and resp.status == 200:
+                    html = resp._body
+                    soup = get_cached_soup(html, 'html.parser')
+                    page_metadata = {
+                        'url': url,
+                        'hash': hashlib.md5(html.encode()).hexdigest(),
+                        'headers': dict(resp.headers),
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    self.crawler_engine.crawled_pages.append(page_metadata)
+                    await self.loop.run_in_executor(None, self.scan_state_manager.store_page_hash, url, html, page_metadata)
+                    
+                    # Learn business logic state from URL if FSM is available
+                    if self.business_logic_fsm:
+                        try:
+                            current_state = self.business_logic_fsm.detect_state_from_url(url)
+                            # Analyze forms for state transitions
+                            for form in soup.find_all('form'):
+                                form_text = form.get_text().lower()
+                                action = urljoin(url, form.get('action', ''))
+                                if any(kw in form_text for kw in ['add', 'cart', 'buy', 'checkout', 'payment']):
+                                    next_state = self.business_logic_fsm.detect_state_from_url(action)
+                                    self.business_logic_fsm.add_transition(current_state, next_state, 'form_submission', {
+                                        'url': url,
+                                        'action': action,
+                                        'form_text': form_text[:100]  # Truncate for logging
+                                    })
+                        except Exception as e:
+                            logging.debug(f"FSM learning error during crawl: {e}")
+                    
+                    # Update endpoint progress to completed
+                    if hasattr(self.signals, 'endpoint_progress'):
+                        self.signals.endpoint_progress.emit(url, "Completed", self.current_task, self.total_tasks)
+                        
+                    await self._passive_checks(resp)
+                    
+                    # Perform JavaScript symbolic analysis if enabled
+                    if self.symbolic_executor and self.config.get('symbolic_execution_enabled', True):
+                        try:
+                            js_analysis = self.symbolic_executor.analyze_page_for_javascript(html, url)
+                            if js_analysis:
+                                # Process JavaScript vulnerabilities found
+                                for js_vuln in js_analysis.get('javascript_vulnerabilities', []):
+                                    js_vuln['url'] = url
+                                    js_vuln['discovery_phase'] = 'crawling'
+                                    self.reporting_engine.vulnerabilities.append(js_vuln)
+                                    self.log(f"[JAVASCRIPT ANALYSIS] {js_vuln['type']} at {url}")
+                                    self.add_finding(js_vuln)
+                                
+                                # Log analysis summary
+                                inline_count = len(js_analysis.get('inline_scripts', []))
+                                external_count = len(js_analysis.get('external_scripts', []))
+                                vuln_count = len(js_analysis.get('javascript_vulnerabilities', []))
+                                logging.info(f"JavaScript analysis: {inline_count} inline scripts, {external_count} external scripts, {vuln_count} vulnerabilities found")
+                        except Exception as e:
+                            logging.warning(f"JavaScript symbolic analysis failed during crawl: {e}")
+                    
+                    links = self.crawler_engine._extract_links(soup, url, html)
+                    for l in links:
+                        if l not in self.crawler_engine.visited_urls:
+                            await queue.put((l, depth + 1))
+                    self.crawler_engine._extract_parameters(url, html, soup)
+                    for form in soup.find_all('form', method=lambda m: m and m.lower() == 'post'):
+                        if not form.find('input', attrs={'name': re.compile(r'csrf|token|nonce', re.I)}):
+                            await self._add_vulnerability({
+                                "type": "CSRF (potential)", "url": url, "parameter": "form",
+                                "evidence": "POST form without CSRF token", "severity": "Medium", "confidence": 65,
+                                "cwe": CWE_MAP["CSRF"]
+                            })
+        
         while not self.stop_event.is_set():
             # Pause check point at the start of each crawl iteration
             await self.pause_event.wait()
@@ -37389,13 +37615,26 @@ class OmegaDAST:
             try:
                 url, depth = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                if queue.empty():
+                if queue.empty() and not active_tasks:
                     break
                 continue
+            
+            # Start concurrent processing
+            task = asyncio.create_task(process_url_concurrent(url, depth))
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
+            
+            # Limit concurrent tasks to prevent overwhelming
+            if len(active_tasks) >= crawl_concurrency:
+                done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+        
+        # Wait for remaining tasks to complete
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
             if any(p.search(url) for p in self.crawler_engine.exclusion_patterns):
-                continue
+                pass
             if url in self.crawler_engine.visited_urls or depth > self.config.get('depth', DEFAULT_DEPTH):
-                continue
+                pass
             self.crawler_engine.visited_urls.add(url)
             self.current_task += 1
             self.update_progress(self.current_task, self.total_tasks)
@@ -37875,8 +38114,8 @@ class OmegaDAST:
                     await websocket.ping(ping_data)
                     ping_count += 1
                     
-                    # Small delay to avoid overwhelming the network
-                    await asyncio.sleep(0.01)
+                    # Small delay to avoid overwhelming the network (reduced from 0.01 for performance)
+                    await asyncio.sleep(0.001)
                     
                     # Check if connection is still alive
                     if ping_count % 10 == 0:
@@ -37929,7 +38168,7 @@ class OmegaDAST:
                 # We test by sending multiple small messages rapidly
                 for i, fragment in enumerate(fragments):
                     await websocket.send(fragment)
-                    await asyncio.sleep(0.01)  # Small delay between fragments
+                    await asyncio.sleep(0.005)  # Reduced from 0.01 for performance (WebSocket testing)
                 
                 # Check response
                 try:
@@ -47054,22 +47293,22 @@ class ScanTab(QWidget):
         
         self.confidence_threshold_spin = QSpinBox()
         self.confidence_threshold_spin.setRange(0, 100)
-        self.confidence_threshold_spin.setValue(95)
+        self.confidence_threshold_spin.setValue(90)  # Reduced from 95 for faster verification
         self.confidence_threshold_spin.setToolTip("Skip V2 and V3 validations for findings above this confidence threshold")
         
         self.gray_zone_threshold_spin = QSpinBox()
         self.gray_zone_threshold_spin.setRange(0, 50)
-        self.gray_zone_threshold_spin.setValue(10)
+        self.gray_zone_threshold_spin.setValue(15)  # Increased from 10 for faster gray zone processing
         self.gray_zone_threshold_spin.setToolTip("Minimum probability % for gray zone reporting")
         
         self.verification_rate_spin = QSpinBox()
         self.verification_rate_spin.setRange(1, 10)
-        self.verification_rate_spin.setValue(1)
+        self.verification_rate_spin.setValue(3)  # Increased from 1 for faster verification
         self.verification_rate_spin.setToolTip("Requests per second for verification phase")
         
         self.discovery_rate_spin = QSpinBox()
         self.discovery_rate_spin.setRange(1, 50)
-        self.discovery_rate_spin.setValue(10)
+        self.discovery_rate_spin.setValue(25)  # Increased from 10 for faster discovery
         self.discovery_rate_spin.setToolTip("Requests per second for discovery phase")
         
         self.off_peak_scheduling = QCheckBox("Schedule Full Verification for Off-Peak Hours (2 AM - 6 AM)")
@@ -48183,7 +48422,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v18.7 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v.18.8 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -49288,7 +49527,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v18.7']
+                        ['Tool Version', 'UltraDAST v.18.8']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -49397,7 +49636,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v18.7",
+                            "tool": "UltraDAST v.18.8",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -49687,7 +49926,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v18.7 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v.18.8 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -53320,7 +53559,11 @@ class JavaScriptSymbolicExecutor:
         
         try:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html_content, 'html.parser')
+            import warnings
+            # Suppress XMLParsedAsHTMLWarning when content appears to be XML
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+                soup = BeautifulSoup(html_content, 'html.parser')
             
             analysis_results = {
                 'inline_scripts': [],
