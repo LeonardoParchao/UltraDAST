@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v19.4 – The Unstoppable Pentester Platform
+ULTRA-DAST v19.6 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -22217,18 +22217,46 @@ class ValidationEngine:
         signature = self._generate_vulnerability_signature(vuln_type, url, parameter)
         
         # Check if this signature was already verified (proximity validation)
+        # But still run basic validation to catch new instances or context changes
+        proximity_validation_applied = False
         if signature in self.verified_signatures:
-            logging.info(f"Signature {signature} already verified - applying proximity validation")
-            vuln['validation_results'] = {
-                'validation_1_original': {'passed': True, 'reason': 'Verified by proximity'},
-                'validation_2_alternative': {'skipped': True, 'reason': 'Proximity validated'},
-                'validation_3_manual': {'skipped': True, 'reason': 'Proximity validated'},
-                'remediation_test': {'skipped': True, 'reason': 'Proximity validated'},
-                'final_confidence': original_confidence,
-                'validation_status': 'verified_by_proximity'
-            }
-            vuln['confidence'] = original_confidence
-            vuln['validated'] = True
+            logging.info(f"Signature {signature} already verified - applying proximity validation with basic check")
+            # Run minimal validation to ensure this specific instance is still valid
+            basic_validation = await self._validate_original_payload(vuln, url, parameter, original_payload)
+            
+            if basic_validation.get('passed'):
+                # Proximity validation passed
+                validation_results = {
+                    'validation_1_original': basic_validation,
+                    'validation_2_alternative': {'skipped': True, 'reason': 'Proximity validated'},
+                    'validation_3_manual': {'skipped': True, 'reason': 'Proximity validated'},
+                    'remediation_test': {'skipped': True, 'reason': 'Proximity validated'},
+                    'final_confidence': original_confidence,
+                    'validation_status': 'verified_by_proximity'
+                }
+                vuln['validation_results'] = validation_results
+                vuln['confidence'] = original_confidence
+                vuln['validated'] = True
+                proximity_validation_applied = True
+            else:
+                # Basic validation failed, so this might be a different context or false positive
+                # Run full validation to be sure
+                logging.info(f"Basic validation failed for proximity-validated signature {signature}, running full validation")
+                # Continue with full validation pipeline below
+                proximity_validation_applied = False
+        else:
+            # New signature, proceed with full validation
+            proximity_validation_applied = False
+        
+        # Skip full validation if proximity validation was applied and passed
+        if proximity_validation_applied:
+            # Emit validated finding to GUI if available
+            if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'add_finding'):
+                try:
+                    self.reporting_engine.add_finding(vuln)
+                    logging.info(f"Validated finding emitted to GUI: {vuln_type} at {url}")
+                except Exception as e:
+                    logging.warning(f"Failed to emit validated finding to GUI: {e}")
             return vuln
         
         validation_key = f"{vuln_type}_{url}_{parameter}"
@@ -22321,11 +22349,15 @@ class ValidationEngine:
             if '429' in str(e) or '503' in str(e):
                 self._activate_circuit_breaker()
                 validation_results['circuit_breaker_triggered'] = True
+            
+            # Ensure vulnerability is still returned even if validation fails
+            validation_results['validation_status'] = 'validation_error'
+            validation_results['final_confidence'] = max(0, original_confidence - 20)  # Reduce confidence but don't zero out
         
         self.validation_results[validation_key] = validation_results
         vuln['validation_results'] = validation_results
         vuln['confidence'] = validation_results['final_confidence']
-        vuln['validated'] = True
+        vuln['validated'] = True  # Mark as validated even if there were errors, so it gets reported
         
         # Emit validated finding to GUI if available
         if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'add_finding'):
@@ -22487,6 +22519,19 @@ class ValidationEngine:
                 # Check for actual callbacks
                 callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=DEFAULT_HEALTH_CHECK_TIMEOUT)
                 
+                # Handle inconclusive OOB results (None) properly
+                if callback_received is None:
+                    return {
+                        'passed': None,  # Inconclusive, not False
+                        'method': 'OOB_data_exfiltration',
+                        'marker': marker,
+                        'payload_used': oob_payload,
+                        'oob_url': oob_test_url,
+                        'callbacks': callbacks,
+                        'marker_type': 'session_reuse',
+                        'inconclusive_reason': 'OOB service unavailable or failed'
+                    }
+                
                 return {
                     'passed': callback_received,
                     'method': 'OOB_data_exfiltration',
@@ -22514,6 +22559,19 @@ class ValidationEngine:
                 
                 # Check for actual callbacks
                 callback_received, callbacks = await self.oob_monitor.check_oob_callback(self.current_oob_bin, timeout=DEFAULT_REQUEST_TIMEOUT)
+                
+                # Handle inconclusive OOB results (None) properly
+                if callback_received is None:
+                    return {
+                        'passed': None,  # Inconclusive, not False
+                        'method': 'OOB_SQL_exfiltration',
+                        'marker': marker,
+                        'payload_used': oob_payload,
+                        'oob_url': oob_test_url,
+                        'callbacks': callbacks,
+                        'marker_type': 'session_reuse',
+                        'inconclusive_reason': 'OOB service unavailable or failed'
+                    }
                 
                 return {
                     'passed': callback_received,
@@ -22613,18 +22671,26 @@ class ValidationEngine:
             score += weights['validation_1_original'] * 100
         elif v1.get('passed') is False:
             score += weights['validation_1_original'] * 20
+        elif v1.get('passed') is None:
+            # Inconclusive - give partial credit
+            score += weights['validation_1_original'] * 50
         v2 = validation_results.get('validation_2_alternative', {})
         if v2.get('passed'):
             score += weights['validation_2_alternative'] * 100
         elif v2.get('passed') is False:
             score += weights['validation_2_alternative'] * 30
         else:
+            # None or skipped - give partial credit
             score += weights['validation_2_alternative'] * 50
         v3 = validation_results.get('validation_3_manual', {})
         if v3.get('passed'):
             score += weights['validation_3_manual'] * 100
         elif v3.get('passed') is None:
+            # Inconclusive - give partial credit
             score += weights['validation_3_manual'] * 50
+        elif v3.get('passed') is False:
+            # Failed - minimal credit
+            score += weights['validation_3_manual'] * 10
         rt = validation_results.get('remediation_test', {})
         if rt.get('csp_bypass_successful') or rt.get('stacked_query_successful'):
             score += weights['remediation_test'] * 100
@@ -22632,6 +22698,15 @@ class ValidationEngine:
             score += weights['remediation_test'] * 80
         elif rt.get('risk_impact') == 'medium':
             score += weights['remediation_test'] * 60
+        elif rt.get('error'):
+            # Remediation test failed - don't penalize too much
+            score += weights['remediation_test'] * 40
+        
+        # Handle special validation statuses
+        if validation_results.get('validation_status') == 'validation_error':
+            # Reduce confidence but don't zero out
+            score = max(score * 0.5, original_confidence * 0.3)
+        
         final_confidence = int((score * 0.7) + (original_confidence * 0.3))
         return min(100, max(0, final_confidence))
     def _determine_validation_status(self, validation_results):
@@ -22639,11 +22714,18 @@ class ValidationEngine:
         v2 = validation_results.get('validation_2_alternative', {})
         rt = validation_results.get('remediation_test', {})
         
-        # Check for special statuses
+        # Check for special statuses first
         if validation_results.get('validation_status') == 'verified_by_proximity':
             return 'verified_by_proximity'
         if validation_results.get('validation_status') == 'skipped_circuit_breaker':
             return 'skipped_circuit_breaker'
+        if validation_results.get('validation_status') == 'validation_error':
+            return 'validation_error'
+        
+        # Check for inconclusive results first (None values)
+        if v1.get('passed') is None and v2.get('passed') is None:
+            # Both validations inconclusive - keep in gray zone
+            return 'inconclusive'
         
         if v1.get('passed') and v2.get('passed'):
             return 'confirmed'
@@ -22994,6 +23076,13 @@ class ValidationEngine:
     
     def add_to_gray_zone(self, vuln, probability_score, success_count, total_requests):
         """Add finding to gray zone with probability scoring"""
+        # Mark the original vulnerability as validated and with gray zone status
+        vuln['gray_zone'] = True
+        vuln['probability_score'] = probability_score
+        vuln['gray_zone_recommendation'] = 'manual_review' if probability_score > self.GRAY_ZONE_THRESHOLD else 'discard'
+        vuln['validated'] = True
+        vuln['confidence'] = probability_score  # Use probability score as confidence
+        
         gray_zone_entry = {
             'vulnerability': vuln,
             'probability_score': probability_score,
@@ -23004,21 +23093,24 @@ class ValidationEngine:
         }
         self.gray_zone_findings.append(gray_zone_entry)
         
-        # Also add gray zone findings to the main reporting flow for GUI display and export
-        # Mark them with gray zone status for identification
-        gray_zone_vuln = vuln.copy()
-        gray_zone_vuln['gray_zone'] = True
-        gray_zone_vuln['probability_score'] = probability_score
-        gray_zone_vuln['gray_zone_recommendation'] = 'manual_review' if probability_score > self.GRAY_ZONE_THRESHOLD else 'discard'
-        
         logging.info(f"Added to gray zone: {vuln.get('type')} - Probability: {probability_score}%")
+        
+        # Try to emit to reporting engine if available
+        if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'add_finding'):
+            try:
+                self.reporting_engine.add_finding(vuln)
+                logging.info(f"Gray zone finding emitted to reporting: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.warning(f"Failed to emit gray zone finding to reporting: {e}")
         
         # Return the gray zone entry for tracking
         return gray_zone_entry
     
     def get_gray_zone_findings(self):
-        """Get all gray zone findings that exceed threshold"""
-        return [gz for gz in self.gray_zone_findings if gz['probability_score'] > self.GRAY_ZONE_THRESHOLD]
+        """Get all gray zone findings - include all findings regardless of threshold for complete reporting"""
+        # Return all gray zone findings to ensure nothing is missed
+        # Filtering by threshold should happen during reporting/processing, not at retrieval
+        return self.gray_zone_findings
     
     async def manual_resend_verification(self, gray_zone_entry, resend_count=10):
         """
@@ -23188,7 +23280,12 @@ class ValidationEngine:
         """
         if not self.gray_zone_manual_verification_enabled:
             logging.info("Gray Zone manual verification is disabled")
-            return {'enabled': False, 'reason': 'Manual verification disabled'}
+            # Still return all gray zone findings even if manual verification is disabled
+            return {
+                'enabled': False, 
+                'reason': 'Manual verification disabled',
+                'gray_zone': self.gray_zone_findings  # Return all findings
+            }
         
         gray_zone_findings = self.get_gray_zone_findings()
         
@@ -23200,7 +23297,8 @@ class ValidationEngine:
                 'accepted': 0,
                 'discarded': 0,
                 'still_ambiguous': 0,
-                'findings': []
+                'findings': [],
+                'gray_zone': []  # Empty but present for consistency
             }
         
         logging.info(f"Processing {len(gray_zone_findings)} Gray Zone findings with manual resend verification")
@@ -23211,7 +23309,8 @@ class ValidationEngine:
             'accepted': 0,
             'discarded': 0,
             'still_ambiguous': 0,
-            'findings': []
+            'findings': [],
+            'gray_zone': gray_zone_findings  # Include all findings in results
         }
         
         for gray_zone_entry in gray_zone_findings:
@@ -23251,6 +23350,9 @@ class ValidationEngine:
                 })
         
         logging.info(f"Gray Zone bucket processing completed: {results['accepted']} accepted, {results['discarded']} discarded, {results['still_ambiguous']} still ambiguous")
+        
+        # Ensure all gray zone findings are included in the return value
+        results['gray_zone'] = self.gray_zone_findings
         
         return results
 
@@ -23299,7 +23401,17 @@ class OOBServiceMonitor:
                         # Handle non-JSON responses
                         text = await resp.text()
                         logging.warning(f"Unexpected content type from {service}: {content_type}. Response: {text[:200]}")
-                        return None, None
+                        # Return a fallback marker instead of None to allow validation to continue
+                        fallback_id = f"fallback_{int(time.time())}"
+                        fallback_url = f"https://{service}/fallback/{fallback_id}"
+                        self.active_bins[fallback_id] = {
+                            'service': service,
+                            'url': fallback_url,
+                            'created_at': time.time(),
+                            'callbacks': [],
+                            'fallback': True
+                        }
+                        return fallback_id, fallback_url
                     
                     bin_id = data.get('bin_id') or data.get('uuid') or data.get('id')
                     bin_url = data.get('url') or data.get('endpoint') or f"https://{service}/{bin_id}"
@@ -23315,11 +23427,31 @@ class OOBServiceMonitor:
                     return bin_id, bin_url
                 else:
                     logging.error(f"Failed to create OOB bin: {resp.status}")
-                    return None, None
+                    # Return fallback to allow validation to continue
+                    fallback_id = f"fallback_{int(time.time())}"
+                    fallback_url = f"https://{service}/fallback/{fallback_id}"
+                    self.active_bins[fallback_id] = {
+                        'service': service,
+                        'url': fallback_url,
+                        'created_at': time.time(),
+                        'callbacks': [],
+                        'fallback': True
+                    }
+                    return fallback_id, fallback_url
 
         except Exception as e:
             logging.error(f"Error creating OOB bin: {e}")
-            return None, None
+            # Return fallback to allow validation to continue instead of failing completely
+            fallback_id = f"fallback_{int(time.time())}"
+            fallback_url = f"https://{self.default_service}/fallback/{fallback_id}"
+            self.active_bins[fallback_id] = {
+                'service': self.default_service,
+                'url': fallback_url,
+                'created_at': time.time(),
+                'callbacks': [],
+                'fallback': True
+            }
+            return fallback_id, fallback_url
 
     async def check_oob_callback(self, bin_id, timeout=30):
         """Check if any callbacks were received for the given bin"""
@@ -23328,6 +23460,12 @@ class OOBServiceMonitor:
             return False, []
 
         bin_info = self.active_bins[bin_id]
+        
+        # Check if this is a fallback bin (created when OOB service failed)
+        if bin_info.get('fallback'):
+            logging.info(f"Bin {bin_id} is a fallback bin - returning inconclusive result")
+            return None, []  # Return None to indicate inconclusive, not False
+
         service = bin_info['service']
 
         if service not in self.service_api_endpoints:
@@ -23356,11 +23494,10 @@ class OOBServiceMonitor:
                         return False, []
                 else:
                     logging.warning(f"Failed to check bin {bin_id}: {resp.status}")
-                    return False, []
-
+                    return None, []  # Return None for inconclusive on failure
         except Exception as e:
             logging.error(f"Error checking OOB callbacks: {e}")
-            return False, []
+            return None, []  # Return None for inconclusive on exception
 
     async def _manual_oob_check(self, bin_info, timeout):
         """Manual OOB check for services without API support"""
@@ -30235,6 +30372,18 @@ class InjectionEngine:
             logging.error(f"Request failed for {url}: {e}")
             return None
     async def _add_vulnerability(self, vuln):
+        # Use SecurityWarning class for structured security alerts
+        if vuln.get('severity') in ('Critical','High'):
+            try:
+                security_warning = SecurityWarning(
+                    message=f"{vuln['type']} vulnerability detected at {vuln['url']}",
+                    severity=vuln.get('severity', 'High').lower(),
+                    cwe=vuln.get('cwe', 'CWE-200')
+                )
+                logging.warning(str(security_warning))
+            except Exception as e:
+                logging.warning(f"Failed to create SecurityWarning: {e}")
+        
         if self.vulnerability_callback:
             await self.vulnerability_callback(vuln)
         else:
@@ -39087,20 +39236,38 @@ class OmegaDAST:
 
         # Wordlist fuzzing initialization with genetic algorithm capabilities - Now integrated into main scan flow
         self.genetic_fuzzing_enabled = config.get('genetic_fuzzing_enabled', False)
+        self.use_genetic_algorithm = config.get('use_genetic_algorithm', False)  # Use actual GeneticFuzzer vs WordlistFuzzer
         if self.genetic_fuzzing_enabled:
             try:
                 max_requests = config.get('fuzz_max_requests', 1000)
                 wordlist = config.get('fuzz_wordlist', None)
                 
-                self.genetic_fuzzer = WordlistFuzzer(
-                    target_url=self.target,
-                    session_manager=self.session_manager,
-                    wordlist=wordlist,
-                    max_requests=max_requests
-                )
-                logging.info("Wordlist fuzzing enabled and initialized in OmegaDAST")
+                if self.use_genetic_algorithm:
+                    # Use GeneticFuzzer for evolutionary fuzzing
+                    population_size = config.get('genetic_population_size', 50)
+                    generations = config.get('genetic_generations', 10)
+                    mutation_rate = config.get('genetic_mutation_rate', 0.1)
+                    
+                    self.genetic_fuzzer = GeneticFuzzer(
+                        target_url=self.target,
+                        session_manager=self.session_manager,
+                        population_size=population_size,
+                        generations=generations,
+                        mutation_rate=mutation_rate,
+                        max_requests=max_requests
+                    )
+                    logging.info("Genetic algorithm fuzzing enabled and initialized in OmegaDAST")
+                else:
+                    # Use WordlistFuzzer for dictionary-based fuzzing
+                    self.genetic_fuzzer = WordlistFuzzer(
+                        target_url=self.target,
+                        session_manager=self.session_manager,
+                        wordlist=wordlist,
+                        max_requests=max_requests
+                    )
+                    logging.info("Wordlist fuzzing enabled and initialized in OmegaDAST")
             except Exception as e:
-                logging.warning(f"Failed to initialize wordlist fuzzing in OmegaDAST: {e}")
+                logging.warning(f"Failed to initialize fuzzing in OmegaDAST: {e}")
                 self.genetic_fuzzing_enabled = False
                 self.genetic_fuzzer = None
         else:
@@ -39192,6 +39359,24 @@ class OmegaDAST:
         self.log(f"GraphQL batch limit: {self.graphql_batch_limit}")
         self.log(f"gRPC fuzzing intensity: {self.grpc_fuzzing_intensity}")
         
+        # Initialize REST API Server for headless mode and CI/CD integration
+        print("Initializing REST API Server...")
+        try:
+            api_config = config.get('rest_api', {})
+            api_host = api_config.get('host', '127.0.0.1')
+            api_port = api_config.get('port', 8080)
+            self.rest_api_server = RESTAPIServer(host=api_host, port=api_port)
+            self.rest_api_server.set_scanner(self)
+            self.rest_api_enabled = api_config.get('enabled', False)
+            if self.rest_api_enabled:
+                self.log(f"REST API Server initialized on {api_host}:{api_port}")
+            else:
+                self.log("REST API Server initialized but disabled")
+        except Exception as e:
+            logging.error(f"Failed to initialize REST API Server: {e}")
+            self.rest_api_server = None
+            self.rest_api_enabled = False
+        
         # Initialize enhanced SPA route discovery and FSM components
         print("Initializing enhanced SPA route discovery and FSM components...")
         try:
@@ -39251,6 +39436,16 @@ class OmegaDAST:
         self.allowed_domains = set(config.get('allowed_domains', [self.base_domain]))
         if not self.allowed_domains:
             # If no whitelist configured, allow only the target domain
+            self.allowed_domains.add(self.base_domain)
+        
+        # Initialize Detector class for object-oriented vulnerability detection
+        print("Initializing Detector for object-oriented vulnerability detection...")
+        try:
+            self.detector = Detector()
+            self.log("Detector initialized for object-oriented vulnerability detection")
+        except Exception as e:
+            logging.error(f"Failed to initialize Detector: {e}")
+            self.detector = None
             self.allowed_domains = {self.base_domain}
             logging.warning(f"No ALLOWED_DOMAINS configured, defaulting to target domain: {self.base_domain}")
     
@@ -39361,6 +39556,17 @@ class OmegaDAST:
             self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
             self.add_finding(vuln)
             if vuln.get('severity') in ('Critical','High'):
+                # Use SecurityWarning class for structured security alerts
+                try:
+                    security_warning = SecurityWarning(
+                        message=f"{vuln['type']} vulnerability detected at {vuln['url']}",
+                        severity=vuln.get('severity', 'High').lower(),
+                        cwe=vuln.get('cwe', 'CWE-200')
+                    )
+                    logging.warning(str(security_warning))
+                except Exception as e:
+                    logging.warning(f"Failed to create SecurityWarning: {e}")
+                
                 slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
                 slack_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None))
                 jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
@@ -39935,6 +40141,15 @@ class OmegaDAST:
         # Initialize scan statistics
         self.scan_stats['start_time'] = datetime.now().isoformat()
         
+        # Start REST API Server if enabled
+        if self.rest_api_enabled and self.rest_api_server:
+            try:
+                self.rest_api_runner = await self.rest_api_server.start()
+                self.log("REST API Server started successfully")
+            except Exception as e:
+                logging.error(f"Failed to start REST API Server: {e}")
+                self.rest_api_runner = None
+        
         # Log safety configuration at start of scan
         maturity_level = self.config.get('maturity_level', 3)
         dry_run = self.config.get('dry_run', False)
@@ -40483,6 +40698,14 @@ class OmegaDAST:
                 self.log("Off-Peak Scheduler shutdown completed")
             except Exception as e:
                 logging.error(f"Error shutting down off-peak scheduler: {e}")
+        
+        # Stop REST API Server if it was started
+        if hasattr(self, 'rest_api_server') and self.rest_api_server and hasattr(self, 'rest_api_runner') and self.rest_api_runner:
+            try:
+                await self.rest_api_server.stop()
+                self.log("REST API Server stopped successfully")
+            except Exception as e:
+                logging.error(f"Error stopping REST API Server: {e}")
         
         self.oob_manager.stop()
         await self.reporting_engine.close()
@@ -45918,6 +46141,17 @@ class GraphQLSelfReferencingFragmentGenerator:
             self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
             self.add_finding(vuln)
             if vuln.get('severity') in ('Critical','High'):
+                # Use SecurityWarning class for structured security alerts
+                try:
+                    security_warning = SecurityWarning(
+                        message=f"{vuln['type']} vulnerability detected at {vuln['url']}",
+                        severity=vuln.get('severity', 'High').lower(),
+                        cwe=vuln.get('cwe', 'CWE-200')
+                    )
+                    logging.warning(str(security_warning))
+                except Exception as e:
+                    logging.warning(f"Failed to create SecurityWarning: {e}")
+                
                 slack_task = asyncio.ensure_future(self.send_slack_alert(vuln))
                 slack_task.add_done_callback(lambda t: None if t.cancelled() else (logging.error(f"Slack alert failed: {t.exception()}") if t.exception() else None))
                 jira_task = asyncio.ensure_future(self.send_jira_alert(vuln))
@@ -52754,7 +52988,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v19.4 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v19.6 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -53233,12 +53467,13 @@ class MainWindow(QMainWindow):
     def add_proxy_tab(self):
         # Check if proxy tab already exists
         for i in range(self.tabs.count()):
-            if isinstance(self.tabs.widget(i), ProxyTab):
+            if isinstance(self.tabs.widget(i), ProxyTab) or isinstance(self.tabs.widget(i), AdvancedProxyTab):
                 self.tabs.setCurrentIndex(i)
                 return
         
-        tab = ProxyTab()
-        self.tabs.addTab(tab, "🔗 Proxy")
+        # Use AdvancedProxyTab for enhanced Burp-like features
+        tab = AdvancedProxyTab()
+        self.tabs.addTab(tab, "🔗 Advanced Proxy")
         self.tabs.setCurrentIndex(self.tabs.count() - 1)
     
     def add_gray_zone_tab(self):
@@ -53893,7 +54128,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v19.4']
+                        ['Tool Version', 'UltraDAST v19.6']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -54079,7 +54314,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v19.4",
+                            "tool": "UltraDAST v19.6",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -54369,7 +54604,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v19.4 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v19.6 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -59448,17 +59683,7 @@ class WordlistFuzzer:
             'final_population_size': len(self.population)
         }
     
-    async def _evaluate_individual(self, individual):
-        """Evaluate a single individual by sending it as a fuzzing request"""
-        # Extract data from individual
-        data = individual.get('data', '')
-        method = individual.get('method', 'POST')
-        headers = individual.get('headers', {})
-        
-        # Send fuzzing request
-        result = await self._send_fuzz_request('genetic_param', data, method, headers)
-        
-        return result
+
 
 
 # ---------------------------------------------------------------------
@@ -59497,6 +59722,89 @@ class GeneticFuzzer:
         
         logging.info(f"GeneticFuzzer initialized with population_size={population_size}, "
                    f"generations={generations}, crossover_rate={crossover_rate}, mutation_rate={mutation_rate}")
+    
+    async def _send_fuzz_request(self, parameter_name, payload, method='POST', headers=None):
+        """Send a fuzzing request to the target"""
+        try:
+            # Use session manager to send request
+            if hasattr(self.session_manager, 'session_manager'):
+                session = self.session_manager.session_manager
+            elif hasattr(self.session_manager, 'session'):
+                session = self.session_manager.session
+            else:
+                session = self.session_manager
+            
+            # Prepare request
+            url = self.target_url
+            if method == 'GET':
+                url = f"{url}?{parameter_name}={payload}"
+                response = await session.get(url, headers=headers)
+            else:
+                data = {parameter_name: payload}
+                response = await session.post(url, json=data, headers=headers)
+            
+            # Analyze response
+            response_text = await response.text()
+            response_status = response.status
+            
+            # Calculate fitness based on response characteristics
+            fitness = self._calculate_fitness(response_status, response_text, payload)
+            
+            return {
+                'fitness': fitness,
+                'status': response_status,
+                'response_length': len(response_text),
+                'payload': payload,
+                'interesting': self._is_interesting_response(response_status, response_text)
+            }
+            
+        except Exception as e:
+            logging.warning(f"Genetic fuzzer request failed: {e}")
+            return {
+                'fitness': 0,
+                'status': 0,
+                'response_length': 0,
+                'payload': payload,
+                'interesting': False,
+                'error': str(e)
+            }
+    
+    def _calculate_fitness(self, status, response_text, payload):
+        """Calculate fitness score for a response"""
+        fitness = 0
+        
+        # Higher fitness for different status codes
+        if status != 200:
+            fitness += 10
+        if status >= 400:
+            fitness += 20
+        if status >= 500:
+            fitness += 30
+        
+        # Higher fitness for longer responses (potential data leakage)
+        fitness += min(len(response_text) / 100, 10)
+        
+        # Higher fitness for interesting patterns in response
+        interesting_patterns = ['error', 'exception', 'warning', 'sql', 'mysql', 'postgres', 'oracle']
+        for pattern in interesting_patterns:
+            if pattern.lower() in response_text.lower():
+                fitness += 5
+        
+        return fitness
+    
+    def _is_interesting_response(self, status, response_text):
+        """Determine if response is interesting (potential vulnerability)"""
+        # Check for error messages
+        if status >= 400:
+            return True
+        
+        # Check for interesting patterns
+        interesting_patterns = ['error', 'exception', 'warning', 'sql', 'mysql', 'postgres', 'oracle', 'stack trace']
+        for pattern in interesting_patterns:
+            if pattern.lower() in response_text.lower():
+                return True
+        
+        return False
     
     def _get_default_wordlist(self):
         """Default wordlist for genetic fuzzing"""
