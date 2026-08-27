@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v19.6 – The Unstoppable Pentester Platform
+ULTRA-DAST v19.7 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -27662,7 +27662,11 @@ class DiskBasedURLStorage:
     def close(self):
         """Close database connection"""
         with self.lock:
-            self.conn.close()
+            try:
+                if self.conn:
+                    self.conn.close()
+            except Exception as e:
+                logging.warning(f"Error closing database connection: {e}")
     
     def __enter__(self):
         """Context manager entry - return self for use with 'with' statement."""
@@ -27691,6 +27695,15 @@ class DiskBasedVulnerabilityStorage:
         # Keep connection open for long-lived operations
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
 
+    def _ensure_connection(self):
+        """Ensure database connection is open, reopen if closed"""
+        try:
+            # Try to execute a simple query to check if connection is alive
+            self.conn.execute("SELECT 1")
+        except (sqlite3.ProgrammingError, AttributeError):
+            # Connection is closed or doesn't exist, reopen it
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
     def _init_tables_sync(self, conn):
         """Synchronous table initialization for use with context manager"""
         conn.execute('''CREATE TABLE IF NOT EXISTS vulnerabilities
@@ -27710,6 +27723,7 @@ class DiskBasedVulnerabilityStorage:
     def add_vulnerability(self, vulnerability: Dict[str, Any]) -> int:
         """Add vulnerability to database"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute(
                 """INSERT INTO vulnerabilities 
                    (type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload)
@@ -27732,6 +27746,7 @@ class DiskBasedVulnerabilityStorage:
     def get_vulnerabilities_paginated(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
         """Get vulnerabilities with pagination for memory efficiency"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute(
                 """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
                    FROM vulnerabilities ORDER BY timestamp DESC LIMIT ? OFFSET ?""",
@@ -27756,6 +27771,7 @@ class DiskBasedVulnerabilityStorage:
     def get_vulnerabilities_by_severity(self, severity: str) -> List[Dict[str, Any]]:
         """Get all vulnerabilities of a specific severity"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute(
                 """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
                    FROM vulnerabilities WHERE severity = ? ORDER BY timestamp DESC""",
@@ -27780,6 +27796,7 @@ class DiskBasedVulnerabilityStorage:
     def get_vulnerabilities_by_type(self, vuln_type: str) -> List[Dict[str, Any]]:
         """Get all vulnerabilities of a specific type"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute(
                 """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
                    FROM vulnerabilities WHERE type = ? ORDER BY timestamp DESC""",
@@ -27804,18 +27821,21 @@ class DiskBasedVulnerabilityStorage:
     def get_vulnerability_count(self) -> int:
         """Get total count of vulnerabilities"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities")
             return cursor.fetchone()[0]
 
     def get_vulnerability_count_by_severity(self, severity: str) -> int:
         """Get count of vulnerabilities by severity"""
         with self.lock:
+            self._ensure_connection()
             cursor = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities WHERE severity = ?", (severity,))
             return cursor.fetchone()[0]
 
     def cleanup_old_vulnerabilities(self, max_age_hours: int = 24):
         """Remove vulnerabilities older than specified hours"""
         with self.lock:
+            self._ensure_connection()
             cutoff_time = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
             cursor = self.conn.execute(
                 "DELETE FROM vulnerabilities WHERE timestamp < ?",
@@ -27827,6 +27847,7 @@ class DiskBasedVulnerabilityStorage:
     def get_storage_stats(self) -> Dict[str, Any]:
         """Get storage statistics"""
         with self.lock:
+            self._ensure_connection()
             total_count = self.conn.execute("SELECT COUNT(*) FROM vulnerabilities").fetchone()[0]
             
             # Get counts by severity
@@ -27849,29 +27870,54 @@ class DiskBasedVulnerabilityStorage:
     def get_all_vulnerabilities(self) -> List[Dict[str, Any]]:
         """Get all vulnerabilities (use with caution for large datasets)"""
         with self.lock:
-            cursor = self.conn.execute(
-                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
-                   FROM vulnerabilities ORDER BY timestamp DESC"""
-            )
-            rows = cursor.fetchall()
-            return [
-                {
-                    'type': row[0],
-                    'url': row[1],
-                    'parameter': row[2],
-                    'evidence': row[3],
-                    'severity': row[4],
-                    'confidence': row[5],
-                    'cwe': row[6],
-                    'timestamp': row[7],
-                    'payload': row[8]
-                }
-                for row in rows
-            ]
+            self._ensure_connection()
+            try:
+                cursor = self.conn.execute(
+                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                       FROM vulnerabilities ORDER BY timestamp DESC"""
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        'type': row[0],
+                        'url': row[1],
+                        'parameter': row[2],
+                        'evidence': row[3],
+                        'severity': row[4],
+                        'confidence': row[5],
+                        'cwe': row[6],
+                        'timestamp': row[7],
+                        'payload': row[8]
+                    }
+                    for row in rows
+                ]
+            except sqlite3.ProgrammingError:
+                # Connection was closed, try to reopen and retry
+                self._ensure_connection()
+                cursor = self.conn.execute(
+                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                       FROM vulnerabilities ORDER BY timestamp DESC"""
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        'type': row[0],
+                        'url': row[1],
+                        'parameter': row[2],
+                        'evidence': row[3],
+                        'severity': row[4],
+                        'confidence': row[5],
+                        'cwe': row[6],
+                        'timestamp': row[7],
+                        'payload': row[8]
+                    }
+                    for row in rows
+                ]
 
     def clear_all_vulnerabilities(self):
         """Clear all vulnerabilities from database"""
         with self.lock:
+            self._ensure_connection()
             self.conn.execute("DELETE FROM vulnerabilities")
             self.conn.commit()
 
@@ -52988,7 +53034,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v19.6 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v19.7 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -54128,7 +54174,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v19.6']
+                        ['Tool Version', 'UltraDAST v19.7']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -54314,7 +54360,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v19.6",
+                            "tool": "UltraDAST v19.7",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -54604,7 +54650,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v19.6 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v19.7 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
