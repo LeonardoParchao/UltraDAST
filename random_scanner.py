@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v19.3 – The Unstoppable Pentester Platform
+ULTRA-DAST v19.4 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -22110,6 +22110,9 @@ class ValidationEngine:
         self.validation_results = {}
         self.oob_markers = []
         
+        # Initialize reporting_engine reference for GUI integration
+        self.reporting_engine = None
+        
         # OOB Service Monitoring
         self.oob_monitor = OOBServiceMonitor(session)
         self.current_oob_bin = None
@@ -22323,6 +22326,15 @@ class ValidationEngine:
         vuln['validation_results'] = validation_results
         vuln['confidence'] = validation_results['final_confidence']
         vuln['validated'] = True
+        
+        # Emit validated finding to GUI if available
+        if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'add_finding'):
+            try:
+                self.reporting_engine.add_finding(vuln)
+                logging.info(f"Validated finding emitted to GUI: {vuln_type} at {url}")
+            except Exception as e:
+                logging.warning(f"Failed to emit validated finding to GUI: {e}")
+        
         return vuln
     async def _validate_original_payload(self, vuln, url, parameter, payload):
         try:
@@ -23441,6 +23453,11 @@ class SurgicalModeOrchestrator:
         self.config = config or {}
         self.scanner = scanner
         
+        # Initialize reporting_engine reference for GUI integration
+        self.reporting_engine = None
+        if scanner and hasattr(scanner, 'reporting_engine'):
+            self.reporting_engine = scanner.reporting_engine
+        
         # Surgical Mode Configuration
         self.critical_vulnerability_types = {'RCE', 'SQLi', 'Auth Bypass', 'IDOR', 'SSRF'}
         self.low_priority_types = {'Info Disclosure', 'Header Misconfig', 'Version Disclosure'}
@@ -23827,7 +23844,7 @@ class SurgicalModeOrchestrator:
     def _add_gray_zone_to_reporting(self, gray_zone_entry):
         """Add gray zone findings to the main reporting flow for GUI display and export"""
         try:
-            if hasattr(self, 'reporting_engine'):
+            if self.reporting_engine:
                 vuln = gray_zone_entry.get('vulnerability', {}).copy()
                 # Mark as gray zone for identification
                 vuln['gray_zone'] = True
@@ -24026,8 +24043,8 @@ class SurgicalModeOrchestrator:
     
     def _push_verified_findings_to_reporting(self, final_results):
         """Push all verified findings through the reporting pipeline for GUI display and export"""
-        if not self.scanner or not hasattr(self.scanner, 'reporting_engine'):
-            logging.warning("Cannot push findings to reporting - scanner or reporting_engine not available")
+        if not self.reporting_engine:
+            logging.warning("Cannot push findings to reporting - reporting_engine not available")
             return
         
         verified_findings = final_results.get('verified_findings', [])
@@ -39616,6 +39633,9 @@ class OmegaDAST:
             
             self.validation_engine = ValidationEngine(session_to_use, validation_config)
             
+            # Set reporting_engine reference for GUI integration
+            self.validation_engine.reporting_engine = self.reporting_engine
+            
             # Initialize Surgical Mode Orchestrator if intelligent verification is enabled
             if self.config.get('intelligent_verification', {}).get('enabled', False):
                 self.surgical_orchestrator = SurgicalModeOrchestrator(self.validation_engine, self.config, self)
@@ -49517,6 +49537,8 @@ class ScannerWorker(QThread):
         self.scanner = None
         self.pause_event = asyncio.Event()
         self.pause_event.set()  # Initially set (not paused)
+        self.all_findings = []  # Initialize findings list for GUI integration
+        self.reporting_engine = None  # Will be set when scanner is initialized
 
     def run(self):
         asyncio.set_event_loop(self.loop)
@@ -49524,6 +49546,11 @@ class ScannerWorker(QThread):
             self.log.emit("Creating OmegaDAST scanner...")
             self.scanner = OmegaDAST(self.target, self.config, self, loop=self.loop, pause_event=self.pause_event)
             self.log.emit("OmegaDAST created successfully, starting scan...")
+            
+            # Set reporting_engine reference for findings integration
+            if hasattr(self.scanner, 'reporting_engine'):
+                self.reporting_engine = self.scanner.reporting_engine
+            
             # Emit scanner_ready signal to allow GUI to access shared FP_Database
             self.scanner_ready.emit(self.scanner)
             self.loop.run_until_complete(self.scanner.scan())
@@ -49549,7 +49576,7 @@ class ScannerWorker(QThread):
             
             # Generate final report
             report = {
-                'vulnerabilities': self.reporting_engine.vulnerabilities if hasattr(self, 'reporting_engine') else [],
+                'vulnerabilities': self.scanner.reporting_engine.vulnerabilities if hasattr(self.scanner, 'reporting_engine') else [],
                 'target': self.target,
                 'scan_time': datetime.now().isoformat(),
                 'safety_stats': safety_stats,
@@ -51791,6 +51818,21 @@ class ScanTab(QWidget):
         
         # Update table with pagination - only show current page
         self.update_findings_table()
+        
+        # Also sync with worker's all_findings if available
+        if hasattr(self, 'worker') and hasattr(self.worker, 'all_findings'):
+            # Check if finding already exists in worker's list to avoid duplicates
+            vuln_key = (vuln.get('type', ''), vuln.get('url', ''), vuln.get('parameter', ''))
+            already_exists = False
+            for existing_vuln in self.worker.all_findings:
+                if (existing_vuln.get('type', '') == vuln_key[0] and 
+                    existing_vuln.get('url', '') == vuln_key[1] and 
+                    existing_vuln.get('parameter', '') == vuln_key[2]):
+                    already_exists = True
+                    break
+            
+            if not already_exists:
+                self.worker.all_findings.append(vuln)
     
     def update_findings_table(self):
         """Update the findings table with paginated data"""
@@ -52107,7 +52149,27 @@ class ScanTab(QWidget):
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(False)
         self.progress_bar.setValue(100)
-        self.log_area.append(f"\nScan complete. {len(report['vulnerabilities'])} findings.")
+        
+        # Ensure all findings from the reporting engine are integrated into GUI
+        if hasattr(self.worker, 'scanner') and hasattr(self.worker.scanner, 'reporting_engine'):
+            scanner_findings = self.worker.scanner.reporting_engine.vulnerabilities
+            # Merge findings without duplicates
+            for scanner_finding in scanner_findings:
+                vuln_key = (scanner_finding.get('type', ''), scanner_finding.get('url', ''), scanner_finding.get('parameter', ''))
+                already_exists = False
+                for existing_vuln in self.all_findings:
+                    if (existing_vuln.get('type', '') == vuln_key[0] and 
+                        existing_vuln.get('url', '') == vuln_key[1] and 
+                        existing_vuln.get('parameter', '') == vuln_key[2]):
+                        already_exists = True
+                        break
+                if not already_exists:
+                    self.all_findings.append(scanner_finding)
+            
+            # Update findings table with all integrated findings
+            self.update_findings_table()
+        
+        self.log_area.append(f"\nScan complete. {len(self.all_findings)} findings.")
         
         # Display maturity model statistics if available
         if 'safety_stats' in report:
@@ -52692,7 +52754,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v19.3 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v19.4 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -53831,7 +53893,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v19.3']
+                        ['Tool Version', 'UltraDAST v19.4']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -54017,7 +54079,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v19.3",
+                            "tool": "UltraDAST v19.4",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -54307,7 +54369,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v19.3 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v19.4 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
