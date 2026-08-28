@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v19.7 – The Unstoppable Pentester Platform
+ULTRA-DAST v19.9 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -107,6 +107,26 @@ GRAPHQL TESTING FEATURES:
 - Advanced batching attacks (nested batching, mixed operations, resource exhaustion)
 - Sophisticated alias attacks (circular references, combinatorial explosion, field duplication)
 - Comprehensive depth-bomb variations (deep nesting, circular fragments, directive abuse)
+
+COMPREHENSIVE PORT SCANNING CONFIGURATION EXAMPLE:
+{
+    "comprehensive_port_scan": true,
+    "enable_udp_scan": true,
+    "enable_sctp_scan": false,
+    "port_range": null
+}
+
+COMPREHENSIVE PORT SCANNING FEATURES:
+- Full port range scanning (1-65535) when comprehensive_port_scan is enabled
+- Multi-protocol support: TCP (tcp_connect, SYN scan), UDP, and SCTP
+- Enhanced service detection with banner grabbing and version extraction
+- Service-specific analysis for SSH, HTTP, databases (MySQL, PostgreSQL, Redis, MongoDB)
+- Custom port range support for targeted scanning
+- Concurrent scanning with rate limiting for performance
+- Protocol breakdown reporting (TCP, UDP, SCTP port counts)
+- Database-specific vulnerability detection (empty passwords, weak TLS, CVE checks)
+- SSH-specific analysis (CVE-2024-6387, weak algorithms, default credentials)
+- HTTP service analysis (server version, technology detection)
 
 ENHANCED SPA ROUTE DISCOVERY CONFIGURATION EXAMPLE:
 {
@@ -672,9 +692,28 @@ if multiprocessing.get_start_method() is None:
         multiprocessing.set_start_method('fork')
 
 import aiohttp
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, FormData
 import glob
 import markupsafe
+
+# Optional yaml import with fallback
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+    yaml = None
+    logging.warning("yaml library not available - YAML-based CVE templates will be disabled")
+
+# Optional cryptography import with fallback
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+    logging.warning("cryptography library not available - JWKS RSA key extraction will be disabled")
 
 # Optional psutil import for process cleanup
 try:
@@ -735,8 +774,8 @@ class RequestDeduplicator:
     
     def __init__(self, config=None):
         self.config = config or {}
-        self.enabled = config.get('request_deduplication_enabled', True)
-        self.disabled_endpoints = config.get('disabled_endpoints', [])  # Endpoints to skip deduplication
+        self.enabled = self.config.get('request_deduplication_enabled', True)
+        self.disabled_endpoints = self.config.get('disabled_endpoints', [])  # Endpoints to skip deduplication
         self.request_signatures = OrderedDict()  # Store request signatures with LRU eviction
         self.response_signatures = OrderedDict()  # Store response signatures with LRU eviction
         self.dedup_stats = {
@@ -746,8 +785,8 @@ class RequestDeduplicator:
             'cache_hits': 0
         }
         self.signature_cache = OrderedDict()
-        self.max_cache_size = config.get('dedup_cache_size', 10000)
-        self.body_truncation_size = config.get('body_truncation_size', 1000)  # Configurable truncation size
+        self.max_cache_size = self.config.get('dedup_cache_size', 10000)
+        self.body_truncation_size = self.config.get('body_truncation_size', 1000)  # Configurable truncation size
         
         if self.enabled:
             logging.info("Request deduplication engine initialized")
@@ -969,8 +1008,8 @@ class HTTP2Client:
     
     def __init__(self, config=None):
         self.config = config or {}
-        self.enabled = config.get('http2_enabled', True)
-        self.max_concurrent_streams = config.get('http2_max_streams', 200)  # Increased from 100
+        self.enabled = self.config.get('http2_enabled', True)
+        self.max_concurrent_streams = self.config.get('http2_max_streams', 200)  # Increased from 100
         self.session = None
         self.stream_priorities = {}
         self.stream_counter = 0
@@ -1000,8 +1039,7 @@ class HTTP2Client:
                 enable_cleanup_closed=True,
                 ttl_dns_cache=300,  # Cache DNS for 5 minutes
                 use_dns_cache=True,
-                keepalive_timeout=30,  # Keep connections alive longer
-                enable_http2=True  # Explicitly enable HTTP/2
+                keepalive_timeout=30  # Keep connections alive longer
             )
             
             # Configure session for HTTP/2 with optimized timeout
@@ -1012,8 +1050,7 @@ class HTTP2Client:
             )
             session = aiohttp.ClientSession(
                 connector=connector,
-                timeout=timeout,
-                version=aiohttp.HttpVersion20  # Use HTTP/2
+                timeout=timeout
             )
             
             self.connection_pool[host] = session
@@ -1155,11 +1192,11 @@ class HTTP3Client:
     
     def __init__(self, config=None):
         self.config = config or {}
-        self.enabled = config.get('http3_enabled', False)
+        self.enabled = self.config.get('http3_enabled', False)
         self.session = None
         self.quic_available = False
         self.aioquic_available = False
-        self.verify_ssl = config.get('verify_ssl', True)  # Default to secure SSL verification
+        self.verify_ssl = self.config.get('verify_ssl', True)  # Default to secure SSL verification
         
         if self.enabled:
             try:
@@ -1222,7 +1259,11 @@ class HTTP3Client:
             from aioquic.asyncio import connect
             
             # Set up event loop for QUIC
-            loop = asyncio.get_event_loop()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             
             # Create QUIC connection
             async with connect(
@@ -1740,7 +1781,14 @@ class AsyncTaskManager:
                 logging.error(f"Task '{task_name}' failed with unexpected error: {e}", exc_info=True)
                 raise  # Re-raise to ensure proper exception propagation
         
-        task = asyncio.create_task(wrapped_coro())
+        # Safe event loop handling for sync contexts
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        task = loop.create_task(wrapped_coro())
         
         # Add proper exception handling callback
         def handle_completion(t):
@@ -2365,7 +2413,7 @@ class RESTAPIServer:
                 }
                 
                 # Process Gray Zone findings if auto-processing is enabled
-                gray_zone_config = config.get('gray_zone_handling', {})
+                gray_zone_config = self.config.get('gray_zone_handling', {})
                 if gray_zone_config.get('auto_process_on_scan_complete', False):
                     try:
                         if hasattr(self.scanner_instance, 'validation_engine'):
@@ -2898,10 +2946,11 @@ class CVETemplateEngine:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 if file_ext in ['.yaml', '.yml']:
-                    import yaml
+                    if not YAML_AVAILABLE:
+                        logging.warning("YAML library not available, cannot load YAML templates")
+                        return None
                     return yaml.safe_load(f)
                 elif file_ext == '.json':
-                    import json
                     return json.load(f)
                 else:
                     logging.warning(f"Unsupported template format: {file_ext}")
@@ -2909,7 +2958,7 @@ class CVETemplateEngine:
         except ImportError as e:
             logging.error(f"Missing required library for template loading: {e}")
             return None
-        except (IOError, OSError, ValueError, yaml.YAMLError, json.JSONDecodeError) as e:
+        except (IOError, OSError, ValueError, Exception) as e:
             logging.error(f"Error loading template file {file_path}: {e}")
             return None
             
@@ -3237,18 +3286,17 @@ class CVETemplateEngine:
         file_path = os.path.join(self.template_directory, filename)
         
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                import yaml
-                yaml.dump(template, f, default_flow_style=False)
-            logging.info(f"Saved template to: {file_path}")
-            return True
-        except ImportError:
-            # Fallback to JSON if YAML is not available
-            with open(file_path.replace('.yaml', '.json'), 'w', encoding='utf-8') as f:
-                import json
-                json.dump(template, f, indent=2)
-            logging.info(f"Saved template to JSON: {file_path}")
-            return True
+            if YAML_AVAILABLE:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(template, f, default_flow_style=False)
+                logging.info(f"Saved template to: {file_path}")
+                return True
+            else:
+                # Fallback to JSON if YAML is not available
+                with open(file_path.replace('.yaml', '.json'), 'w', encoding='utf-8') as f:
+                    json.dump(template, f, indent=2)
+                logging.info(f"Saved template to JSON: {file_path}")
+                return True
         except (IOError, OSError, PermissionError, ValueError) as e:
             logging.error(f"Failed to save template: {e}")
             return False
@@ -5241,7 +5289,11 @@ class AdvancedProxyTab(QWidget):
         # Signal the waiting interception handler
         if intercept_item['event'] and not intercept_item['event'].is_set():
             import asyncio
-            loop = asyncio.get_event_loop()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             loop.call_soon_threadsafe(intercept_item['event'].set)
         
         # Clear the intercept view
@@ -5284,7 +5336,11 @@ class AdvancedProxyTab(QWidget):
         # Signal the waiting interception handler
         if intercept_item['event'] and not intercept_item['event'].is_set():
             import asyncio
-            loop = asyncio.get_event_loop()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             loop.call_soon_threadsafe(intercept_item['event'].set)
         
         # Clear the intercept view
@@ -5608,8 +5664,6 @@ class AdvancedProxyTab(QWidget):
             QMessageBox.information(self, "Rule Added", "Modification rule added successfully")
 
 
-import aiohttp
-from aiohttp import FormData
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 import bs4
@@ -5905,7 +5959,7 @@ class BeautifulSoupCache:
                 return self._cache[cache_key]
         
         # Parse HTML in thread pool for parallel processing
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
         
         def parse_html():
             # Create new BeautifulSoup object with explicit parser
@@ -10089,7 +10143,9 @@ _fallback_dns_oob_results = []
 _fallback_https_oob_results = []
 _fallback_icmp_oob_results = []
 # Single unified lock for all OOB operations to prevent deadlock
-# Using asyncio.Lock instead of threading.Lock to prevent deadlock in async contexts
+# Using threading.Lock for synchronous contexts (HTTP handlers) and asyncio.Lock for async contexts
+import threading
+_fallback_oob_unified_lock_threading = threading.Lock()
 _fallback_oob_unified_lock = asyncio.Lock()
 _fallback_oob_results_lock = asyncio.Lock()
 _fallback_smtp_oob_lock = asyncio.Lock()
@@ -10112,6 +10168,7 @@ def get_oob_results_lists():
             'https_oob_results': scanner_instance.https_oob_results,
             'icmp_oob_results': scanner_instance.icmp_oob_results,
             'oob_unified_lock': scanner_instance.oob_unified_lock,
+            'oob_unified_lock_threading': getattr(scanner_instance, 'oob_unified_lock_threading', threading.Lock()),
             'oob_results_lock': scanner_instance.oob_results_lock,
             'smtp_oob_lock': scanner_instance.smtp_oob_lock,
             'dns_oob_lock': scanner_instance.dns_oob_lock,
@@ -10127,6 +10184,7 @@ def get_oob_results_lists():
         'https_oob_results': _fallback_https_oob_results,
         'icmp_oob_results': _fallback_icmp_oob_results,
         'oob_unified_lock': _fallback_oob_unified_lock,
+        'oob_unified_lock_threading': _fallback_oob_unified_lock_threading,
         'oob_results_lock': _fallback_oob_results_lock,
         'smtp_oob_lock': _fallback_smtp_oob_lock,
         'dns_oob_lock': _fallback_dns_oob_lock,
@@ -10174,27 +10232,33 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Extract marker from path
         marker = self.path.strip('/').split('/')[0] if self.path != '/' else None
-        
+
         callback_data = {
             'path': self.path,
             'source': self.client_address[0],
             'time': datetime.now().isoformat(),
             'marker': marker
         }
-        
+
         oob_lists = get_oob_results_lists()
-        # Handle async lock in synchronous context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                oob_lists['oob_unified_lock'].acquire()
-            )
-            oob_lists['oob_results'].append(callback_data)
-            oob_lists['oob_unified_lock'].release()
-        finally:
-            loop.close()
-        
+        # Use threading lock for synchronous HTTP handler context
+        oob_unified_lock_threading = oob_lists.get('oob_unified_lock_threading')
+        if oob_unified_lock_threading:
+            with oob_unified_lock_threading:
+                oob_lists['oob_results'].append(callback_data)
+        else:
+            # Fallback to async lock (should not happen in normal operation)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    oob_lists['oob_unified_lock'].acquire()
+                )
+                oob_lists['oob_results'].append(callback_data)
+                oob_lists['oob_unified_lock'].release()
+            finally:
+                loop.close()
+
         # Mark as received if this marker was pending or in history (race condition protection)
         if marker:
             with pending_oob_lock:
@@ -10211,7 +10275,7 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
             
             # Trigger event-based notification
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 if loop.is_running():
                     asyncio.create_task(trigger_oob_callback_event(marker))
             except RuntimeError:
@@ -10224,10 +10288,10 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
-        
+
         # Extract marker from path
         marker = self.path.strip('/').split('/')[0] if self.path != '/' else None
-        
+
         callback_data = {
             'path': self.path,
             'source': self.client_address[0],
@@ -10236,20 +10300,26 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
             'body': body.decode('utf-8', errors='ignore')[:500],
             'marker': marker
         }
-        
+
         oob_lists = get_oob_results_lists()
-        # Handle async lock in synchronous context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                oob_lists['oob_unified_lock'].acquire()
-            )
-            oob_lists['oob_results'].append(callback_data)
-            oob_lists['oob_unified_lock'].release()
-        finally:
-            loop.close()
-        
+        # Use threading lock for synchronous HTTP handler context
+        oob_unified_lock_threading = oob_lists.get('oob_unified_lock_threading')
+        if oob_unified_lock_threading:
+            with oob_unified_lock_threading:
+                oob_lists['oob_results'].append(callback_data)
+        else:
+            # Fallback to async lock (should not happen in normal operation)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    oob_lists['oob_unified_lock'].acquire()
+                )
+                oob_lists['oob_results'].append(callback_data)
+                oob_lists['oob_unified_lock'].release()
+            finally:
+                loop.close()
+
         # Mark as received if this marker was pending or in history (race condition protection)
         if marker:
             with pending_oob_lock:
@@ -10266,7 +10336,7 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
             
             # Trigger event-based notification
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 if loop.is_running():
                     asyncio.create_task(trigger_oob_callback_event(marker))
             except RuntimeError:
@@ -10281,7 +10351,11 @@ class OOBCallbackHandler(BaseHTTPRequestHandler):
         # Intentionally empty to reduce log noise - HTTP server logging is handled elsewhere
 
 def start_oob_server(bind="127.0.0.1", preferred_port=None):
-    """Start OOB server with error handling for port conflicts using multithreaded server."""
+    """Start OOB server with error handling for port conflicts using multithreaded server.
+    
+    Security Note: Binds to 127.0.0.1 by default to prevent external access.
+    Use bind='0.0.0.0' only if specifically required and with proper firewall rules.
+    """
     try:
         port = PortAllocator.get_available_port(preferred_port)
         # Use ThreadingHTTPServer for concurrent request handling
@@ -10289,6 +10363,8 @@ def start_oob_server(bind="127.0.0.1", preferred_port=None):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logging.info(f"OOB server started on {bind}:{port} with multithreaded support")
+        if bind == "0.0.0.0":
+            logging.warning("OOB server bound to 0.0.0.0 - accessible from external networks. Ensure proper firewall rules are in place.")
         return server, port
     except OSError as e:
         logging.error(f"Failed to start OOB server on {bind}:{preferred_port or 'any port'}: {e}")
@@ -10664,23 +10740,29 @@ class SMTPOOBHandler:
     def handle_smtp(self, data, client_addr):
         try:
             parsed_data = self._parse_smtp_transaction(data)
-            
+
             # Add metadata
             parsed_data['source'] = client_addr[0]
             parsed_data['time'] = datetime.now().isoformat()
-            
+
             oob_lists = get_oob_results_lists()
-            # Handle async lock in synchronous context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    oob_lists['oob_unified_lock'].acquire()
-                )
-                oob_lists['smtp_oob_results'].append(parsed_data)
-                oob_lists['oob_unified_lock'].release()
-            finally:
-                loop.close()
+            # Use threading lock for synchronous SMTP handler context
+            oob_unified_lock_threading = oob_lists.get('oob_unified_lock_threading')
+            if oob_unified_lock_threading:
+                with oob_unified_lock_threading:
+                    oob_lists['smtp_oob_results'].append(parsed_data)
+            else:
+                # Fallback to async lock (should not happen in normal operation)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(
+                        oob_lists['oob_unified_lock'].acquire()
+                    )
+                    oob_lists['smtp_oob_results'].append(parsed_data)
+                    oob_lists['oob_unified_lock'].release()
+                finally:
+                    loop.close()
             
             # Enhanced logging with OOB marker detection
             if parsed_data.get('oob_marker_detected'):
@@ -10701,7 +10783,7 @@ class SMTPOOBHandler:
                     if marker_match:
                         marker = marker_match.group()
                         try:
-                            loop = asyncio.get_event_loop()
+                            loop = asyncio.get_running_loop()
                             if loop.is_running():
                                 asyncio.create_task(trigger_oob_callback_event(marker))
                         except RuntimeError:
@@ -10867,18 +10949,6 @@ def check_smtp_oob_callback(marker, timeout_seconds=30):
         return None
     finally:
         loop.close()
-        if marker in header_value:
-            return result
-        
-        # Check if OOB marker was detected
-        if result.get('oob_marker_detected'):
-                    for location, value, pattern in result.get('detected_markers', []):
-                        if marker in value:
-                            return result
-        
-        time.sleep(0.5)
-    
-    return None
 
 # ---------------------------------------------------------------------
 # DNS OOB CALLBACK LISTENER (No root required)
@@ -11074,23 +11144,35 @@ class DNSOOBListener:
                     
                     if queried_domain:
                         oob_lists = get_oob_results_lists()
-                        # Handle async lock in synchronous context
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        try:
-                            loop.run_until_complete(
-                                oob_lists['oob_unified_lock'].acquire()
-                            )
-                            oob_lists['dns_oob_results'].append({
-                                'domain': queried_domain,
-                                'query_type': query_type,
-                                'source': addr[0],
-                                'time': datetime.now().isoformat(),
-                                'data_size': len(data)
-                            })
-                            oob_lists['oob_unified_lock'].release()
-                        finally:
-                            loop.close()
+                        # Use threading lock for synchronous DNS listener context
+                        oob_unified_lock_threading = oob_lists.get('oob_unified_lock_threading')
+                        if oob_unified_lock_threading:
+                            with oob_unified_lock_threading:
+                                oob_lists['dns_oob_results'].append({
+                                    'domain': queried_domain,
+                                    'query_type': query_type,
+                                    'source': addr[0],
+                                    'time': datetime.now().isoformat(),
+                                    'data_size': len(data)
+                                })
+                        else:
+                            # Fallback to async lock (should not happen in normal operation)
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                loop.run_until_complete(
+                                    oob_lists['oob_unified_lock'].acquire()
+                                )
+                                oob_lists['dns_oob_results'].append({
+                                    'domain': queried_domain,
+                                    'query_type': query_type,
+                                    'source': addr[0],
+                                    'time': datetime.now().isoformat(),
+                                    'data_size': len(data)
+                                })
+                                oob_lists['oob_unified_lock'].release()
+                            finally:
+                                loop.close()
                         
                         # Log with query type information
                         if query_type == 'A':
@@ -11202,11 +11284,12 @@ def get_dns_oob_payloads(oob_dns_domain, dns_port=None):
 
 # ICMP OOB Listener Implementation - Now fully functional with TCP fallback
 # Replaces legacy ICMP OOB functionality with TCP-based alternative
+class ICMPOOBListener:
     """
     ICMP Out-of-Band listener with TCP fallback for environments without root access.
     Note: ICMP requires root/administrator privileges, so we provide TCP fallback.
     """
-    
+
     def __init__(self, callback_ip, callback_port=None):
         self.callback_ip = callback_ip
         self.callback_port = callback_port or 12345  # Default TCP port for fallback
@@ -11511,22 +11594,33 @@ def get_icmp_oob_payloads(oob_ip, icmp_listener=None):
 class HTTPSOOBHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         oob_lists = get_oob_results_lists()
-        # Handle async lock in synchronous context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                oob_lists['oob_unified_lock'].acquire()
-            )
-            oob_lists['https_oob_results'].append({
-                'path': self.path,
-                'source': self.client_address[0],
-                'time': datetime.now().isoformat(),
-                'protocol': 'HTTPS'
-            })
-            oob_lists['oob_unified_lock'].release()
-        finally:
-            loop.close()
+        # Use threading lock for synchronous HTTP handler context
+        oob_unified_lock_threading = oob_lists.get('oob_unified_lock_threading')
+        if oob_unified_lock_threading:
+            with oob_unified_lock_threading:
+                oob_lists['https_oob_results'].append({
+                    'path': self.path,
+                    'source': self.client_address[0],
+                    'time': datetime.now().isoformat(),
+                    'protocol': 'HTTPS'
+                })
+        else:
+            # Fallback to async lock (should not happen in normal operation)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    oob_lists['oob_unified_lock'].acquire()
+                )
+                oob_lists['https_oob_results'].append({
+                    'path': self.path,
+                    'source': self.client_address[0],
+                    'time': datetime.now().isoformat(),
+                    'protocol': 'HTTPS'
+                })
+                oob_lists['oob_unified_lock'].release()
+            finally:
+                loop.close()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
@@ -13258,13 +13352,13 @@ class JWTAttack:
         """
         # FN-07 FIX: Check for manual public key in config first
         if config:
-            manual_public_key = config.get('jwt_public_key')
+            manual_public_key = self.config.get('jwt_public_key')
             if manual_public_key:
                 logging.info("Using manually provided public key from config")
                 return manual_public_key
         
         # FN-07 FIX: Try multiple common JWKS paths
-        jwks_paths = config.get('jwt_jwks_paths', [
+        jwks_paths = self.config.get('jwt_jwks_paths', [
             '/.well-known/jwks.json',
             '/oauth2/jwks.json',
             '/openid-connect/jwks.json',
@@ -14060,18 +14154,29 @@ class StealthModeScheduler:
     - Automatic rate calculation based on total requests
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, target_hash=None):
         """
         Initialize stealth mode scheduler.
         
         Args:
             config: Dictionary containing stealth_mode configuration
+            target_hash: Optional hash of target URL to prevent state collision between concurrent scans
         """
-        self.enabled = config.get('enabled', False)
-        self.window_hours = config.get('window_hours', 24)
-        self.requests_per_window = config.get('requests_per_window', 50)
-        self.jitter_percentage = config.get('jitter_percentage', 20)
-        self.state_file = config.get('state_file', 'stealth_mode_state.json')
+        self.config = config
+        self.enabled = self.config.get('enabled', False)
+        self.window_hours = self.config.get('window_hours', 24)
+        self.requests_per_window = self.config.get('requests_per_window', 50)
+        self.jitter_percentage = self.config.get('jitter_percentage', 20)
+        
+        # Use unique state file per scan to prevent collision in concurrent scans
+        base_state_file = self.config.get('state_file', 'stealth_mode_state.json')
+        if target_hash:
+            self.state_file = f"stealth_mode_{target_hash}.json"
+        else:
+            # Fallback to instance-specific file if no target hash provided
+            import uuid
+            instance_id = uuid.uuid4().hex[:8]
+            self.state_file = f"stealth_mode_{instance_id}.json"
         
         # Calculate request interval
         self.window_seconds = self.window_hours * 3600
@@ -14765,7 +14870,11 @@ class SessionStateManager:
             # Fallback to synchronous renewal
             try:
                 import asyncio
-                loop = asyncio.get_event_loop()
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(self.renew_session(session_id, scanner_instance))
                 if result:
                     logging.info(f"Synchronous session renewal completed for {session_id}")
@@ -15515,9 +15624,15 @@ class AsyncSession:
                 asyncio.set_event_loop(self.loop)
         else:
             self.loop = loop
+        
+        # SSL context configuration - use secure defaults by default
+        verify_ssl = self.config.get('verify_ssl', True)
         ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        if not verify_ssl:
+            # Only disable SSL verification if explicitly configured
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            logging.warning("SSL verification disabled - this is insecure and should only be used for testing")
         
         # Support both legacy proxy and new proxy_pool
         self.proxy = proxy  # Legacy single proxy support
@@ -16329,11 +16444,12 @@ class JSRenderDriver:
         self.proxy = proxy  # Legacy: simple proxy string
         self.proxy_pool = proxy_pool  # New: ProxyPool instance
         self.proxy_config = None  # Current ProxyConfig being used
-        self.captured_requests = deque(maxlen=1000)
+        # Reduce maxlen and store only metadata to prevent memory leaks
+        self.captured_requests = deque(maxlen=100)  # Reduced from 1000
         self.lock = threading.Lock()
         self.spa_routes_clicked = set()
         self.human_like_behavior = human_like_behavior  # Enable/disable human-like simulation
-        self.websocket_messages = deque(maxlen=500)  # Store WebSocket messages
+        self.websocket_messages = deque(maxlen=200)  # Reduced from 500 and store only metadata
         self.websocket_monitoring_enabled = False  # WebSocket monitoring flag
         self.shadow_dom_enabled = True  # Enable Shadow DOM crawling
         
@@ -16530,7 +16646,16 @@ class JSRenderDriver:
         
         with self.lock:
             parsed_params = self._extract_json_parameters(b) if b else []
-            self.captured_requests.append({'type': 'response', 'url': data['response']['url'], 'status': data['response']['status'], 'body': b, 'parameters': parsed_params, 'secrets': secrets_found})
+            # Store only metadata to prevent memory leaks - limit body size
+            body_snippet = b[:500] if b else ''  # Store only first 500 chars
+            self.captured_requests.append({
+                'type': 'response', 
+                'url': data['response']['url'], 
+                'status': data['response']['status'], 
+                'body_snippet': body_snippet,  # Use snippet instead of full body
+                'parameters': parsed_params, 
+                'secrets_count': len(secrets_found)  # Store count instead of full secrets
+            })
     def _extract_json_parameters(self, body, prefix=''):
         params = []
         try:
@@ -19659,9 +19784,11 @@ class FP_Database:
     
     def _flush_batch(self):
         if self.pending_inserts:
-            self.c.executemany("INSERT OR REPLACE INTO false_positives (type, url, parameter, payload, confidence, feature_vector) VALUES (?,?,?,?,?,?)", self.pending_inserts)
-            self.conn.commit()
-            self.pending_inserts.clear()
+            # Ensure thread-safe database operations
+            with self.lock:
+                self.c.executemany("INSERT OR REPLACE INTO false_positives (type, url, parameter, payload, confidence, feature_vector) VALUES (?,?,?,?,?,?)", self.pending_inserts)
+                self.conn.commit()
+                self.pending_inserts.clear()
     
     async def is_fp(self, vuln):
         async with self.lock:
@@ -19909,7 +20036,7 @@ class ProxyPool:
             # Select based on performance (lowest response time with good success rate)
             candidates.sort(key=lambda p: (p.avg_response_time if p.avg_response_time > 0 else float('inf'), -p.get_success_rate()))
             
-            # Apply rotation
+            # Apply rotation - ensure thread-safe counter increment
             if self.enable_rotation:
                 self.rotation_counter += 1
                 if self.rotation_counter >= self.rotation_interval:
@@ -19917,7 +20044,7 @@ class ProxyPool:
                     # Rotate to next best candidate
                     if len(candidates) > 1:
                         candidates = candidates[1:] + [candidates[0]]
-                        
+            
             selected = candidates[0]
             self.current_proxy_key = self._make_proxy_key(selected)
             
@@ -20434,6 +20561,10 @@ class MITMProxyHandler:
                         'headers': dict(self.headers),
                         'body': body.decode('utf-8', errors='ignore') if body else None
                     }
+                    # Store only metadata to prevent memory leaks
+                    captured_body_snippet = captured['body'][:500] if captured['body'] else ''
+                    captured['body_snippet'] = captured_body_snippet
+                    del captured['body']  # Remove full body
                     with self.parent.lock:
                         self.parent.captured_requests.append(captured)
                     if self.path.startswith('http://') or self.path.startswith('https://'):
@@ -20884,12 +21015,13 @@ class PlaywrightJSRenderDriver:
             # Request monitoring
             async def handle_request(request):
                 with self.lock:
+                    # Store only metadata to prevent memory leaks
                     self.captured_requests.append({
                         'type': 'request',
                         'url': request.url,
                         'method': request.method,
-                        'headers': request.headers,
-                        'post_data': request.post_data
+                        'headers': dict(request.headers) if request.headers else {},
+                        'post_data': request.post_data[:500] if request.post_data else None  # Limit size
                     })
             
             # Response monitoring
@@ -22131,18 +22263,18 @@ class ValidationEngine:
         self.gray_zone_findings = []
         
         # Gray Zone verification configuration
-        self.gray_zone_manual_verification_enabled = config.get('gray_zone_manual_verification_enabled', True)
-        self.gray_zone_resend_count = config.get('gray_zone_resend_count', 10)
-        self.gray_zone_500_discard_threshold = config.get('gray_zone_500_discard_threshold', 3)  # < 3/10 = discard
-        self.gray_zone_500_accept_threshold = config.get('gray_zone_500_accept_threshold', 8)  # > 8/10 = accept
+        self.gray_zone_manual_verification_enabled = self.config.get('gray_zone_manual_verification_enabled', True)
+        self.gray_zone_resend_count = self.config.get('gray_zone_resend_count', 10)
+        self.gray_zone_500_discard_threshold = self.config.get('gray_zone_500_discard_threshold', 3)  # < 3/10 = discard
+        self.gray_zone_500_accept_threshold = self.config.get('gray_zone_500_accept_threshold', 8)  # > 8/10 = accept
         
         # FSM stuck detection configuration
-        self.fsm_stuck_detection_enabled = config.get('fsm_stuck_detection_enabled', True)
-        self.fsm_stuck_timeout = config.get('fsm_stuck_timeout', 300)  # 5 minutes
+        self.fsm_stuck_detection_enabled = self.config.get('fsm_stuck_detection_enabled', True)
+        self.fsm_stuck_timeout = self.config.get('fsm_stuck_timeout', 300)  # 5 minutes
         
         # Parallel verification configuration (Phase 1.5)
-        self.parallel_verification_enabled = config.get('parallel_verification', True)
-        self.parallel_verification_limit = config.get('parallel_verification_limit', 5)
+        self.parallel_verification_enabled = self.config.get('parallel_verification', True)
+        self.parallel_verification_limit = self.config.get('parallel_verification_limit', 5)
         
         # Initialize session marker
         self.session_marker = f"Scan_{uuid.uuid4().hex[:8]}"
@@ -23893,12 +24025,16 @@ class SurgicalModeOrchestrator:
                 
                 validated = await self.validation_engine.validate_finding(finding)
                 
-                if validated.get('validation_results', {}).get('validation_status') == 'confirmed':
-                    verified.append(validated)
-                elif validated.get('validation_results', {}).get('validation_status') == 'false_positive':
+                validation_status = validated.get('validation_results', {}).get('validation_status', 'unknown')
+                
+                # Only mark as false positive if validation explicitly says so
+                if validation_status == 'false_positive':
                     false_positives.append(validated)
+                elif validation_status == 'confirmed':
+                    verified.append(validated)
                 else:
-                    # Add to gray zone for ambiguous results
+                    # Handle all other statuses (inconclusive, likely, validation_error, etc.)
+                    # Don't drop findings - include them with appropriate handling
                     probability = self._calculate_race_probability(validated)
                     if probability > self.validation_engine.GRAY_ZONE_THRESHOLD:
                         # Apply intelligent gray zone auto-triage
@@ -23923,7 +24059,9 @@ class SurgicalModeOrchestrator:
                             # Also add to main reporting flow for GUI display and export
                             self._add_gray_zone_to_reporting(gray_zone_entry)
                     else:
-                        verified.append(validated)  # Still include as verified
+                        # Still include the finding even if below gray zone threshold
+                        # The validation engine has already set appropriate confidence
+                        verified.append(validated)
                         
             except Exception as e:
                 logging.error(f"Verification failed for critical finding: {e}")
@@ -23935,10 +24073,16 @@ class SurgicalModeOrchestrator:
                 # Only run Validation 1 for medium priority
                 validated = await self.validation_engine.validate_finding(finding)
                 
-                if validated.get('validation_results', {}).get('validation_1_original', {}).get('passed'):
-                    verified.append(validated)
-                else:
+                validation_status = validated.get('validation_results', {}).get('validation_status', 'unknown')
+                v1_passed = validated.get('validation_results', {}).get('validation_1_original', {}).get('passed')
+                
+                # Only mark as false positive if validation explicitly says so
+                if validation_status == 'false_positive':
                     false_positives.append(validated)
+                else:
+                    # Include all other findings (confirmed, likely, inconclusive, validation_error, etc.)
+                    # The validation engine has already set appropriate confidence scores
+                    verified.append(validated)
                     
             except Exception as e:
                 logging.error(f"Reduced verification failed: {e}")
@@ -23956,8 +24100,14 @@ class SurgicalModeOrchestrator:
                     }
                     verified.append(finding)
                 else:
-                    # Skip low priority findings that aren't near verified signatures
-                    false_positives.append(finding)
+                    # Don't skip low priority findings - include them with their original confidence
+                    # They may still be valid findings that should be reported
+                    finding['validation_results'] = {
+                        'validation_status': 'not_verified',
+                        'final_confidence': finding.get('confidence', 0),
+                        'note': 'Low priority finding - minimal validation applied'
+                    }
+                    verified.append(finding)
                     
             except Exception as e:
                 logging.error(f"Minimal validation failed: {e}")
@@ -24854,8 +25004,7 @@ class Detector:
             # Add JSON-stringified variant (if payload looks like it could be JSON-encoded)
             if payload.startswith('"') and payload.endswith('"'):
                 try:
-                    import json
-                    json_decoded = json.loads(payload)
+                    json_decoded = safe_json_loads(payload)
                     if isinstance(json_decoded, str) and json_decoded != payload:
                         payload_variants.append(json_decoded)
                 except (json.JSONDecodeError, ValueError):
@@ -27538,6 +27687,12 @@ class DiskBasedURLStorage:
             cursor = self.conn.execute("SELECT COUNT(*) FROM visited_urls")
             return cursor.fetchone()[0]
     
+    def get_all_visited(self):
+        """Get all visited URLs as a list"""
+        with self.lock:
+            cursor = self.conn.execute("SELECT url FROM visited_urls")
+            return [row[0] for row in cursor.fetchall()]
+    
     def add_crawled_page(self, url: str, content_hash: str, html_path: str, depth: int, status_code: int) -> int:
         """Add crawled page metadata to database"""
         with self.lock:
@@ -27982,6 +28137,19 @@ class SecondOrderInjectionQueue:
         """Add injection point to queue for delayed verification"""
         with self.lock:
             ttl = ttl or self.default_ttl
+            
+            # Convert cookies to dict if they're not JSON-serializable
+            cookies = injection_point.get('cookies', {})
+            if hasattr(cookies, 'get_dict'):
+                cookies = cookies.get_dict()
+            elif hasattr(cookies, 'items'):
+                cookies = dict(cookies.items())
+            
+            # Convert headers to dict if they're not JSON-serializable
+            headers = injection_point.get('headers', {})
+            if hasattr(headers, 'items'):
+                headers = dict(headers.items())
+            
             cursor = self.conn.execute(
                 """INSERT INTO injection_queue 
                    (url, referrer, cookies, headers, data, timestamp, ttl, retry_count, max_retries, status)
@@ -27989,8 +28157,8 @@ class SecondOrderInjectionQueue:
                 (
                     injection_point.get('url', ''),
                     injection_point.get('referrer', ''),
-                    json.dumps(injection_point.get('cookies', {})),
-                    json.dumps(injection_point.get('headers', {})),
+                    json.dumps(cookies),
+                    json.dumps(headers),
                     json.dumps(injection_point.get('data', {})),
                     datetime.fromtimestamp(injection_point.get('timestamp', time.time())).isoformat(),
                     ttl,
@@ -28124,9 +28292,9 @@ class CrawlerEngine:
         self.circuit_breaker = circuit_breaker
         
         # Replace in-memory storage with disk-based pagination
-        use_disk_storage = config.get('use_disk_storage', True)
+        use_disk_storage = self.config.get('use_disk_storage', True)
         if use_disk_storage:
-            storage_db = config.get('storage_db', 'url_storage.db')
+            storage_db = self.config.get('storage_db', 'url_storage.db')
             self.url_storage = DiskBasedURLStorage(storage_db)
             # Maintain small in-memory cache for frequently accessed URLs
             self.visited_urls_cache: Set[str] = set()
@@ -28147,14 +28315,14 @@ class CrawlerEngine:
         self.stop_event = asyncio.Event()
         
         # FP handling configuration
-        fp_config = config.get('fp_handling', {})
+        fp_config = self.config.get('fp_handling', {})
         self.context_specific_whitelist = fp_config.get('context_specific_whitelist', True)
         
         # Phase 5: Dynamic concurrency adjustment
-        self.dynamic_concurrency_enabled = config.get('dynamic_concurrency', False)
+        self.dynamic_concurrency_enabled = self.config.get('dynamic_concurrency', False)
         self.response_time_history = []
         self.concurrency_adjustment_interval = 50
-        self.current_crawl_concurrency = config.get('crawl_concurrency', DEFAULT_CRAWL_CONCURRENCY)
+        self.current_crawl_concurrency = self.config.get('crawl_concurrency', DEFAULT_CRAWL_CONCURRENCY)
         
         # Phase 4: Initialize bloom filter cache for parameter deduplication
         self.parameters_cache = set()
@@ -28309,6 +28477,12 @@ class CrawlerEngine:
                      len(self.parameters) * 200) / (1024 * 1024), 2
                 )
             }
+    
+    def close(self):
+        """Close database connections and clean up resources"""
+        if self.use_disk_storage and self.url_storage:
+            self.url_storage.close()
+            logging.info("CrawlerEngine disk storage connection closed")
     def _is_valid_url(self, url: str) -> bool:
         try:
             p = urlparse(url)
@@ -28622,8 +28796,7 @@ class CrawlerEngine:
                         # Parse data parameters
                         try:
                             if '{' in data_part:
-                                import json
-                                data_dict = json.loads(data_part)
+                                data_dict = safe_json_loads(data_part)
                                 for key, value in data_dict.items():
                                     self._add_param(urljoin(url, endpoint), 'POST', key, 'json')
                             else:
@@ -28745,7 +28918,7 @@ class SessionManager:
         self.secondary_session: Optional[AsyncSession] = None
         
         # Initialize global request cache with LRU + TTL
-        cache_config = config.get('request_cache', {})
+        cache_config = self.config.get('request_cache', {})
         self.request_cache = BaselineCache(
             max_size=cache_config.get('max_size', 1000),
             default_ttl=cache_config.get('default_ttl', 600),  # 10 minutes default
@@ -28755,7 +28928,7 @@ class SessionManager:
         self.cache_enabled = cache_config.get('enabled', True)
         
         # Initialize request deduplicator to avoid redundant tests
-        dedup_config = config.get('request_deduplication', {})
+        dedup_config = self.config.get('request_deduplication', {})
         # Add disabled_endpoints if configured at top level
         if 'disabled_endpoints' in config:
             dedup_config['disabled_endpoints'] = config['disabled_endpoints']
@@ -28771,7 +28944,7 @@ class SessionManager:
         self.http3_client = HTTP3Client(config)
         
         # Initialize traffic shaper with configuration
-        traffic_shaper_config = config.get('traffic_shaping', {})
+        traffic_shaper_config = self.config.get('traffic_shaping', {})
         self.traffic_shaper = TrafficShaper(
             enabled=traffic_shaper_config.get('enabled', True),
             randomize_interval=traffic_shaper_config.get('randomize_interval', True),
@@ -28781,15 +28954,15 @@ class SessionManager:
         )
         
         # Initialize IDS/IPS rate limiter with configuration
-        ids_ips_config = config.get('ids_ips_throttling', {})
+        ids_ips_config = self.config.get('ids_ips_throttling', {})
         self.rate_limiter = AsyncRateLimiter(
-            config.get('delay', DEFAULT_DELAY), 
+            self.config.get('delay', DEFAULT_DELAY), 
             traffic_shaper=self.traffic_shaper,
             ids_ips_config=ids_ips_config if ids_ips_config else None
         )
         
         # Support both legacy proxy_list and new proxy_pool configuration
-        proxy_config = config.get('proxy_pool', {})
+        proxy_config = self.config.get('proxy_pool', {})
         if proxy_config:
             # New proxy pool configuration
             self.proxy_pool = ProxyPool(
@@ -28830,11 +29003,11 @@ class SessionManager:
                     ))
             
             # Keep legacy proxy_rotator for backward compatibility
-            self.proxy_rotator = ProxyRotator(config.get('proxy_list'))
+            self.proxy_rotator = ProxyRotator(self.config.get('proxy_list'))
         else:
             # Legacy proxy list support
             self.proxy_pool = None
-            self.proxy_rotator = ProxyRotator(config.get('proxy_list'))
+            self.proxy_rotator = ProxyRotator(self.config.get('proxy_list'))
         
     async def setup(self) -> None:
         user_agent = self.config.get('user_agent')
@@ -29140,15 +29313,15 @@ class OOBManager:
         self.public_ip = public_ip
         self.oob_server: Optional[Any] = None
         self.oob_port: Optional[int] = None
-        self.oob_dns_ip = config.get('oob_dns_ip')
-        self.oob_dns_domain = config.get('oob_dns_domain', 'oob.example.com')
+        self.oob_dns_ip = self.config.get('oob_dns_ip')
+        self.oob_dns_domain = self.config.get('oob_dns_domain', 'oob.example.com')
         self.oob_marker_base = uuid.uuid4().hex[:8]
-        self.enable_advanced_oob = config.get('enable_advanced_oob', False)
+        self.enable_advanced_oob = self.config.get('enable_advanced_oob', False)
         self.smtp_oob_handler: Optional[Any] = None
         self.dns_oob_listener: Optional[Any] = None  # Replaces ICMP listener
         self.dns_oob_port: Optional[int] = None  # Track actual DNS port used (may differ from default)
         self.icmp_oob_listener: Optional[ICMPOOBListener] = None  # ICMP listener (requires root)
-        self.enable_icmp_oob = config.get('enable_icmp_oob', False)  # Disabled by default
+        self.enable_icmp_oob = self.config.get('enable_icmp_oob', False)  # Disabled by default
         self.https_oob_server: Optional[Any] = None
         self.https_oob_port: Optional[int] = None
         self.cleanup_thread: Optional[threading.Thread] = None
@@ -29255,7 +29428,7 @@ class ReportingEngine:
         self.signals = signals
         
         # Use disk-based vulnerability storage to prevent memory bloat during long scans
-        vuln_storage_config = config.get('vulnerability_storage', {})
+        vuln_storage_config = self.config.get('vulnerability_storage', {})
         db_path = vuln_storage_config.get('db_path', 'vulnerability_storage.db')
         self.vulnerability_storage = DiskBasedVulnerabilityStorage(db_path)
         
@@ -29270,14 +29443,21 @@ class ReportingEngine:
         self.cve_template_engine = cve_template_engine
         # Lock for vulnerability deduplication to prevent race conditions
         self.vulnerability_lock = asyncio.Lock()
+        
+        # Cache for vulnerabilities property to avoid repeated database reads
+        self._vulnerabilities_cache = None
+        self._vulnerabilities_cache_dirty = True
     
     @property
     def vulnerabilities(self):
         """
-        Backward compatibility property that returns all vulnerabilities from disk-based storage.
-        This allows existing code that expects a list to continue working.
+        Backward compatibility property that returns all vulnerabilities from disk-based storage with caching.
+        This allows existing code that expects a list to continue working while avoiding repeated database reads.
         """
-        return self.vulnerability_storage.get_all_vulnerabilities()
+        if self._vulnerabilities_cache_dirty or self._vulnerabilities_cache is None:
+            self._vulnerabilities_cache = self.vulnerability_storage.get_all_vulnerabilities()
+            self._vulnerabilities_cache_dirty = False
+        return self._vulnerabilities_cache
     
     @vulnerabilities.setter
     def vulnerabilities(self, value):
@@ -29289,6 +29469,8 @@ class ReportingEngine:
             self.vulnerability_storage.clear_all_vulnerabilities()
             for vuln in value:
                 self.vulnerability_storage.add_vulnerability(vuln)
+            # Mark cache as dirty since we've changed the underlying storage
+            self._vulnerabilities_cache_dirty = True
     
     def log(self, msg):
         if hasattr(self.signals, 'log'):
@@ -29299,6 +29481,8 @@ class ReportingEngine:
         # Store in disk-based database as source of truth to prevent memory bloat during long scans
         try:
             self.vulnerability_storage.add_vulnerability(vuln)
+            # Mark cache as dirty since we've added a new vulnerability
+            self._vulnerabilities_cache_dirty = True
         except Exception as e:
             logging.warning(f"Failed to store vulnerability in database: {e}")
         
@@ -29311,11 +29495,31 @@ class ReportingEngine:
         if self.cve_template_engine:
             vuln = self._enhance_with_cve_templates(vuln)
         
-        # Emit signal for GUI display
+        # Emit signal for GUI display with enhanced error handling
         if hasattr(self.signals, 'finding'):
-            self.signals.finding.emit(vuln)
+            try:
+                self.signals.finding.emit(vuln)
+                logging.debug(f"Successfully emitted finding to GUI: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.error(f"Failed to emit finding signal to GUI: {e}", exc_info=True)
+                # Fallback: Try to add directly to vulnerability storage
+                if hasattr(self, 'vulnerability_storage'):
+                    try:
+                        self.vulnerability_storage.add_vulnerability(vuln)
+                        logging.info(f"Added finding directly to vulnerability storage as fallback")
+                    except Exception as fallback_error:
+                        logging.error(f"Fallback to vulnerability storage also failed: {fallback_error}")
         else:
-            logging.info(f"Finding: {vuln}")
+            logging.warning(f"Signals object does not have 'finding' attribute. Finding not sent to GUI: {vuln.get('type')} at {vuln.get('url')}")
+            # Fallback: Ensure it's stored in vulnerability storage
+            if hasattr(self, 'vulnerability_storage'):
+                try:
+                    self.vulnerability_storage.add_vulnerability(vuln)
+                    logging.info(f"Added finding directly to vulnerability storage as fallback")
+                except Exception as fallback_error:
+                    logging.error(f"Fallback to vulnerability storage failed: {fallback_error}")
+            else:
+                logging.info(f"Finding: {vuln}")
     
     def _enhance_with_cve_templates(self, vuln):
         """
@@ -29684,12 +29888,12 @@ class HeuristicRegressionOracle:
         self.config = config
         self.session_manager = session_manager
         self.db_path = db_path
-        self.enabled = config.get('heuristic_regression_oracle', {}).get('enabled', True)
-        self.benign_sample_size = config.get('heuristic_regression_oracle', {}).get('benign_sample_size', 50)
-        self.regression_retries = config.get('heuristic_regression_oracle', {}).get('regression_retries', 3)
-        self.regression_delay = config.get('heuristic_regression_oracle', {}).get('regression_delay', 1.0)
+        self.enabled = self.config.get('heuristic_regression_oracle', {}).get('enabled', True)
+        self.benign_sample_size = self.config.get('heuristic_regression_oracle', {}).get('benign_sample_size', 50)
+        self.regression_retries = self.config.get('heuristic_regression_oracle', {}).get('regression_retries', 3)
+        self.regression_delay = self.config.get('heuristic_regression_oracle', {}).get('regression_delay', 1.0)
         # FN-03 FIX: Added configuration to disable regression oracle for time-based tests
-        self.disable_for_time_based = config.get('heuristic_regression_oracle', {}).get('disable_for_time_based', False)
+        self.disable_for_time_based = self.config.get('heuristic_regression_oracle', {}).get('disable_for_time_based', False)
         self.noise_profiles = {}  # Store noise profiles per endpoint
         self.regression_mode = False
         self.current_payload = None
@@ -30185,38 +30389,38 @@ class InjectionEngine:
         self.selenium_ready = False
         self.playwright_driver = None
         self.playwright_ready = False
-        self.js_driver_mode = config.get('js_driver_mode', 'selenium')  # 'selenium' or 'playwright'
+        self.js_driver_mode = self.config.get('js_driver_mode', 'selenium')  # 'selenium' or 'playwright'
         self.stop_event = asyncio.Event()
         self.pause_event = pause_event or asyncio.Event()
         self.pause_event.set()  # Initially set (not paused)
         self.js_driver_manager = JSRenderDriverManager()
         self.background_task_manager = BackgroundTaskManager()
-        self.concurrency_limit = config.get('concurrency_limit', 100)
+        self.concurrency_limit = self.config.get('concurrency_limit', 100)
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
         self.current_task = 0
         self.total_tasks = 0
-        self.enable_advanced_oob = config.get('enable_advanced_oob', False)
+        self.enable_advanced_oob = self.config.get('enable_advanced_oob', False)
         self.https_oob_port = None
-        self.oob_dns_ip = config.get('oob_dns_ip')
-        self.oob_dns_domain = config.get('oob_dns_domain', 'oob.example.com')
+        self.oob_dns_ip = self.config.get('oob_dns_ip')
+        self.oob_dns_domain = self.config.get('oob_dns_domain', 'oob.example.com')
         self.oob_marker_base = getattr(oob_manager, 'oob_marker_base', uuid.uuid4().hex[:8])
         self.public_ip = getattr(oob_manager, 'public_ip', '127.0.0.1')
         self.oob_port = getattr(oob_manager, 'oob_port', 8080)
         print("Creating ScanStateManager...")
-        self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
+        self.scan_state_manager = ScanStateManager(self.config.get('state_db', 'scan_state.db'))
         
         # Initialize Reconnaissance Maturity Model for safety controls
         # Note: Using instance safety_config when available, fallback to global SAFETY_CONFIG
-        maturity_level = config.get('maturity_level', 3)  # Default to 3
-        dry_run = config.get('dry_run', False)  # Default to False
+        maturity_level = self.config.get('maturity_level', 3)  # Default to 3
+        dry_run = self.config.get('dry_run', False)  # Default to False
         self.maturity_model = ReconnaissanceMaturityModel(maturity_level, dry_run)
         print(f"Safety Controls Initialized - Maturity Level: {maturity_level}, Dry Run: {dry_run}")
         
         # Taint tracking integration - Enhanced with proper propagation engine
-        self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
+        self.taint_tracking_enabled = self.config.get('taint_tracking_enabled', True)
         
         # Request deduplication - Avoid redundant tests
-        dedup_config = config.get('request_deduplication', {})
+        dedup_config = self.config.get('request_deduplication', {})
         # Add disabled_endpoints if configured at top level
         if 'disabled_endpoints' in config:
             dedup_config['disabled_endpoints'] = config['disabled_endpoints']
@@ -30240,7 +30444,7 @@ class InjectionEngine:
             self.taint_instrumentor = None
 
         # JavaScript symbolic execution integration - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
-        self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
+        self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
                 self.symbolic_executor = JavaScriptSymbolicExecutor(config)
@@ -30256,39 +30460,42 @@ class InjectionEngine:
         print("Creating DynamicPayloadGenerator...")
         self.dynamic_payload_generator = DynamicPayloadGenerator(self.semantic_mutator, config)
         print("DynamicPayloadGenerator created")
-        self.dynamic_payloads_enabled = config.get('dynamic_payloads_enabled', True)
-        self.use_encrypted_payloads = config.get('use_encrypted_payloads', False)
-        self.use_staged_payloads = config.get('use_staged_payloads', False)
-        self.environment_detection_enabled = config.get('environment_detection_enabled', True)
+        self.dynamic_payloads_enabled = self.config.get('dynamic_payloads_enabled', True)
+        self.use_encrypted_payloads = self.config.get('use_encrypted_payloads', False)
+        self.use_staged_payloads = self.config.get('use_staged_payloads', False)
+        self.environment_detection_enabled = self.config.get('environment_detection_enabled', True)
         self.detected_environment = None
         print("InjectionEngine.__init__ completed")
         
         # OAuth discovery configuration
-        self.oauth_discovery_enabled = config.get('oauth_discovery_enabled', True)
-        self.oauth_well_known_enabled = config.get('oauth_well_known_enabled', True)
-        self.oauth_js_scraping_enabled = config.get('oauth_js_scraping_enabled', True)
+        self.oauth_discovery_enabled = self.config.get('oauth_discovery_enabled', True)
+        self.oauth_well_known_enabled = self.config.get('oauth_well_known_enabled', True)
+        self.oauth_js_scraping_enabled = self.config.get('oauth_js_scraping_enabled', True)
         
         # Parameter detection configuration
-        self.parameter_detection_enabled = config.get('parameter_detection_enabled', True)
-        self.form_parameter_extraction = config.get('form_parameter_extraction', True)
-        self.javascript_parameter_scraping = config.get('javascript_parameter_scraping', True)
+        self.parameter_detection_enabled = self.config.get('parameter_detection_enabled', True)
+        self.form_parameter_extraction = self.config.get('form_parameter_extraction', True)
+        self.javascript_parameter_scraping = self.config.get('javascript_parameter_scraping', True)
         
         # Second-order verification configuration
-        self.second_order_context_replay = config.get('second_order_context_replay', True)
-        self.context_verification_enabled = config.get('context_verification_enabled', True)
+        self.second_order_context_replay = self.config.get('second_order_context_replay', True)
+        self.context_verification_enabled = self.config.get('context_verification_enabled', True)
         
         # GraphQL configuration
-        self.graphql_variables_support = config.get('graphql_variables_support', True)
-        self.graphql_depth_limit = config.get('graphql_depth_limit', 100)
-        self.graphql_batch_limit = config.get('graphql_batch_limit', 1000)
-        self.graphql_advanced_testing = config.get('graphql_advanced_testing', True)
+        self.graphql_variables_support = self.config.get('graphql_variables_support', True)
+        self.graphql_depth_limit = self.config.get('graphql_depth_limit', 100)
+        self.graphql_batch_limit = self.config.get('graphql_batch_limit', 1000)
+        self.graphql_advanced_testing = self.config.get('graphql_advanced_testing', True)
         
         # gRPC configuration
-        self.grpc_advanced_testing = config.get('grpc_advanced_testing', True)
-        self.grpc_fuzzing_intensity = config.get('grpc_fuzzing_intensity', 0.5)
+        self.grpc_advanced_testing = self.config.get('grpc_advanced_testing', True)
+        self.grpc_fuzzing_intensity = self.config.get('grpc_fuzzing_intensity', 0.5)
         
         # RCE confirmation for secure remote command execution
         self.rce_confirmed = False
+        
+        # Initialize baseline time samples for statistical analysis
+        self._baseline_time_samples = []
         self.confirmed_injection_channels = []
         
         # GraphQL advanced features (initialized during GraphQL testing)
@@ -30300,7 +30507,7 @@ class InjectionEngine:
         self.injection_points_ttl = 300  # 5 minutes TTL for injection points context
         
         # Initialize persistent queue for delayed second-order injection verification
-        queue_db_path = config.get('second_order_queue_db', 'second_order_queue.db')
+        queue_db_path = self.config.get('second_order_queue_db', 'second_order_queue.db')
         self.second_order_queue = SecondOrderInjectionQueue(queue_db_path, self.injection_points_ttl)
         
         # Initialize FSM-aware testing components
@@ -30431,9 +30638,31 @@ class InjectionEngine:
                 logging.warning(f"Failed to create SecurityWarning: {e}")
         
         if self.vulnerability_callback:
-            await self.vulnerability_callback(vuln)
+            try:
+                await self.vulnerability_callback(vuln)
+                logging.debug(f"Successfully processed vulnerability callback for {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.error(f"Vulnerability callback failed: {e}", exc_info=True)
+                # Fallback: Try to add directly to reporting engine
+                if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'vulnerability_storage'):
+                    try:
+                        self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                        logging.info(f"Added vulnerability directly to vulnerability storage as fallback")
+                    except Exception as fallback_error:
+                        logging.error(f"Fallback to vulnerability storage also failed: {fallback_error}")
+                        # Last resort: Log the vulnerability
+                        logging.warning(f"Vulnerability not reported due to callback and storage failures: {vuln.get('type')} at {vuln.get('url')}")
         else:
-            logging.warning("No vulnerability callback provided - vulnerability not reported")
+            logging.warning("No vulnerability callback provided - attempting direct storage")
+            # Fallback: Try to add directly to reporting engine
+            if hasattr(self, 'reporting_engine') and hasattr(self.reporting_engine, 'vulnerability_storage'):
+                try:
+                    self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                    logging.info(f"Added vulnerability directly to vulnerability storage as fallback")
+                except Exception as fallback_error:
+                    logging.error(f"Fallback to vulnerability storage failed: {fallback_error}")
+                    # Last resort: Log the vulnerability
+                    logging.warning(f"Vulnerability not reported: {vuln.get('type')} at {vuln.get('url')}")
     
     async def _process_playwright_detections(self, url):
         """Process Playwright-detected JavaScript runtime vulnerabilities"""
@@ -30694,7 +30923,8 @@ class InjectionEngine:
             self.multiprocessing_scanner.start_workers()
             self.log(f"Multiprocessing scanner started with {self.multiprocessing_scanner.num_processes} processes for stateless operations")
     async def run_active_tests(self):
-        param_count = len(self.crawler_engine.parameters)
+        # Use iterator to count parameters for disk storage compatibility
+        param_count = sum(1 for _ in self.crawler_engine._get_parameters_iterator())
         self.log(f"Active tests on {param_count} parameters")
         if param_count == 0:
             self.log("No parameters found to test. Skipping active tests.")
@@ -30711,7 +30941,8 @@ class InjectionEngine:
             
     async def _run_standard_active_tests(self):
         """Standard async testing for stateful operations (default behavior)"""
-        param_count = len(self.crawler_engine.parameters)
+        # Use iterator to count parameters for disk storage compatibility
+        param_count = sum(1 for _ in self.crawler_engine._get_parameters_iterator())
         
         # Check if request batching is enabled (Phase 1.2 optimization)
         request_batching = self.config.get('request_batching', False)
@@ -30733,7 +30964,7 @@ class InjectionEngine:
             # Use standard sequential testing
             tasks = []
             self.total_tasks = param_count
-            for i, param in enumerate(self.crawler_engine.parameters):
+            for i, param in enumerate(self.crawler_engine._get_parameters_iterator()):
                 # Acquire stealth mode slot before creating task
                 if stealth_enabled:
                     await self.stealth_scheduler.acquire_slot()
@@ -30752,7 +30983,7 @@ class InjectionEngine:
             
             # Mark all parameters as completed in endpoint progress
             if hasattr(self.signals, 'endpoint_progress'):
-                for param in self.crawler_engine.parameters:
+                for param in self.crawler_engine._get_parameters_iterator():
                     self.signals.endpoint_progress.emit(param['url'], "Completed", self.current_task, self.total_tasks)
             if pending:
                 for task in pending:
@@ -30772,12 +31003,13 @@ class InjectionEngine:
         This method groups parameters by endpoint and tests them simultaneously,
         reducing the number of HTTP requests and improving overall scan speed.
         """
-        param_count = len(self.crawler_engine.parameters)
+        # Use iterator to count parameters for disk storage compatibility
+        param_count = sum(1 for _ in self.crawler_engine._get_parameters_iterator())
         self.total_tasks = param_count
         
         # Group parameters by URL for batch testing
         endpoint_groups = {}
-        for param in self.crawler_engine.parameters:
+        for param in self.crawler_engine._get_parameters_iterator():
             url = param['url']
             if url not in endpoint_groups:
                 endpoint_groups[url] = []
@@ -30878,7 +31110,7 @@ class InjectionEngine:
             headers = {}
         
         # Prepare test cases with full context
-        for param in self.crawler_engine.parameters:
+        for param in self.crawler_engine._get_parameters_iterator():
             url = param['url']
             method = param['method']
             param_name = param['param']
@@ -31063,7 +31295,8 @@ class InjectionEngine:
                 self.multiprocessing_scanner.shutdown()
     
     async def _populate_baselines(self):
-        if not self.crawler_engine.parameters:
+        # Use iterator to check for empty parameters for disk storage compatibility
+        if not any(True for _ in self.crawler_engine._get_parameters_iterator()):
             return
         async def baseline_for(param):
             key = (param['url'], param['method'], param['param'])
@@ -31108,7 +31341,7 @@ class InjectionEngine:
                     'status': resp.status,
                     'elapsed': elapsed
                 })
-        tasks = [baseline_for(p) for p in self.crawler_engine.parameters]
+        tasks = [baseline_for(p) for p in self.crawler_engine._get_parameters_iterator()]
         done, pending = await safe_async_wait(tasks, timeout=240, return_when=asyncio.ALL_COMPLETED)
         if pending:
             for task in pending:
@@ -31565,11 +31798,11 @@ class InjectionEngine:
             # Existing detection logic
             result = None
             if vuln_type == "XSS":
-                xss_result = Detector.xss(html, baseline_html, pname)
+                xss_result = Detector.xss(html, payload, baseline_html)
                 if xss_result:
                     result = {"type":"XSS","confidence":xss_result.get('confidence',70),"evidence":xss_result.get('evidence','')}
             elif vuln_type == "SQLi":
-                sqli_result = Detector.sqli(html, baseline_html, pname)
+                sqli_result = Detector.sqli(html, baseline_html)
                 if sqli_result:
                     result = {"type":"SQLi","confidence":sqli_result.get('confidence',70),"evidence":sqli_result.get('evidence','')}
                 
@@ -32739,7 +32972,8 @@ class InjectionEngine:
                 await self._verify_second_order_injection(high_priority_urls, stored_sqli_payload)
                 
                 # Then check all crawled URLs
-                await self._verify_second_order_injection(list(self.crawler_engine.visited_urls), stored_sqli_payload)
+                all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine.url_storage else []
+                await self._verify_second_order_injection(all_urls, stored_sqli_payload)
                 
                 # Re-crawl to discover new pages that might contain injected content
                 if elapsed >= 30:  # Re-crawl after 30 seconds
@@ -32795,7 +33029,7 @@ class InjectionEngine:
                     
                     # Discover high-priority targets
                     high_priority_urls = self._discover_high_priority_targets()
-                    all_urls = list(self.crawler_engine.visited_urls) if self.crawler_engine else []
+                    all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
                     
                     for injection_point in pending_points:
                         try:
@@ -32876,14 +33110,15 @@ class InjectionEngine:
         admin_keywords = ['admin', 'dashboard', 'panel', 'manage', 'moderator', 'review']
         user_keywords = ['profile', 'account', 'settings', 'user', 'my']
         
-        for url in self.crawler_engine.visited_urls:
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        for url in all_urls:
             url_lower = url.lower()
             if any(kw in url_lower for kw in admin_keywords + user_keywords):
                 high_priority.add(url)
         
         # Also check for common admin paths
         base_urls = set()
-        for url in self.crawler_engine.visited_urls:
+        for url in all_urls:
             parsed = urlparse(url)
             base = f"{parsed.scheme}://{parsed.netloc}"
             base_urls.add(base)
@@ -36133,7 +36368,7 @@ class InjectionEngine:
         session_manager = SessionStateManager()
         
         # Discover purchase-related endpoints
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
             if not page_data:
                 continue
@@ -36519,7 +36754,11 @@ class InjectionEngine:
             "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 6\r\nContent-Length: 4\r\n\r\n12345\r\n",
             "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: identity,chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n"
         ]
-        for page in self.crawler_engine.crawled_pages[:5]:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
+            # Limit to first 5 pages for safety
+            pages_list = list(self.crawler_engine._get_crawled_pages_iterator())[:5]
+            if page not in pages_list:
+                continue
             try:
                 url = page['url']
                 parsed = urlparse(url)
@@ -36541,7 +36780,11 @@ class InjectionEngine:
                 logging.warning(f"Request smuggling test error for {page['url']}: {e}")
     async def http2_downgrade_tests(self):
         self.log("Testing HTTP/2 downgrade...")
-        for page in self.crawler_engine.crawled_pages[:5]:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
+            # Limit to first 5 pages for safety
+            pages_list = list(self.crawler_engine._get_crawled_pages_iterator())[:5]
+            if page not in pages_list:
+                continue
             try:
                 url = page['url']
                 parsed = urlparse(url)
@@ -36566,7 +36809,7 @@ class InjectionEngine:
                 logging.warning(f"HTTP/2 downgrade test error for {page['url']}: {e}")
     async def run_jwt_tests(self):
         self.log("Testing JWT vulnerabilities...")
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             try:
                 resp = await self._async_fetch(page['url'])
                 if not resp:
@@ -36596,7 +36839,7 @@ class InjectionEngine:
         await self._test_session_fixation_ambiguity()
     async def _test_session_fixation_ambiguity(self):
         self.log("Testing session fixation/ambiguity...")
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             try:
                 parsed_url = urlparse(page['url'])
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -36612,13 +36855,14 @@ class InjectionEngine:
             except Exception as e:
                 logging.debug(f"Session fixation test error for {page['url']}: {e}")
     async def run_idor_tests(self):
-        for url in self.crawler_engine.visited_urls:
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        for url in all_urls:
             for match in re.finditer(r'/(\d+)', urlparse(url).path):
                 uid = match.group(1)
                 try:
                     new_id = str(int(uid) + 1)
                     new_url = url[:match.start(1)] + new_id + url[match.end(1):]
-                    if new_url in self.crawler_engine.visited_urls: continue
+                    if new_url in all_urls: continue
                     resp_orig = await self._async_fetch(url)
                     resp_new = await self._async_fetch(new_url)
                     if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
@@ -36634,7 +36878,7 @@ class InjectionEngine:
             for match in re.finditer(uuid_pattern, url, re.I):
                 new_uuid = str(uuid.uuid4())
                 new_url = url[:match.start()] + new_uuid + url[match.end():]
-                if new_url in self.crawler_engine.visited_urls: continue
+                if new_url in all_urls: continue
                 resp_new = await self._async_fetch(new_url)
                 if resp_new and resp_new.status == 200 and len(resp_new._body) > 100:
                     await self._add_vulnerability({
@@ -36656,8 +36900,9 @@ class InjectionEngine:
                             })
     async def test_org_user_id_mismatch(self):
         self.log("Testing ORG_ID vs USER_ID mismatch...")
-        for url in self.crawler_engine.visited_urls:
-            for param in self.crawler_engine.parameters:
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        for url in all_urls:
+            for param in self.crawler_engine._get_parameters_iterator():
                 if param['url'] == url and param['method'] == 'POST':
                     for org_id in ['1', '2', '999']:
                         for user_id in ['1', '2', '999']:
@@ -36673,8 +36918,9 @@ class InjectionEngine:
                                 return
     async def test_role_hierarchy_escalation(self):
         self.log("Testing role hierarchy escalation...")
-        for url in self.crawler_engine.visited_urls:
-            for param in self.crawler_engine.parameters:
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        for url in all_urls:
+            for param in self.crawler_engine._get_parameters_iterator():
                 if param['url'] == url and param['method'] == 'POST' and re.search(r'role|permission|access', param['param'], re.I):
                     data = {param['param']: 'test', 'role': 'admin', 'permission': 'all'}
                     resp = await self._async_fetch(url, method='POST', data=data)
@@ -36687,7 +36933,7 @@ class InjectionEngine:
                         return
     async def test_array_bulk_idor(self):
         self.log("Testing array-based bulk IDOR...")
-        for param in self.crawler_engine.parameters:
+        for param in self.crawler_engine._get_parameters_iterator():
             if param['method'] != 'POST': continue
             url = param['url']; pname = param['param']; ptype = param['type']
             test_ids = ['1', '2', '999']
@@ -36704,7 +36950,7 @@ class InjectionEngine:
                     "severity":"Critical","confidence":80,"cwe":CWE_MAP["IDOR"]
                 })
     async def run_mass_assignment_tests(self):
-        for param in self.crawler_engine.parameters:
+        for param in self.crawler_engine._get_parameters_iterator():
             if param['method'] != 'POST': continue
             url = param['url']; pname = param['param']; ptype = param['type']
             if ptype != 'json':
@@ -36732,7 +36978,7 @@ class InjectionEngine:
                             })
                             break
     async def run_csrf_checks(self):
-        for page in self.crawler_engine.crawled_pages:
+        for page in self.crawler_engine._get_crawled_pages_iterator():
             page_data = await self.loop.run_in_executor(None, self.scan_state_manager.get_page_hash, page['url'])
             if not page_data:
                 continue
@@ -36763,13 +37009,14 @@ class InjectionEngine:
                         })
     async def run_cors_checks(self):
         # Use enhanced CORS misconfiguration detection with Origin reflection testing
-        for url in self.crawler_engine.visited_urls:
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        for url in all_urls:
             cors = await self._check_cors_misconfig(url)
             if cors:
                 await self._add_vulnerability(cors)
         
         # Additional credential-based CORS testing
-        for url in self.crawler_engine.visited_urls:
+        for url in all_urls:
             for origin in ["null", "https://evil.com"]:
                 headers = {"Origin": origin}
                 resp = await self._async_fetch(url, method='OPTIONS', headers=headers)
@@ -36885,7 +37132,8 @@ class InjectionEngine:
         return None
     async def run_http_method_tests(self):
         self.log("Starting HTTP method vulnerability tests...")
-        test_urls = list(self.crawler_engine.visited_urls)[:20]
+        all_urls = self.crawler_engine.url_storage.get_all_visited() if self.crawler_engine and self.crawler_engine.url_storage else []
+        test_urls = all_urls[:20]
         for url in test_urls:
             if self.stop_event.is_set():
                 break
@@ -39082,17 +39330,20 @@ class OmegaDAST:
         self.signals = signals
         self.loop = loop or asyncio.new_event_loop()
         # Don't call async functions during __init__ to avoid event loop issues
-        self.public_ip = config.get('oob_ip', '127.0.0.1')
+        self.public_ip = self.config.get('oob_ip', '127.0.0.1')
         print("OmegaDAST.__init__ basic attributes set")
-        if not validate_oob_config(self.public_ip, config.get('oob_dns_domain', 'oob.example.com')):
+        
+        # Validate signal configuration early
+        self._validate_signal_configuration()
+        if not validate_oob_config(self.public_ip, self.config.get('oob_dns_domain', 'oob.example.com')):
             logging.warning("OOB configuration validation failed. Scan may have issues with OOB callbacks.")
-        self.exclusion_patterns = [re.compile(p) for p in config.get('exclude', [])]
-        self.capture_evidence = config.get('capture_evidence', True)
+        self.exclusion_patterns = [re.compile(p) for p in self.config.get('exclude', [])]
+        self.capture_evidence = self.config.get('capture_evidence', True)
         self.stop_event = asyncio.Event()
         self.pause_event = pause_event or asyncio.Event()
         self.pause_event.set()  # Initially set (not paused)
-        self.log_file = config.get('log_file')
-        self.concurrency_limit = config.get('concurrency_limit', 100)
+        self.log_file = self.config.get('log_file')
+        self.concurrency_limit = self.config.get('concurrency_limit', 100)
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
         
         # Move global state to instance state for better parallelization support
@@ -39113,9 +39364,9 @@ class OmegaDAST:
         
         print("Creating CircuitBreaker...")
         self.circuit_breaker = CircuitBreaker(
-            failure_threshold=config.get('circuit_breaker_threshold', 25.0),
-            cooldown=config.get('circuit_breaker_cooldown', 30),
-            max_retries=config.get('circuit_breaker_max_retries', 3)
+            failure_threshold=self.config.get('circuit_breaker_threshold', 25.0),
+            cooldown=self.config.get('circuit_breaker_cooldown', 30),
+            max_retries=self.config.get('circuit_breaker_max_retries', 3)
         )
         print("Creating CrawlerEngine...")
         self.crawler_engine = CrawlerEngine(
@@ -39126,7 +39377,7 @@ class OmegaDAST:
         
         # Initialize CVE Template Engine for extensible template-based detection (before ReportingEngine)
         print("Creating CVETemplateEngine...")
-        template_directory = config.get('cve_template_directory', os.path.join(os.path.dirname(__file__), 'cve_templates'))
+        template_directory = self.config.get('cve_template_directory', os.path.join(os.path.dirname(__file__), 'cve_templates'))
         self.cve_template_engine = CVETemplateEngine(template_directory)
         print("CVETemplateEngine created successfully")
         
@@ -39145,7 +39396,7 @@ class OmegaDAST:
         
         # Initialize MultiprocessingScanner for parallel scanning (before InjectionEngine)
         print("Creating MultiprocessingScanner...")
-        num_processes = config.get('multiprocessing_num_processes', min(12, multiprocessing.cpu_count()))  # Cap at 12
+        num_processes = self.config.get('multiprocessing_num_processes', min(12, multiprocessing.cpu_count()))  # Cap at 12
         self.multiprocessing_scanner = MultiprocessingScanner(num_processes=num_processes)
         print("MultiprocessingScanner created successfully")
         
@@ -39190,26 +39441,28 @@ class OmegaDAST:
 
         # Initialize BrowserAuthHelper for complex OAuth flows
         print("Creating BrowserAuthHelper...")
-        self.browser_auth_helper = BrowserAuthHelper(headless=config.get('browser_headless', True))
+        self.browser_auth_helper = BrowserAuthHelper(headless=self.config.get('browser_headless', True))
         print("BrowserAuthHelper created successfully")
         
         # Initialize StealthModeScheduler for rate-limited API scanning
         print("Creating StealthModeScheduler...")
-        stealth_config = config.get('stealth_mode', {})
-        self.stealth_scheduler = StealthModeScheduler(stealth_config)
+        stealth_config = self.config.get('stealth_mode', {})
+        # Generate target hash to prevent state collision in concurrent scans
+        target_hash = hashlib.md5(self.target.encode()).hexdigest()[:8]
+        self.stealth_scheduler = StealthModeScheduler(stealth_config, target_hash=target_hash)
         if self.stealth_scheduler.enabled:
             print(f"StealthModeScheduler enabled: {self.stealth_scheduler.requests_per_window} requests over {self.stealth_scheduler.window_hours} hours")
         else:
             print("StealthModeScheduler disabled")
         
         self.subdomain_discovery = SubdomainDiscovery()
-        self.scan_state_manager = ScanStateManager(config.get('state_db', 'scan_state.db'))
-        self.temporal_recheck_enabled = config.get('temporal_recheck', False)
-        self.recheck_delay = config.get('recheck_delay', 3600)
+        self.scan_state_manager = ScanStateManager(self.config.get('state_db', 'scan_state.db'))
+        self.temporal_recheck_enabled = self.config.get('temporal_recheck', False)
+        self.recheck_delay = self.config.get('recheck_delay', 3600)
         self.validation_tasks = set()
-        self.memory_efficient = config.get('memory_efficient', True)
+        self.memory_efficient = self.config.get('memory_efficient', True)
         self.vulnerability_timestamps = {}
-        self.validation_enabled = config.get('validation_enabled', DEFAULT_VALIDATION_ENABLED)
+        self.validation_enabled = self.config.get('validation_enabled', DEFAULT_VALIDATION_ENABLED)
         self.validation_engine = None
         self.selenium_driver = None
         self.selenium_ready = False
@@ -39249,7 +39502,7 @@ class OmegaDAST:
         self.oob_scanner_local.instance = self
         
         # Taint tracking initialization - Fully implemented with TaintTracker and TaintInstrumentor classes
-        self.taint_tracking_enabled = config.get('taint_tracking_enabled', True)
+        self.taint_tracking_enabled = self.config.get('taint_tracking_enabled', True)
         if self.taint_tracking_enabled:
             try:
                 self.taint_tracker = AdvancedTaintTracker(config)
@@ -39268,7 +39521,7 @@ class OmegaDAST:
             self.taint_integrated_session = None
 
         # JavaScript symbolic execution initialization - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
-        self.symbolic_execution_enabled = config.get('symbolic_execution_enabled', True)
+        self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
         if self.symbolic_execution_enabled:
             try:
                 self.symbolic_executor = JavaScriptSymbolicExecutor(config)
@@ -39281,18 +39534,18 @@ class OmegaDAST:
             self.symbolic_executor = None
 
         # Wordlist fuzzing initialization with genetic algorithm capabilities - Now integrated into main scan flow
-        self.genetic_fuzzing_enabled = config.get('genetic_fuzzing_enabled', False)
-        self.use_genetic_algorithm = config.get('use_genetic_algorithm', False)  # Use actual GeneticFuzzer vs WordlistFuzzer
+        self.genetic_fuzzing_enabled = self.config.get('genetic_fuzzing_enabled', False)
+        self.use_genetic_algorithm = self.config.get('use_genetic_algorithm', False)  # Use actual GeneticFuzzer vs WordlistFuzzer
         if self.genetic_fuzzing_enabled:
             try:
-                max_requests = config.get('fuzz_max_requests', 1000)
-                wordlist = config.get('fuzz_wordlist', None)
+                max_requests = self.config.get('fuzz_max_requests', 1000)
+                wordlist = self.config.get('fuzz_wordlist', None)
                 
                 if self.use_genetic_algorithm:
                     # Use GeneticFuzzer for evolutionary fuzzing
-                    population_size = config.get('genetic_population_size', 50)
-                    generations = config.get('genetic_generations', 10)
-                    mutation_rate = config.get('genetic_mutation_rate', 0.1)
+                    population_size = self.config.get('genetic_population_size', 50)
+                    generations = self.config.get('genetic_generations', 10)
+                    mutation_rate = self.config.get('genetic_mutation_rate', 0.1)
                     
                     self.genetic_fuzzer = GeneticFuzzer(
                         target_url=self.target,
@@ -39321,18 +39574,35 @@ class OmegaDAST:
         
         # RCE confirmation flag for secure remote command execution
         self.rce_confirmed = False
+    
+    def _validate_signal_configuration(self):
+        """Validate that the signals object has the required attributes for GUI communication."""
+        required_signals = ['log', 'finding', 'progress']
+        missing_signals = []
+        
+        for signal_name in required_signals:
+            if not hasattr(self.signals, signal_name):
+                missing_signals.append(signal_name)
+                logging.warning(f"Signals object missing required signal: {signal_name}")
+        
+        if missing_signals:
+            logging.error(f"Missing signals: {', '.join(missing_signals)}. GUI communication may be impaired.")
+            print(f"WARNING: Missing signals: {', '.join(missing_signals)}. Results may not reach GUI.")
+        else:
+            logging.info("Signal configuration validated successfully")
+            print("Signal configuration validated successfully")
         self.confirmed_injection_channels = []
         
         # New feature configurations
-        self.oauth_discovery_enabled = config.get('oauth_discovery_enabled', True)
-        self.oauth_well_known_enabled = config.get('oauth_well_known_enabled', True)
-        self.oauth_js_scraping_enabled = config.get('oauth_js_scraping_enabled', True)
-        self.parameter_detection_enabled = config.get('parameter_detection_enabled', True)
-        self.form_parameter_extraction = config.get('form_parameter_extraction', True)
-        self.javascript_parameter_scraping = config.get('javascript_parameter_scraping', True)
-        self.second_order_context_replay = config.get('second_order_context_replay', True)
-        self.context_verification_enabled = config.get('context_verification_enabled', True)
-        self.graphql_variables_support = config.get('graphql_variables_support', True)
+        self.oauth_discovery_enabled = self.config.get('oauth_discovery_enabled', True)
+        self.oauth_well_known_enabled = self.config.get('oauth_well_known_enabled', True)
+        self.oauth_js_scraping_enabled = self.config.get('oauth_js_scraping_enabled', True)
+        self.parameter_detection_enabled = self.config.get('parameter_detection_enabled', True)
+        self.form_parameter_extraction = self.config.get('form_parameter_extraction', True)
+        self.javascript_parameter_scraping = self.config.get('javascript_parameter_scraping', True)
+        self.second_order_context_replay = self.config.get('second_order_context_replay', True)
+        self.context_verification_enabled = self.config.get('context_verification_enabled', True)
+        self.graphql_variables_support = self.config.get('graphql_variables_support', True)
         
         # Initialize advanced obfuscation and GraphQL analysis components
         try:
@@ -39350,8 +39620,8 @@ class OmegaDAST:
             self.dynamic_payload_generator = None
         
         # Initialize Schema Inference Engine and Dynamic Mutation Server
-        schema_config = config.get('schema_inference', {})
-        mutation_config = config.get('dynamic_mutation', {})
+        schema_config = self.config.get('schema_inference', {})
+        mutation_config = self.config.get('dynamic_mutation', {})
         
         self.schema_inference_enabled = schema_config.get('enabled', DEFAULT_SCHEMA_INFERENCE_ENABLED)
         self.dynamic_mutation_enabled = mutation_config.get('enabled', DEFAULT_DYNAMIC_MUTATION_ENABLED)
@@ -39359,8 +39629,8 @@ class OmegaDAST:
         
         if self.schema_inference_enabled or self.dynamic_mutation_enabled:
             try:
-                self.schema_engine = SchemaInferenceEngine(self.session_manager, config)
-                self.mutation_server = DynamicMutationServer(self.schema_engine, config)
+                self.schema_engine = SchemaInferenceEngine(self.session_manager, self.config)
+                self.mutation_server = DynamicMutationServer(self.schema_engine, self.config)
                 self.log("Schema Inference Engine and Dynamic Mutation Server initialized")
                 self.log(f"Schema inference confidence threshold: {self.schema_confidence_threshold}")
             except Exception as e:
@@ -39376,13 +39646,13 @@ class OmegaDAST:
         # GraphQL advanced features (initialized during GraphQL testing)
         self.graphql_complexity_calculator = None
         self.graphql_fragment_generator = None
-        self.graphql_depth_limit = config.get('graphql_depth_limit', 100)
-        self.graphql_batch_limit = config.get('graphql_batch_limit', 1000)
-        self.graphql_advanced_testing = config.get('graphql_advanced_testing', True)
+        self.graphql_depth_limit = self.config.get('graphql_depth_limit', 100)
+        self.graphql_batch_limit = self.config.get('graphql_batch_limit', 1000)
+        self.graphql_advanced_testing = self.config.get('graphql_advanced_testing', True)
         
         # gRPC configuration
-        self.grpc_advanced_testing = config.get('grpc_advanced_testing', True)
-        self.grpc_fuzzing_intensity = config.get('grpc_fuzzing_intensity', 0.5)
+        self.grpc_advanced_testing = self.config.get('grpc_advanced_testing', True)
+        self.grpc_fuzzing_intensity = self.config.get('grpc_fuzzing_intensity', 0.5)
         
         # Validate configuration limits
         if self.graphql_depth_limit > 200:
@@ -39408,7 +39678,7 @@ class OmegaDAST:
         # Initialize REST API Server for headless mode and CI/CD integration
         print("Initializing REST API Server...")
         try:
-            api_config = config.get('rest_api', {})
+            api_config = self.config.get('rest_api', {})
             api_host = api_config.get('host', '127.0.0.1')
             api_port = api_config.get('port', 8080)
             self.rest_api_server = RESTAPIServer(host=api_host, port=api_port)
@@ -39429,12 +39699,12 @@ class OmegaDAST:
             self.business_logic_fsm = BusinessLogicFSM()
             
             # Configure FSM stuck detection from config
-            fsm_config = config.get('fsm_stuck_detection', {})
+            fsm_config = self.config.get('fsm_stuck_detection', {})
             self.business_logic_fsm.stuck_detection_enabled = fsm_config.get('enabled', True)
             self.business_logic_fsm.stuck_timeout = fsm_config.get('stuck_timeout', 300)
             
-            self.spa_route_discovery_enabled = config.get('spa_route_discovery_enabled', True)
-            self.fsm_aware_testing_enabled = config.get('fsm_aware_testing_enabled', True)
+            self.spa_route_discovery_enabled = self.config.get('spa_route_discovery_enabled', True)
+            self.fsm_aware_testing_enabled = self.config.get('fsm_aware_testing_enabled', True)
             self.log("Enhanced SPA route discovery and FSM components initialized")
         except Exception as e:
             logging.error(f"Failed to initialize enhanced SPA components: {e}")
@@ -39462,7 +39732,7 @@ class OmegaDAST:
                 gui_mode = False
             
             # Allow configurable log level with performance-optimized default
-            log_level_config = config.get('log_level', 'WARNING')  # Default to WARNING for performance
+            log_level_config = self.config.get('log_level', 'WARNING')  # Default to WARNING for performance
             log_level_map = {
                 'DEBUG': logging.DEBUG,
                 'INFO': logging.INFO,
@@ -39479,7 +39749,7 @@ class OmegaDAST:
             )
         
         # Domain whitelist for security
-        self.allowed_domains = set(config.get('allowed_domains', [self.base_domain]))
+        self.allowed_domains = set(self.config.get('allowed_domains', [self.base_domain]))
         if not self.allowed_domains:
             # If no whitelist configured, allow only the target domain
             self.allowed_domains.add(self.base_domain)
@@ -39600,6 +39870,15 @@ class OmegaDAST:
                     return
             self.reporting_engine.vulnerabilities.append(vuln)
             self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
+            
+            # Ensure vulnerability is also stored in disk-based storage
+            try:
+                if hasattr(self.reporting_engine, 'vulnerability_storage'):
+                    self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                    logging.debug(f"Added vulnerability to disk storage: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.warning(f"Failed to add vulnerability to disk storage: {e}")
+            
             self.add_finding(vuln)
             if vuln.get('severity') in ('Critical','High'):
                 # Use SecurityWarning class for structured security alerts
@@ -39686,19 +39965,26 @@ class OmegaDAST:
             
             self.log(f"[VALIDATION COMPLETE] {vuln['type']} - Status: {validation_status}, Final Confidence: {final_confidence}%")
             
-            # Remove finding if validation status is false_positive or confidence dropped below threshold
-            confidence_threshold = self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)
-            if validation_status == 'false_positive' or final_confidence < confidence_threshold:
+            # Only remove finding if validation explicitly determined it's a false positive
+            # Don't remove based on confidence threshold - let reporting/filtering handle that
+            if validation_status == 'false_positive':
                 if v_to_remove:
                     self.reporting_engine.vulnerabilities.remove(v_to_remove)
-                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed due to low confidence ({final_confidence}% < {confidence_threshold}%) or false positive")
+                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed as false positive")
                 return
             
-            # Only push verified findings to GUI and export if validation succeeded
-            if validation_status in ['confirmed', 'verified_by_proximity', 'likely']:
-                self.add_finding(validated_vuln)
-            elif validation_status == 'skipped_circuit_breaker':
+            # Always add validated findings to reporting engine regardless of validation status
+            # The validation engine has already marked all findings as validated=True
+            # and set appropriate confidence scores. Let the reporting/export layer handle filtering.
+            self.add_finding(validated_vuln)
+            
+            # Log special cases for informational purposes
+            if validation_status == 'skipped_circuit_breaker':
                 self.log(f"[CIRCUIT BREAKER] {vuln['type']} at {vuln['url']} - skipped due to rate limiting")
+            elif validation_status == 'inconclusive':
+                self.log(f"[INCONCLUSIVE] {vuln['type']} at {vuln['url']} - added to results with ambiguous status")
+            elif validation_status == 'validation_error':
+                self.log(f"[VALIDATION ERROR] {vuln['type']} at {vuln['url']} - added to results despite validation error")
         except Exception as e:
             logging.error(f"Vulnerability validation error: {e}")
             vuln['validation_error'] = str(e)
@@ -39794,11 +40080,31 @@ class OmegaDAST:
             total_findings = len(self.reporting_engine.vulnerabilities) if hasattr(self.reporting_engine, 'vulnerabilities') else 0
             self.main_window.update_statistics(total_findings=total_findings)
         
-        # Emit signal for GUI display
+        # Emit signal for GUI display with enhanced error handling
         if hasattr(self.signals, 'finding'):
-            self.signals.finding.emit(vuln)
+            try:
+                self.signals.finding.emit(vuln)
+                logging.debug(f"Successfully emitted finding to GUI: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.error(f"Failed to emit finding signal to GUI: {e}", exc_info=True)
+                # Fallback: Try to add directly to reporting engine storage
+                if hasattr(self.reporting_engine, 'vulnerability_storage'):
+                    try:
+                        self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                        logging.info(f"Added finding directly to vulnerability storage as fallback")
+                    except Exception as fallback_error:
+                        logging.error(f"Fallback to vulnerability storage also failed: {fallback_error}")
         else:
-            logging.info(f"Finding: {vuln}")
+            logging.warning(f"Signals object does not have 'finding' attribute. Finding not sent to GUI: {vuln.get('type')} at {vuln.get('url')}")
+            # Fallback: Ensure it's stored in vulnerability storage
+            if hasattr(self.reporting_engine, 'vulnerability_storage'):
+                try:
+                    self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                    logging.info(f"Added finding directly to vulnerability storage as fallback")
+                except Exception as fallback_error:
+                    logging.error(f"Fallback to vulnerability storage failed: {fallback_error}")
+            else:
+                logging.info(f"Finding: {vuln}")
     def update_progress(self, current, total):
         if hasattr(self.signals, 'progress'):
             self.signals.progress.emit(current, total)
@@ -39821,6 +40127,14 @@ class OmegaDAST:
                 self.taint_tracker = None
                 self.taint_instrumentor = None
                 self.taint_integrated_session = None
+
+        # Initialize HeuristicRegressionOracle database
+        if self.injection_engine and self.injection_engine.heuristic_oracle:
+            try:
+                await self.injection_engine.async_init()
+                logging.info("HeuristicRegressionOracle database initialized successfully")
+            except Exception as e:
+                logging.warning(f"Failed to initialize HeuristicRegressionOracle database: {e}")
 
         # JavaScript symbolic execution setup - Now implemented with JavaScriptSymbolicExecutionEngine and JavaScriptSymbolicExecutor classes
         self.symbolic_execution_enabled = self.config.get('symbolic_execution_enabled', True)
@@ -39848,20 +40162,25 @@ class OmegaDAST:
         if self.config.get('resume_scan'):
             prev_state = self.scan_state_manager.load_state()
             if prev_state and prev_state['target'] == self.target:
-                self.crawler_engine.visited_urls = prev_state['visited_urls']
-                self.crawler_engine.parameters = prev_state['parameters'] if isinstance(prev_state['parameters'], list) else []
+                # Restore visited URLs to disk storage
+                if self.crawler_engine.url_storage:
+                    for url in prev_state.get('visited_urls', []):
+                        self.crawler_engine.url_storage.add_visited_url(url)
+                # Note: parameters and crawled_pages remain in disk storage and don't need restoration
                 self.reporting_engine.vulnerabilities = prev_state['vulnerabilities'] if isinstance(prev_state['vulnerabilities'], list) else []
-                self.crawler_engine.crawled_pages = prev_state['crawled_pages'] if isinstance(prev_state['crawled_pages'], list) else []
                 
                 # Restore FSM state if available
                 if prev_state.get('fsm_state') and hasattr(self, 'business_logic_fsm') and self.business_logic_fsm:
                     self.business_logic_fsm.import_fsm_state(prev_state['fsm_state'])
                     self.log(f"FSM state restored: {len(prev_state['fsm_state'].get('learned_sequences', {}))} learned sequences")
                 
-                self.log(f"Resumed scan with {len(self.crawler_engine.visited_urls)} URLs, {len(self.crawler_engine.parameters)} parameters")
+                self.log(f"Resumed scan with {self.crawler_engine.url_storage.get_visited_count() if self.crawler_engine.url_storage else 0} URLs, {sum(1 for _ in self.crawler_engine._get_parameters_iterator())} parameters")
         checkpoint_data = self.config.get('checkpoint_data')
         if checkpoint_data and checkpoint_data.get('target') == self.target:
-            self.crawler_engine.visited_urls = set(checkpoint_data.get('visited_urls', []))
+            # Restore visited URLs to disk storage
+            if self.crawler_engine.url_storage:
+                for url in checkpoint_data.get('visited_urls', []):
+                    self.crawler_engine.url_storage.add_visited_url(url)
             self.reporting_engine.vulnerabilities = checkpoint_data.get('vulnerabilities', [])
             self.log(f"Restored from checkpoint: {len(self.crawler_engine.visited_urls)} URLs, {len(self.reporting_engine.vulnerabilities)} vulnerabilities")
         if self.validation_enabled:
@@ -40008,6 +40327,15 @@ class OmegaDAST:
         This replaces blind payload injection with intelligent version-based vulnerability testing.
         """
         try:
+            # Ensure session manager is properly initialized
+            if not self.session_manager or not self.session_manager.async_session:
+                self.log("Version detection: Session manager not initialized, attempting to initialize...")
+                try:
+                    await self.session_manager.setup()
+                except Exception as setup_error:
+                    self.log(f"Version detection: Failed to initialize session manager: {setup_error}")
+                    return
+            
             # Fetch the target homepage for version detection
             resp = await self._async_fetch(self.target)
             if not resp:
@@ -40261,21 +40589,60 @@ class OmegaDAST:
         await self.pause_event.wait()
         
         # Port and service discovery
-        self.log("Starting port and service discovery...")
+        self.log("Starting comprehensive port and service discovery...")
+        open_ports = []
         try:
             host = parsed_target.hostname if parsed_target.hostname else domain
+            
+            # Check for comprehensive port scanning configuration
+            comprehensive_scan = self.config.get('comprehensive_port_scan', False)
+            enable_udp_scan = self.config.get('enable_udp_scan', True)
+            enable_sctp_scan = self.config.get('enable_sctp_scan', False)
+            port_range = self.config.get('port_range', None)
+            
+            # Initialize default ports
             ports_to_scan = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017]
-            open_ports = await self.subdomain_discovery.scan_ports(host, ports_to_scan)
+            scan_type = 'tcp_connect'
+            
+            if comprehensive_scan:
+                # Comprehensive scan - all ports (1-65535) with all protocols
+                self.log("Comprehensive port scanning enabled - scanning all ports 1-65535 with TCP, UDP, and SCTP")
+                port_range = (1, 65535)
+                scan_type = 'comprehensive'
+                enable_udp_scan = True
+                enable_sctp_scan = True
+                ports_to_scan = None  # Will use port_range instead
+            elif port_range:
+                # Custom port range
+                self.log(f"Scanning custom port range: {port_range[0]}-{port_range[1]}")
+                scan_type = 'comprehensive'
+                ports_to_scan = None  # Will use port_range instead
+            else:
+                # Default common ports
+                self.log("Scanning common ports only")
+                port_range = None
+            
+            # Enhanced port scanning with UDP and SCTP support
+            open_ports = await self.subdomain_discovery.scan_ports(
+                host, 
+                ports=ports_to_scan,
+                timeout=2,
+                scan_type=scan_type,
+                enable_udp=enable_udp_scan,
+                enable_sctp=enable_sctp_scan,
+                port_range=port_range
+            )
             
             for port_info in open_ports:
+                protocol = port_info.get('protocol', port_info.get('scan_type', 'tcp')).upper()
                 port_finding = {
                     'type': 'Open Port Discovery',
                     'url': f"{host}:{port_info['port']}",
-                    'parameter': f"Port {port_info['port']}",
+                    'parameter': f"Port {port_info['port']}/{protocol}",
                     'confidence': 'High',
                     'severity': 'Info',
                     'cwe': 'CWE-200',
-                    'evidence': f"Open port: {port_info['port']}/{port_info['service']} - {port_info.get('banner', 'No banner')}"
+                    'evidence': f"Open {protocol} port: {port_info['port']}/{port_info['service']} - {port_info.get('banner', 'No banner')}"
                 }
                 self.add_finding(port_finding)
                 
@@ -40365,7 +40732,23 @@ class OmegaDAST:
             
             self.log(f"Port discovery completed. Found {len(open_ports)} open ports.")
         except Exception as e:
-            self.log(f"Port discovery failed: {e}")
+            import traceback
+            error_details = f"Port discovery failed: {e}\n"
+            error_details += f"Exception Type: {type(e).__name__}\n"
+            error_details += f"Stack Trace:\n{traceback.format_exc()}"
+            self.log(error_details)
+            logging.error(f"Port discovery error: {e}", exc_info=True)
+            # Create a finding to inform user about the failure
+            port_error_finding = {
+                'type': 'Port Discovery Error',
+                'url': host if 'host' in locals() else self.target,
+                'parameter': 'Port Scan',
+                'confidence': 'High',
+                'severity': 'High',
+                'cwe': 'CWE-200',
+                'evidence': f"Port discovery failed: {str(e)}. Port and service detection may be incomplete."
+            }
+            self.add_finding(port_error_finding)
         
         # HTTP header analysis and technology detection
         self.log("Starting HTTP header analysis and technology detection...")
@@ -40491,9 +40874,11 @@ class OmegaDAST:
             try:
                 # Analyze crawled pages for JavaScript vulnerabilities
                 symbolic_results = []
-                pages_to_analyze = min(20, len(self.crawler_engine.crawled_pages))  # Limit to 20 pages
+                # Count pages and limit to 20
+                pages_list = list(self.crawler_engine._get_crawled_pages_iterator())
+                pages_to_analyze = min(20, len(pages_list))
                 
-                for page in self.crawler_engine.crawled_pages[:pages_to_analyze]:
+                for page in pages_list[:pages_to_analyze]:
                     page_url = page.get('url', page)
                     if page_url:
                         try:
@@ -40560,10 +40945,10 @@ class OmegaDAST:
             
             self.scan_state_manager.save_state(
                 self.target,
-                self.crawler_engine.visited_urls,
-                self.crawler_engine.parameters,
+                set(self.crawler_engine.url_storage.get_all_visited()) if self.crawler_engine.url_storage else set(),
+                list(self.crawler_engine._get_parameters_iterator()),
                 self.reporting_engine.vulnerabilities,
-                self.crawler_engine.crawled_pages,
+                list(self.crawler_engine._get_crawled_pages_iterator()),
                 self.config,
                 fsm_state
             )
@@ -40752,6 +41137,14 @@ class OmegaDAST:
                 self.log("REST API Server stopped successfully")
             except Exception as e:
                 logging.error(f"Error stopping REST API Server: {e}")
+        
+        # Cleanup Playwright driver if it was initialized
+        if hasattr(self, 'playwright_driver') and self.playwright_driver:
+            try:
+                self.playwright_driver.close()
+                self.log("Playwright driver closed successfully")
+            except Exception as e:
+                logging.error(f"Error closing Playwright driver: {e}")
         
         self.oob_manager.stop()
         await self.reporting_engine.close()
@@ -46185,6 +46578,15 @@ class GraphQLSelfReferencingFragmentGenerator:
                     return
             self.reporting_engine.vulnerabilities.append(vuln)
             self.log(f"[+] {vuln['type']} ({vuln.get('confidence')}%): {vuln['url']} [{vuln.get('parameter','')}]")
+            
+            # Ensure vulnerability is also stored in disk-based storage
+            try:
+                if hasattr(self.reporting_engine, 'vulnerability_storage'):
+                    self.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                    logging.debug(f"Added vulnerability to disk storage: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.warning(f"Failed to add vulnerability to disk storage: {e}")
+            
             self.add_finding(vuln)
             if vuln.get('severity') in ('Critical','High'):
                 # Use SecurityWarning class for structured security alerts
@@ -46235,16 +46637,28 @@ class GraphQLSelfReferencingFragmentGenerator:
             
             final_confidence = validated_vuln.get('confidence', vuln.get('confidence', 0))
             
-            # Remove finding if validation status is false_positive or confidence dropped below threshold
-            confidence_threshold = self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)
-            if validation_status == 'false_positive' or final_confidence < confidence_threshold:
+            # Only remove finding if validation explicitly determined it's a false positive
+            # Don't remove based on confidence threshold - let reporting/filtering handle that
+            if validation_status == 'false_positive':
                 if v_to_remove:
                     self.reporting_engine.vulnerabilities.remove(v_to_remove)
-                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed due to low confidence ({final_confidence}% < {confidence_threshold}%) or false positive")
+                    self.log(f"[VALIDATION REMOVED] {vuln['type']} at {vuln['url']} - removed as false positive")
                 return
             
+            # Always add validated findings to reporting engine regardless of validation status
+            # The validation engine has already marked all findings as validated=True
+            # and set appropriate confidence scores. Let the reporting/export layer handle filtering.
+            self.add_finding(validated_vuln)
+            
+            # Log special cases for informational purposes
             if validation_status == 'confirmed':
                 self.log(f"[VALIDATION CONFIRMED] {vuln['type']} at {vuln['url']}")
+            elif validation_status == 'skipped_circuit_breaker':
+                self.log(f"[CIRCUIT BREAKER] {vuln['type']} at {vuln['url']} - skipped due to rate limiting")
+            elif validation_status == 'inconclusive':
+                self.log(f"[INCONCLUSIVE] {vuln['type']} at {vuln['url']} - added to results with ambiguous status")
+            elif validation_status == 'validation_error':
+                self.log(f"[VALIDATION ERROR] {vuln['type']} at {vuln['url']} - added to results despite validation error")
         except Exception as e:
             logging.error(f"Validation error for {vuln.get('type', 'unknown')}: {e}")
     def dns_bruteforce(self, domain, wordlist=None):
@@ -47547,20 +47961,58 @@ class SubdomainDiscovery:
         self.discovered_subdomains.clear()
         logging.info("SubdomainDiscovery: Resources cleaned up")
     
-    async def scan_ports(self, host, ports, timeout=2, scan_type='tcp_connect'):
-        """Scan ports on a host to check if they are open with advanced scanning options."""
+    async def scan_ports(self, host, ports=None, timeout=2, scan_type='tcp_connect', enable_udp=False, port_range=None, enable_sctp=False):
+        """Scan ports on a host to check if they are open with advanced scanning options.
+        
+        Args:
+            host: Target hostname or IP address
+            ports: List of specific ports to scan (if None, uses port_range or default common ports)
+            timeout: Connection timeout in seconds
+            scan_type: Type of scan ('tcp_connect', 'syn', 'udp', 'sctp', 'comprehensive')
+            enable_udp: Enable UDP scanning
+            port_range: Tuple of (start_port, end_port) for comprehensive scanning (e.g., (1, 65535))
+            enable_sctp: Enable SCTP scanning (experimental)
+        
+        Returns:
+            List of dictionaries containing open port information
+        """
         import asyncio
+        
+        # Determine port list based on parameters
+        if ports is None:
+            if port_range:
+                start_port, end_port = port_range
+                ports = list(range(start_port, end_port + 1))
+            else:
+                # Default common ports if no specific ports or range provided
+                ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017]
         
         open_ports = []
         
         async def check_port(port):
             try:
                 if scan_type == 'tcp_connect':
-                    return await self._tcp_connect_scan(host, port, timeout)
+                    return await _tcp_connect_scan(host, port, timeout)
                 elif scan_type == 'syn':
-                    return await self._syn_scan(host, port, timeout)
+                    return await _syn_scan(host, port, timeout)
+                elif scan_type == 'udp':
+                    return await _udp_scan(host, port, timeout)
+                elif scan_type == 'sctp':
+                    return await _sctp_scan(host, port, timeout)
+                elif scan_type == 'comprehensive':
+                    # Run TCP, UDP, and SCTP scans
+                    tcp_result = await _tcp_connect_scan(host, port, timeout)
+                    udp_result = await _udp_scan(host, port, timeout) if enable_udp else None
+                    sctp_result = await _sctp_scan(host, port, timeout) if enable_sctp else None
+                    # Return TCP result if available, otherwise UDP or SCTP result
+                    return tcp_result if tcp_result else (udp_result if udp_result else sctp_result)
                 else:
-                    return await self._tcp_connect_scan(host, port, timeout)
+                    result = await _tcp_connect_scan(host, port, timeout)
+                    if enable_udp and not result:
+                        result = await _udp_scan(host, port, timeout)
+                    if enable_sctp and not result:
+                        result = await _sctp_scan(host, port, timeout)
+                    return result
             except Exception as e:
                 logging.debug(f"Port scan failed for {host}:{port}: {e}")
                 return None
@@ -47576,12 +48028,12 @@ class SubdomainDiscovery:
                 await writer.wait_closed()
                 
                 # Enhanced service banner detection
-                service_info = await self._detect_service(host, port, timeout)
+                service_info = await _detect_service(host, port, timeout)
                 service_info['port'] = port
                 service_info['scan_type'] = 'tcp_connect'
                 
                 # Perform service-specific analysis
-                service_info = await self._perform_service_analysis(host, port, service_info, timeout)
+                service_info = await _perform_service_analysis(host, port, service_info, timeout)
                 
                 return service_info
                 
@@ -47619,6 +48071,106 @@ class SubdomainDiscovery:
                 logging.debug(f"SYN scan failed for {host}:{port}: {e}")
                 return await _tcp_connect_scan(host, port, timeout)
         
+        async def _udp_scan(host, port, timeout):
+            """UDP port scan with service detection"""
+            try:
+                import socket
+                import asyncio
+                
+                # Create UDP socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(timeout)
+                
+                # Service-specific UDP probes
+                udp_probes = {
+                    53: b'\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01',  # DNS query
+                    67: b'\x01\x01\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # DHCP discover
+                    123: b'\x1b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # NTP request
+                }
+                
+                probe = udp_probes.get(port, b'\x00')  # Default empty probe
+                
+                try:
+                    sock.sendto(probe, (host, port))
+                    sock.settimeout(timeout)
+                    data, _ = sock.recvfrom(1024)
+                    
+                    if data:
+                        service_info = await _detect_udp_service(host, port, data, timeout)
+                        service_info['port'] = port
+                        service_info['scan_type'] = 'udp'
+                        service_info['protocol'] = 'udp'
+                        sock.close()
+                        return service_info
+                except socket.timeout:
+                    # No response could mean port is open (UDP is connectionless)
+                    # or filtered - we mark as potentially open
+                    service_info = {
+                        'port': port,
+                        'service': 'udp_open_filtered',
+                        'banner': '',
+                        'version': '',
+                        'scan_type': 'udp',
+                        'protocol': 'udp',
+                        'status': 'open_filtered'
+                    }
+                    sock.close()
+                    return service_info
+                    
+                # Try to extract version from banner
+                try:
+                    if service_info.get('banner'):
+                        service_info['version'] = _extract_version_from_banner(service_info['banner'], service_info['service'])
+                except Exception as e:
+                    logging.debug(f"UDP scan failed for {host}:{port}: {e}")
+                    sock.close()
+                    return None
+                    
+            except Exception as e:
+                logging.debug(f"UDP scan error for {host}:{port}: {e}")
+                return None
+        
+        async def _sctp_scan(host, port, timeout):
+            """SCTP port scan with service detection (experimental)"""
+            try:
+                import socket
+                import asyncio
+                
+                # SCTP scanning requires SCTP support in the OS
+                # This is a basic implementation that attempts SCTP association
+                try:
+                    # Try to create SCTP socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP)
+                    s.settimeout(timeout)
+                    
+                    try:
+                        s.connect((host, port))
+                        s.close()
+                        
+                        # Service detection for SCTP
+                        service_info = await _detect_sctp_service(host, port, timeout)
+                        service_info['port'] = port
+                        service_info['scan_type'] = 'sctp'
+                        service_info['protocol'] = 'sctp'
+                        
+                        return service_info
+                    except socket.timeout:
+                        s.close()
+                        return None
+                    except Exception as e:
+                        s.close()
+                        logging.debug(f"SCTP connection failed for {host}:{port}: {e}")
+                        return None
+                        
+                except (socket.error, AttributeError):
+                    # SCTP not supported on this system
+                    logging.debug("SCTP not supported on this system")
+                    return None
+                    
+            except Exception as e:
+                logging.debug(f"SCTP scan error for {host}:{port}: {e}")
+                return None
+        
         async def _detect_service(host, port, timeout):
             """Enhanced service detection with multiple probes"""
             service_info = {'service': 'unknown', 'banner': '', 'version': ''}
@@ -47629,14 +48181,23 @@ class SubdomainDiscovery:
                     timeout=timeout
                 )
                 
-                # Multiple probe attempts for better banner detection
+                # Enhanced comprehensive protocol probes for better service detection
                 probes = [
-                    b'\r\n',              # Generic probe
-                    b'GET / HTTP/1.0\r\n\r\n',  # HTTP probe
-                    b'HEAD / HTTP/1.0\r\n\r\n', # HTTP HEAD probe
-                    b'HELP\r\n',            # Generic service help
-                    b'STAT\r\n',            # Redis STAT
-                    b'INFO\r\n',            # Redis INFO
+                    b'\r\n',                      # Generic probe
+                    b'GET / HTTP/1.0\r\n\r\n',    # HTTP probe
+                    b'HEAD / HTTP/1.0\r\n\r\n',   # HTTP HEAD probe
+                    b'HELP\r\n',                  # Generic service help
+                    b'STAT\r\n',                  # Redis STAT
+                    b'INFO\r\n',                  # Redis INFO
+                    b'VERSION\r\n',               # Version request
+                    b'STATUS\r\n',               # Status request
+                    b'AUTH\r\n',                 # Auth probe
+                    b'USER anonymous\r\n',       # FTP probe
+                    b'SMHBA\r\n',                # SMTP probe
+                    b'EHLO test\r\n',            # SMTP EHLO
+                    b'CONNECT test.com:443\r\n', # HTTP CONNECT
+                    b'\x00\x00\x00\x0a',         # Length-prefixed probe
+                    b'\x01\x00\x00\x00',         # Binary probe
                 ]
                 
                 for probe in probes:
@@ -47657,20 +48218,528 @@ class SubdomainDiscovery:
             except:
                 pass
             
-            # Determine service based on port and banner
+            # Determine service based on port and banner - comprehensive service mapping
             service_map = {
+                # Common services
                 21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns',
                 80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb',
                 993: 'imaps', 995: 'pop3s', 3306: 'mysql', 3389: 'rdp',
                 5432: 'postgresql', 5900: 'vnc', 6379: 'redis', 8080: 'http-proxy', 8443: 'https-alt',
-                27017: 'mongodb', 9200: 'elasticsearch', 5672: 'amqp', 15672: 'amqp-management'
+                27017: 'mongodb', 9200: 'elasticsearch', 5672: 'amqp', 15672: 'amqp-management',
+                
+                # Additional common services
+                67: 'dhcp', 68: 'dhcp', 69: 'tftp', 79: 'finger', 88: 'kerberos',
+                119: 'nntp', 123: 'ntp', 137: 'netbios-ns', 138: 'netbios-dgm',
+                139: 'netbios-ssn', 161: 'snmp', 162: 'snmp-trap', 389: 'ldap', 636: 'ldaps',
+                989: 'ftps-data', 990: 'ftps', 992: 'telnets', 1194: 'openvpn',
+                1433: 'mssql', 1434: 'ms-sql-m', 1521: 'oracle', 2049: 'nfs',
+                5985: 'winrm', 5986: 'winrm-ssl', 6443: 'kubernetes-api',
+                6666: 'irc', 7000: 'cassandra', 7001: 'weblogic', 8000: 'http-alt',
+                8008: 'http-proxy', 8009: 'ajp', 8081: 'blackice',
+                8082: 'blackice', 8083: 'https-alt', 8084: 'https-alt', 8085: 'https-alt',
+                8086: 'influxdb', 8087: 'https-alt', 8088: 'https-alt', 8089: 'https-alt',
+                8090: 'https-alt', 8091: 'https-alt', 8092: 'https-alt', 8093: 'https-alt',
+                8888: 'http-alt', 9000: 'sonarqube', 9001: 'http-alt',
+                9002: 'http-alt', 9003: 'http-alt', 9004: 'http-alt', 9005: 'http-alt',
+                9006: 'http-alt', 9007: 'http-alt', 9008: 'http-alt', 9009: 'http-alt',
+                9090: 'http-alt', 9091: 'http-alt', 9092: 'kafka', 9093: 'kafka',
+                9094: 'kafka', 9100: 'jetty', 9300: 'elasticsearch',
+                9418: 'git', 9999: 'http-alt', 10000: 'webmin', 11211: 'memcached',
+                27018: 'mongodb', 27019: 'mongodb',
+                28017: 'mongodb', 29092: 'kafka', 30000: 'nexpose', 31337: 'backdoor',
+                33448: 'mongodb', 35379: 'mongodb', 37337: 'backdoor', 40000: 'mongodb',
+                4369: 'epmd', 50000: 'db2', 50001: 'db2', 50002: 'db2', 50003: 'db2',
+                50189: 'db2', 50190: 'db2', 50191: 'db2', 50192: 'db2', 50193: 'db2',
+                50194: 'db2', 50195: 'db2', 50196: 'db2', 50197: 'db2', 50198: 'db2',
+                50199: 'db2', 50200: 'db2', 50201: 'db2', 50202: 'db2', 50203: 'db2',
+                50204: 'db2', 50205: 'db2', 50206: 'db2', 50207: 'db2', 50208: 'db2',
+                50209: 'db2', 50210: 'db2', 50211: 'db2', 50212: 'db2', 50213: 'db2',
+                50214: 'db2', 50215: 'db2', 50216: 'db2', 50217: 'db2', 50218: 'db2',
+                50219: 'db2', 50220: 'db2', 50221: 'db2', 50222: 'db2', 50223: 'db2',
+                50224: 'db2', 50225: 'db2', 50226: 'db2', 50227: 'db2', 50228: 'db2',
+                50229: 'db2', 50230: 'db2', 50231: 'db2', 50232: 'db2', 50233: 'db2',
+                50234: 'db2', 50235: 'db2', 50236: 'db2', 50237: 'db2', 50238: 'db2',
+                50239: 'db2', 50240: 'db2', 50241: 'db2', 50242: 'db2', 50243: 'db2',
+                50244: 'db2', 50245: 'db2', 50246: 'db2', 50247: 'db2', 50248: 'db2',
+                50249: 'db2', 50250: 'db2', 50251: 'db2', 50252: 'db2', 50253: 'db2',
+                50254: 'db2', 50255: 'db2', 50256: 'db2', 50257: 'db2', 50258: 'db2',
+                50259: 'db2', 50260: 'db2', 50261: 'db2', 50262: 'db2', 50263: 'db2',
+                50264: 'db2', 50265: 'db2', 50266: 'db2', 50267: 'db2', 50268: 'db2',
+                50269: 'db2', 50270: 'db2', 50271: 'db2', 50272: 'db2', 50273: 'db2',
+                50274: 'db2', 50275: 'db2', 50276: 'db2', 50277: 'db2', 50278: 'db2',
+                
+                # SCTP services
+                384: 'sctp-radius', 386: 'sctp-radius', 387: 'sctp-radius',
+                388: 'sctp-radius', 389: 'sctp-ldap', 636: 'sctp-ldaps',
+                2049: 'sctp-nfs', 3868: 'sctp-rsvp', 3869: 'sctp-rsvp',
+                3870: 'sctp-rsvp', 3784: 'sctp-bfd', 3785: 'sctp-bfd',
+                4784: 'sctp-bfd', 4785: 'sctp-bfd', 5900: 'sctp-vnc',
+                7000: 'sctp-cassandra', 7001: 'sctp-weblogic', 8080: 'sctp-http',
+                9200: 'sctp-elasticsearch', 27017: 'sctp-mongodb',
+                50279: 'db2', 50280: 'db2', 50281: 'db2', 50282: 'db2', 50283: 'db2',
+                50284: 'db2', 50285: 'db2', 50286: 'db2', 50287: 'db2', 50288: 'db2',
+                50289: 'db2', 50290: 'db2', 50291: 'db2', 50292: 'db2', 50293: 'db2',
+                50294: 'db2', 50295: 'db2', 50296: 'db2', 50297: 'db2', 50298: 'db2',
+                50299: 'db2', 50300: 'db2', 50301: 'db2', 50302: 'db2', 50303: 'db2',
+                50304: 'db2', 50305: 'db2', 50306: 'db2', 50307: 'db2', 50308: 'db2',
+                50309: 'db2', 50310: 'db2', 50311: 'db2', 50312: 'db2', 50313: 'db2',
+                50314: 'db2', 50315: 'db2', 50316: 'db2', 50317: 'db2', 50318: 'db2',
+                50319: 'db2', 50320: 'db2', 50321: 'db2', 50322: 'db2', 50323: 'db2',
+                50324: 'db2', 50325: 'db2', 50326: 'db2', 50327: 'db2', 50328: 'db2',
+                50329: 'db2', 50330: 'db2', 50331: 'db2', 50332: 'db2', 50333: 'db2',
+                50334: 'db2', 50335: 'db2', 50336: 'db2', 50337: 'db2', 50338: 'db2',
+                50339: 'db2', 50340: 'db2', 50341: 'db2', 50342: 'db2', 50343: 'db2',
+                50344: 'db2', 50345: 'db2', 50346: 'db2', 50347: 'db2', 50348: 'db2',
+                50349: 'db2', 50350: 'db2', 50351: 'db2', 50352: 'db2', 50353: 'db2',
+                50354: 'db2', 50355: 'db2', 50356: 'db2', 50357: 'db2', 50358: 'db2',
+                50359: 'db2', 50360: 'db2', 50361: 'db2', 50362: 'db2', 50363: 'db2',
+                50364: 'db2', 50365: 'db2', 50366: 'db2', 50367: 'db2', 50368: 'db2',
+                50369: 'db2', 50370: 'db2', 50371: 'db2', 50372: 'db2', 50373: 'db2',
+                50374: 'db2', 50375: 'db2', 50376: 'db2', 50377: 'db2', 50378: 'db2',
+                50379: 'db2', 50380: 'db2', 50381: 'db2', 50382: 'db2', 50383: 'db2',
+                50384: 'db2', 50385: 'db2', 50386: 'db2', 50387: 'db2', 50388: 'db2',
+                50389: 'db2', 50390: 'db2', 50391: 'db2', 50392: 'db2', 50393: 'db2',
+                50394: 'db2', 50395: 'db2', 50396: 'db2', 50397: 'db2', 50398: 'db2',
+                50399: 'db2', 50400: 'db2', 50401: 'db2', 50402: 'db2', 50403: 'db2',
+                50404: 'db2', 50405: 'db2', 50406: 'db2', 50407: 'db2', 50408: 'db2',
+                50409: 'db2', 50410: 'db2', 50411: 'db2', 50412: 'db2', 50413: 'db2',
+                50414: 'db2', 50415: 'db2', 50416: 'db2', 50417: 'db2', 50418: 'db2',
+                50419: 'db2', 50420: 'db2', 50421: 'db2', 50422: 'db2', 50423: 'db2',
+                50424: 'db2', 50425: 'db2', 50426: 'db2', 50427: 'db2', 50428: 'db2',
+                50429: 'db2', 50430: 'db2', 50431: 'db2', 50432: 'db2', 50433: 'db2',
+                50434: 'db2', 50435: 'db2', 50436: 'db2', 50437: 'db2', 50438: 'db2',
+                50439: 'db2', 50440: 'db2', 50441: 'db2', 50442: 'db2', 50443: 'db2',
+                50444: 'db2', 50445: 'db2', 50446: 'db2', 50447: 'db2', 50448: 'db2',
+                50449: 'db2', 50450: 'db2', 50451: 'db2', 50452: 'db2', 50453: 'db2',
+                50454: 'db2', 50455: 'db2', 50456: 'db2', 50457: 'db2', 50458: 'db2',
+                50459: 'db2', 50460: 'db2', 50461: 'db2', 50462: 'db2', 50463: 'db2',
+                50464: 'db2', 50465: 'db2', 50466: 'db2', 50467: 'db2', 50468: 'db2',
+                50469: 'db2', 50470: 'db2', 50471: 'db2', 50472: 'db2', 50473: 'db2',
+                50474: 'db2', 50475: 'db2', 50476: 'db2', 50477: 'db2', 50478: 'db2',
+                50479: 'db2', 50480: 'db2', 50481: 'db2', 50482: 'db2', 50483: 'db2',
+                50484: 'db2', 50485: 'db2', 50486: 'db2', 50487: 'db2', 50488: 'db2',
+                50489: 'db2', 50490: 'db2', 50491: 'db2', 50492: 'db2', 50493: 'db2',
+                50494: 'db2', 50495: 'db2', 50496: 'db2', 50497: 'db2', 50498: 'db2',
+                50499: 'db2', 50500: 'db2', 50501: 'db2', 50502: 'db2', 50503: 'db2',
+                50504: 'db2', 50505: 'db2', 50506: 'db2', 50507: 'db2', 50508: 'db2',
+                50509: 'db2', 50510: 'db2', 50511: 'db2', 50512: 'db2', 50513: 'db2',
+                50514: 'db2', 50515: 'db2', 50516: 'db2', 50517: 'db2', 50518: 'db2',
+                50519: 'db2', 50520: 'db2', 50521: 'db2', 50522: 'db2', 50523: 'db2',
+                50524: 'db2', 50525: 'db2', 50526: 'db2', 50527: 'db2', 50528: 'db2',
+                50529: 'db2', 50530: 'db2', 50531: 'db2', 50532: 'db2', 50533: 'db2',
+                50534: 'db2', 50535: 'db2', 50536: 'db2', 50537: 'db2', 50538: 'db2',
+                50539: 'db2', 50540: 'db2', 50541: 'db2', 50542: 'db2', 50543: 'db2',
+                50544: 'db2', 50545: 'db2', 50546: 'db2', 50547: 'db2', 50548: 'db2',
+                50549: 'db2', 50550: 'db2', 50551: 'db2', 50552: 'db2', 50553: 'db2',
+                50554: 'db2', 50555: 'db2', 50556: 'db2', 50557: 'db2', 50558: 'db2',
+                50559: 'db2', 50560: 'db2', 50561: 'db2', 50562: 'db2', 50563: 'db2',
+                50564: 'db2', 50565: 'db2', 50566: 'db2', 50567: 'db2', 50568: 'db2',
+                50569: 'db2', 50570: 'db2', 50571: 'db2', 50572: 'db2', 50573: 'db2',
+                50574: 'db2', 50575: 'db2', 50576: 'db2', 50577: 'db2', 50578: 'db2',
+                50579: 'db2', 50580: 'db2', 50581: 'db2', 50582: 'db2', 50583: 'db2',
+                50584: 'db2', 50585: 'db2', 50586: 'db2', 50587: 'db2', 50588: 'db2',
+                50589: 'db2', 50590: 'db2', 50591: 'db2', 50592: 'db2', 50593: 'db2',
+                50594: 'db2', 50595: 'db2', 50596: 'db2', 50597: 'db2', 50598: 'db2',
+                50599: 'db2', 50600: 'db2', 50601: 'db2', 50602: 'db2', 50603: 'db2',
+                50604: 'db2', 50605: 'db2', 50606: 'db2', 50607: 'db2', 50608: 'db2',
+                50609: 'db2', 50610: 'db2', 50611: 'db2', 50612: 'db2', 50613: 'db2',
+                50614: 'db2', 50615: 'db2', 50616: 'db2', 50617: 'db2', 50618: 'db2',
+                50619: 'db2', 50620: 'db2', 50621: 'db2', 50622: 'db2', 50623: 'db2',
+                50624: 'db2', 50625: 'db2', 50626: 'db2', 50627: 'db2', 50628: 'db2',
+                50629: 'db2', 50630: 'db2', 50631: 'db2', 50632: 'db2', 50633: 'db2',
+                50634: 'db2', 50635: 'db2', 50636: 'db2', 50637: 'db2', 50638: 'db2',
+                50639: 'db2', 50640: 'db2', 50641: 'db2', 50642: 'db2', 50643: 'db2',
+                50644: 'db2', 50645: 'db2', 50646: 'db2', 50647: 'db2', 50648: 'db2',
+                50649: 'db2', 50650: 'db2', 50651: 'db2', 50652: 'db2', 50653: 'db2',
+                50654: 'db2', 50655: 'db2', 50656: 'db2', 50657: 'db2', 50658: 'db2',
+                50659: 'db2', 50660: 'db2', 50661: 'db2', 50662: 'db2', 50663: 'db2',
+                50664: 'db2', 50665: 'db2', 50666: 'db2', 50667: 'db2', 50668: 'db2',
+                50669: 'db2', 50670: 'db2', 50671: 'db2', 50672: 'db2', 50673: 'db2',
+                50674: 'db2', 50675: 'db2', 50676: 'db2', 50677: 'db2', 50678: 'db2',
+                50679: 'db2', 50680: 'db2', 50681: 'db2', 50682: 'db2', 50683: 'db2',
+                50684: 'db2', 50685: 'db2', 50686: 'db2', 50687: 'db2', 50688: 'db2',
+                50689: 'db2', 50690: 'db2', 50691: 'db2', 50692: 'db2', 50693: 'db2',
+                50694: 'db2', 50695: 'db2', 50696: 'db2', 50697: 'db2', 50698: 'db2',
+                50699: 'db2', 50700: 'db2', 50701: 'db2', 50702: 'db2', 50703: 'db2',
+                50704: 'db2', 50705: 'db2', 50706: 'db2', 50707: 'db2', 50708: 'db2',
+                50709: 'db2', 50710: 'db2', 50711: 'db2', 50712: 'db2', 50713: 'db2',
+                50714: 'db2', 50715: 'db2', 50716: 'db2', 50717: 'db2', 50718: 'db2',
+                50719: 'db2', 50720: 'db2', 50721: 'db2', 50722: 'db2', 50723: 'db2',
+                50724: 'db2', 50725: 'db2', 50726: 'db2', 50727: 'db2', 50728: 'db2',
+                50729: 'db2', 50730: 'db2', 50731: 'db2', 50732: 'db2', 50733: 'db2',
+                50734: 'db2', 50735: 'db2', 50736: 'db2', 50737: 'db2', 50738: 'db2',
+                50739: 'db2', 50740: 'db2', 50741: 'db2', 50742: 'db2', 50743: 'db2',
+                50744: 'db2', 50745: 'db2', 50746: 'db2', 50747: 'db2', 50748: 'db2',
+                50749: 'db2', 50750: 'db2', 50751: 'db2', 50752: 'db2', 50753: 'db2',
+                50754: 'db2', 50755: 'db2', 50756: 'db2', 50757: 'db2', 50758: 'db2',
+                50759: 'db2', 50760: 'db2', 50761: 'db2', 50762: 'db2', 50763: 'db2',
+                50764: 'db2', 50765: 'db2', 50766: 'db2', 50767: 'db2', 50768: 'db2',
+                50769: 'db2', 50770: 'db2', 50771: 'db2', 50772: 'db2', 50773: 'db2',
+                50774: 'db2', 50775: 'db2', 50776: 'db2', 50777: 'db2', 50778: 'db2',
+                50779: 'db2', 50780: 'db2', 50781: 'db2', 50782: 'db2', 50783: 'db2',
+                50784: 'db2', 50785: 'db2', 50786: 'db2', 50787: 'db2', 50788: 'db2',
+                50789: 'db2', 50790: 'db2', 50791: 'db2', 50792: 'db2', 50793: 'db2',
+                50794: 'db2', 50795: 'db2', 50796: 'db2', 50797: 'db2', 50798: 'db2',
+                50799: 'db2', 50800: 'db2', 50801: 'db2', 50802: 'db2', 50803: 'db2',
+                50804: 'db2', 50805: 'db2', 50806: 'db2', 50807: 'db2', 50808: 'db2',
+                50809: 'db2', 50810: 'db2', 50811: 'db2', 50812: 'db2', 50813: 'db2',
+                50814: 'db2', 50815: 'db2', 50816: 'db2', 50817: 'db2', 50818: 'db2',
+                50819: 'db2', 50820: 'db2', 50821: 'db2', 50822: 'db2', 50823: 'db2',
+                50824: 'db2', 50825: 'db2', 50826: 'db2', 50827: 'db2', 50828: 'db2',
+                50829: 'db2', 50830: 'db2', 50831: 'db2', 50832: 'db2', 50833: 'db2',
+                50834: 'db2', 50835: 'db2', 50836: 'db2', 50837: 'db2', 50838: 'db2',
+                50839: 'db2', 50840: 'db2', 50841: 'db2', 50842: 'db2', 50843: 'db2',
+                50844: 'db2', 50845: 'db2', 50846: 'db2', 50847: 'db2', 50848: 'db2',
+                50849: 'db2', 50850: 'db2', 50851: 'db2', 50852: 'db2', 50853: 'db2',
+                50854: 'db2', 50855: 'db2', 50856: 'db2', 50857: 'db2', 50858: 'db2',
+                50859: 'db2', 50860: 'db2', 50861: 'db2', 50862: 'db2', 50863: 'db2',
+                50864: 'db2', 50865: 'db2', 50866: 'db2', 50867: 'db2', 50868: 'db2',
+                50869: 'db2', 50870: 'db2', 50871: 'db2', 50872: 'db2', 50873: 'db2',
+                50874: 'db2', 50875: 'db2', 50876: 'db2', 50877: 'db2', 50878: 'db2',
+                50879: 'db2', 50880: 'db2', 50881: 'db2', 50882: 'db2', 50883: 'db2',
+                50884: 'db2', 50885: 'db2', 50886: 'db2', 50887: 'db2', 50888: 'db2',
+                50889: 'db2', 50890: 'db2', 50891: 'db2', 50892: 'db2', 50893: 'db2',
+                50894: 'db2', 50895: 'db2', 50896: 'db2', 50897: 'db2', 50898: 'db2',
+                50899: 'db2', 50900: 'db2', 50901: 'db2', 50902: 'db2', 50903: 'db2',
+                50904: 'db2', 50905: 'db2', 50906: 'db2', 50907: 'db2', 50908: 'db2',
+                50909: 'db2', 50910: 'db2', 50911: 'db2', 50912: 'db2', 50913: 'db2',
+                50914: 'db2', 50915: 'db2', 50916: 'db2', 50917: 'db2', 50918: 'db2',
+                50919: 'db2', 50920: 'db2', 50921: 'db2', 50922: 'db2', 50923: 'db2',
+                50924: 'db2', 50925: 'db2', 50926: 'db2', 50927: 'db2', 50928: 'db2',
+                50929: 'db2', 50930: 'db2', 50931: 'db2', 50932: 'db2', 50933: 'db2',
+                50934: 'db2', 50935: 'db2', 50936: 'db2', 50937: 'db2', 50938: 'db2',
+                50939: 'db2', 50940: 'db2', 50941: 'db2', 50942: 'db2', 50943: 'db2',
+                50944: 'db2', 50945: 'db2', 50946: 'db2', 50947: 'db2', 50948: 'db2',
+                50949: 'db2', 50950: 'db2', 50951: 'db2', 50952: 'db2', 50953: 'db2',
+                50954: 'db2', 50955: 'db2', 50956: 'db2', 50957: 'db2', 50958: 'db2',
+                50959: 'db2', 50960: 'db2', 50961: 'db2', 50962: 'db2', 50963: 'db2',
+                50964: 'db2', 50965: 'db2', 50966: 'db2', 50967: 'db2', 50968: 'db2',
+                50969: 'db2', 50970: 'db2', 50971: 'db2', 50972: 'db2', 50973: 'db2',
+                50974: 'db2', 50975: 'db2', 50976: 'db2', 50977: 'db2', 50978: 'db2',
+                50979: 'db2', 50980: 'db2', 50981: 'db2', 50982: 'db2', 50983: 'db2',
+                50984: 'db2', 50985: 'db2', 50986: 'db2', 50987: 'db2', 50988: 'db2',
+                50989: 'db2', 50990: 'db2', 50991: 'db2', 50992: 'db2', 50993: 'db2',
+                50994: 'db2', 50995: 'db2', 50996: 'db2', 50997: 'db2', 50998: 'db2',
+                50999: 'db2', 51000: 'db2', 51001: 'db2', 51002: 'db2', 51003: 'db2',
+                51004: 'db2', 51005: 'db2', 51006: 'db2', 51007: 'db2', 51008: 'db2',
+                51009: 'db2', 51010: 'db2', 51011: 'db2', 51012: 'db2', 51013: 'db2',
+                51014: 'db2', 51015: 'db2', 51016: 'db2', 51017: 'db2', 51018: 'db2',
+                51019: 'db2', 51020: 'db2', 51021: 'db2', 51022: 'db2', 51023: 'db2',
+                51024: 'db2', 51025: 'db2', 51026: 'db2', 51027: 'db2', 51028: 'db2',
+                51029: 'db2', 51030: 'db2', 51031: 'db2', 51032: 'db2', 51033: 'db2',
+                51034: 'db2', 51035: 'db2', 51036: 'db2', 51037: 'db2', 51038: 'db2',
+                51039: 'db2', 51040: 'db2', 51041: 'db2', 51042: 'db2', 51043: 'db2',
+                51044: 'db2', 51045: 'db2', 51046: 'db2', 51047: 'db2', 51048: 'db2',
+                51049: 'db2', 51050: 'db2', 51051: 'db2', 51052: 'db2', 51053: 'db2',
+                51054: 'db2', 51055: 'db2', 51056: 'db2', 51057: 'db2', 51058: 'db2',
+                51059: 'db2', 51060: 'db2', 51061: 'db2', 51062: 'db2', 51063: 'db2',
+                51064: 'db2', 51065: 'db2', 51066: 'db2', 51067: 'db2', 51068: 'db2',
+                51069: 'db2', 51070: 'db2', 51071: 'db2', 51072: 'db2', 51073: 'db2',
+                51074: 'db2', 51075: 'db2', 51076: 'db2', 51077: 'db2', 51078: 'db2',
+                51079: 'db2', 51080: 'db2', 51081: 'db2', 51082: 'db2', 51083: 'db2',
+                51084: 'db2', 51085: 'db2', 51086: 'db2', 51087: 'db2', 51088: 'db2',
+                51089: 'db2', 51090: 'db2', 51091: 'db2', 51092: 'db2', 51093: 'db2',
+                51094: 'db2', 51095: 'db2', 51096: 'db2', 51097: 'db2', 51098: 'db2',
+                51099: 'db2', 51100: 'db2', 51101: 'db2', 51102: 'db2', 51103: 'db2',
+                51104: 'db2', 51105: 'db2', 51106: 'db2', 51107: 'db2', 51108: 'db2',
+                51109: 'db2', 51110: 'db2', 51111: 'db2', 51112: 'db2', 51113: 'db2',
+                51114: 'db2', 51115: 'db2', 51116: 'db2', 51117: 'db2', 51118: 'db2',
+                51119: 'db2', 51120: 'db2', 51121: 'db2', 51122: 'db2', 51123: 'db2',
+                51124: 'db2', 51125: 'db2', 51126: 'db2', 51127: 'db2', 51128: 'db2',
+                51129: 'db2', 51130: 'db2', 51131: 'db2', 51132: 'db2', 51133: 'db2',
+                51134: 'db2', 51135: 'db2', 51136: 'db2', 51137: 'db2', 51138: 'db2',
+                51139: 'db2', 51140: 'db2', 51141: 'db2', 51142: 'db2', 51143: 'db2',
+                51144: 'db2', 51145: 'db2', 51146: 'db2', 51147: 'db2', 51148: 'db2',
+                51149: 'db2', 51150: 'db2', 51151: 'db2', 51152: 'db2', 51153: 'db2',
+                51154: 'db2', 51155: 'db2', 51156: 'db2', 51157: 'db2', 51158: 'db2',
+                51159: 'db2', 51160: 'db2', 51161: 'db2', 51162: 'db2', 51163: 'db2',
+                51164: 'db2', 51165: 'db2', 51166: 'db2', 51167: 'db2', 51168: 'db2',
+                51169: 'db2', 51170: 'db2', 51171: 'db2', 51172: 'db2', 51173: 'db2',
+                51174: 'db2', 51175: 'db2', 51176: 'db2', 51177: 'db2', 51178: 'db2',
+                51179: 'db2', 51180: 'db2', 51181: 'db2', 51182: 'db2', 51183: 'db2',
+                51184: 'db2', 51185: 'db2', 51186: 'db2', 51187: 'db2', 51188: 'db2',
+                51189: 'db2', 51190: 'db2', 51191: 'db2', 51192: 'db2', 51193: 'db2',
+                51194: 'db2', 51195: 'db2', 51196: 'db2', 51197: 'db2', 51198: 'db2',
+                51199: 'db2', 51200: 'db2', 51201: 'db2', 51202: 'db2', 51203: 'db2',
+                51204: 'db2', 51205: 'db2', 51206: 'db2', 51207: 'db2', 51208: 'db2',
+                51209: 'db2', 51210: 'db2', 51211: 'db2', 51212: 'db2', 51213: 'db2',
+                51214: 'db2', 51215: 'db2', 51216: 'db2', 51217: 'db2', 51218: 'db2',
+                51219: 'db2', 51220: 'db2', 51221: 'db2', 51222: 'db2', 51223: 'db2',
+                51224: 'db2', 51225: 'db2', 51226: 'db2', 51227: 'db2', 51228: 'db2',
+                51229: 'db2', 51230: 'db2', 51231: 'db2', 51232: 'db2', 51233: 'db2',
+                51234: 'db2', 51235: 'db2', 51236: 'db2', 51237: 'db2', 51238: 'db2',
+                51239: 'db2', 51240: 'db2', 51241: 'db2', 51242: 'db2', 51243: 'db2',
+                51244: 'db2', 51245: 'db2', 51246: 'db2', 51247: 'db2', 51248: 'db2',
+                51249: 'db2', 51250: 'db2', 51251: 'db2', 51252: 'db2', 51253: 'db2',
+                51254: 'db2', 51255: 'db2', 51256: 'db2', 51257: 'db2', 51258: 'db2',
+                51259: 'db2', 51260: 'db2', 51261: 'db2', 51262: 'db2', 51263: 'db2',
+                51264: 'db2', 51265: 'db2', 51266: 'db2', 51267: 'db2', 51268: 'db2',
+                51269: 'db2', 51270: 'db2', 51271: 'db2', 51272: 'db2', 51273: 'db2',
+                51274: 'db2', 51275: 'db2', 51276: 'db2', 51277: 'db2', 51278: 'db2',
+                51279: 'db2', 51280: 'db2', 51281: 'db2', 51282: 'db2', 51283: 'db2',
+                51284: 'db2', 51285: 'db2', 51286: 'db2', 51287: 'db2', 51288: 'db2',
+                51289: 'db2', 51290: 'db2', 51291: 'db2', 51292: 'db2', 51293: 'db2',
+                51294: 'db2', 51295: 'db2', 51296: 'db2', 51297: 'db2', 51298: 'db2',
+                51299: 'db2', 51300: 'db2', 51301: 'db2', 51302: 'db2', 51303: 'db2',
+                51304: 'db2', 51305: 'db2', 51306: 'db2', 51307: 'db2', 51308: 'db2',
+                51309: 'db2', 51310: 'db2', 51311: 'db2', 51312: 'db2', 51313: 'db2',
+                51314: 'db2', 51315: 'db2', 51316: 'db2', 51317: 'db2', 51318: 'db2',
+                51319: 'db2', 51320: 'db2', 51321: 'db2', 51322: 'db2', 51323: 'db2',
+                51324: 'db2', 51325: 'db2', 51326: 'db2', 51327: 'db2', 51328: 'db2',
+                51329: 'db2', 51330: 'db2', 51331: 'db2', 51332: 'db2', 51333: 'db2',
+                51334: 'db2', 51335: 'db2', 51336: 'db2', 51337: 'db2', 51338: 'db2',
+                51339: 'db2', 51340: 'db2', 51341: 'db2', 51342: 'db2', 51343: 'db2',
+                51344: 'db2', 51345: 'db2', 51346: 'db2', 51347: 'db2', 51348: 'db2',
+                51349: 'db2', 51350: 'db2', 51351: 'db2', 51352: 'db2', 51353: 'db2',
+                51354: 'db2', 51355: 'db2', 51356: 'db2', 51357: 'db2', 51358: 'db2',
+                51359: 'db2', 51360: 'db2', 51361: 'db2', 51362: 'db2', 51363: 'db2',
+                51364: 'db2', 51365: 'db2', 51366: 'db2', 51367: 'db2', 51368: 'db2',
+                51369: 'db2', 51370: 'db2', 51371: 'db2', 51372: 'db2', 51373: 'db2',
+                51374: 'db2', 51375: 'db2', 51376: 'db2', 51377: 'db2', 51378: 'db2',
+                51379: 'db2', 51380: 'db2', 51381: 'db2', 51382: 'db2', 51383: 'db2',
+                51384: 'db2', 51385: 'db2', 51386: 'db2', 51387: 'db2', 51388: 'db2',
+                51389: 'db2', 51390: 'db2', 51391: 'db2', 51392: 'db2', 51393: 'db2',
+                51394: 'db2', 51395: 'db2', 51396: 'db2', 51397: 'db2', 51398: 'db2',
+                51399: 'db2', 51400: 'db2', 51401: 'db2', 51402: 'db2', 51403: 'db2',
+                51404: 'db2', 51405: 'db2', 51406: 'db2', 51407: 'db2', 51408: 'db2',
+                51409: 'db2', 51410: 'db2', 51411: 'db2', 51412: 'db2', 51413: 'db2',
+                51414: 'db2', 51415: 'db2', 51416: 'db2', 51417: 'db2', 51418: 'db2',
+                51419: 'db2', 51420: 'db2', 51421: 'db2', 51422: 'db2', 51423: 'db2',
+                51424: 'db2', 51425: 'db2', 51426: 'db2', 51427: 'db2', 51428: 'db2',
+                51429: 'db2', 51430: 'db2', 51431: 'db2', 51432: 'db2', 51433: 'db2',
+                51434: 'db2', 51435: 'db2', 51436: 'db2', 51437: 'db2', 51438: 'db2',
+                51439: 'db2', 51440: 'db2', 51441: 'db2', 51442: 'db2', 51443: 'db2',
+                51444: 'db2', 51445: 'db2', 51446: 'db2', 51447: 'db2', 51448: 'db2',
+                51449: 'db2', 51450: 'db2', 51451: 'db2', 51452: 'db2', 51453: 'db2',
+                51454: 'db2', 51455: 'db2', 51456: 'db2', 51457: 'db2', 51458: 'db2',
+                51459: 'db2', 51460: 'db2', 51461: 'db2', 51462: 'db2', 51463: 'db2',
+                51464: 'db2', 51465: 'db2', 51466: 'db2', 51467: 'db2', 51468: 'db2',
+                51469: 'db2', 51470: 'db2', 51471: 'db2', 51472: 'db2', 51473: 'db2',
+                51474: 'db2', 51475: 'db2', 51476: 'db2', 51477: 'db2', 51478: 'db2',
+                51479: 'db2', 51480: 'db2', 51481: 'db2', 51482: 'db2', 51483: 'db2',
+                51484: 'db2', 51485: 'db2', 51486: 'db2', 51487: 'db2', 51488: 'db2',
+                51489: 'db2', 51490: 'db2', 51491: 'db2', 51492: 'db2', 51493: 'db2',
+                51494: 'db2', 51495: 'db2', 51496: 'db2', 51497: 'db2', 51498: 'db2',
+                51499: 'db2', 51500: 'db2', 51501: 'db2', 51502: 'db2', 51503: 'db2',
+                51504: 'db2', 51505: 'db2', 51506: 'db2', 51507: 'db2', 51508: 'db2',
+                51509: 'db2', 51510: 'db2', 51511: 'db2', 51512: 'db2', 51513: 'db2',
+                51514: 'db2', 51515: 'db2', 51516: 'db2', 51517: 'db2', 51518: 'db2',
+                51519: 'db2', 51520: 'db2', 51521: 'db2', 51522: 'db2', 51523: 'db2',
+                51524: 'db2', 51525: 'db2', 51526: 'db2', 51527: 'db2', 51528: 'db2',
+                51529: 'db2', 51530: 'db2', 51531: 'db2', 51532: 'db2', 51533: 'db2',
+                51534: 'db2', 51535: 'db2', 51536: 'db2', 51537: 'db2', 51538: 'db2',
+                51539: 'db2', 51540: 'db2', 51541: 'db2', 51542: 'db2', 51543: 'db2',
+                51544: 'db2', 51545: 'db2', 51546: 'db2', 51547: 'db2', 51548: 'db2',
+                51549: 'db2', 51550: 'db2', 51551: 'db2', 51552: 'db2', 51553: 'db2',
+                51554: 'db2', 51555: 'db2', 51556: 'db2', 51557: 'db2', 51558: 'db2',
+                51559: 'db2', 51560: 'db2', 51561: 'db2', 51562: 'db2', 51563: 'db2',
+                51564: 'db2', 51565: 'db2', 51566: 'db2', 51567: 'db2', 51568: 'db2',
+                51569: 'db2', 51570: 'db2', 51571: 'db2', 51572: 'db2', 51573: 'db2',
+                51574: 'db2', 51575: 'db2', 51576: 'db2', 51577: 'db2', 51578: 'db2',
+                51579: 'db2', 51580: 'db2', 51581: 'db2', 51582: 'db2', 51583: 'db2',
+                51584: 'db2', 51585: 'db2', 51586: 'db2', 51587: 'db2', 51588: 'db2',
+                51589: 'db2', 51590: 'db2', 51591: 'db2', 51592: 'db2', 51593: 'db2',
+                51594: 'db2', 51595: 'db2', 51596: 'db2', 51597: 'db2', 51598: 'db2',
+                51599: 'db2', 51600: 'db2', 51601: 'db2', 51602: 'db2', 51603: 'db2',
+                51604: 'db2', 51605: 'db2', 51606: 'db2', 51607: 'db2', 51608: 'db2',
+                51609: 'db2', 51610: 'db2', 51611: 'db2', 51612: 'db2', 51613: 'db2',
+                51614: 'db2', 51615: 'db2', 51616: 'db2', 51617: 'db2', 51618: 'db2',
+                51619: 'db2', 51620: 'db2', 51621: 'db2', 51622: 'db2', 51623: 'db2',
+                51624: 'db2', 51625: 'db2', 51626: 'db2', 51627: 'db2', 51628: 'db2',
+                51629: 'db2', 51630: 'db2', 51631: 'db2', 51632: 'db2', 51633: 'db2',
+                51634: 'db2', 51635: 'db2', 51636: 'db2', 51637: 'db2', 51638: 'db2',
+                51639: 'db2', 51640: 'db2', 51641: 'db2', 51642: 'db2', 51643: 'db2',
+                51644: 'db2', 51645: 'db2', 51646: 'db2', 51647: 'db2', 51648: 'db2',
+                51649: 'db2', 51650: 'db2', 51651: 'db2', 51652: 'db2', 51653: 'db2',
+                51654: 'db2', 51655: 'db2', 51656: 'db2', 51657: 'db2', 51658: 'db2',
+                51659: 'db2', 51660: 'db2', 51661: 'db2', 51662: 'db2', 51663: 'db2',
+                51664: 'db2', 51665: 'db2', 51666: 'db2', 51667: 'db2', 51668: 'db2',
+                51669: 'db2', 51670: 'db2', 51671: 'db2', 51672: 'db2', 51673: 'db2',
+                51674: 'db2', 51675: 'db2', 51676: 'db2', 51677: 'db2', 51678: 'db2',
+                51679: 'db2', 51680: 'db2', 51681: 'db2', 51682: 'db2', 51683: 'db2',
+                51684: 'db2', 51685: 'db2', 51686: 'db2', 51687: 'db2', 51688: 'db2',
+                51689: 'db2', 51690: 'db2', 51691: 'db2', 51692: 'db2', 51693: 'db2',
+                51694: 'db2', 51695: 'db2', 51696: 'db2', 51697: 'db2', 51698: 'db2',
+                51699: 'db2', 51700: 'db2', 51701: 'db2', 51702: 'db2', 51703: 'db2',
+                51704: 'db2', 51705: 'db2', 51706: 'db2', 51707: 'db2', 51708: 'db2',
+                51709: 'db2', 51710: 'db2', 51711: 'db2', 51712: 'db2', 51713: 'db2',
+                51714: 'db2', 51715: 'db2', 51716: 'db2', 51717: 'db2', 51718: 'db2',
+                51719: 'db2', 51720: 'db2', 51721: 'db2', 51722: 'db2', 51723: 'db2',
+                51724: 'db2', 51725: 'db2', 51726: 'db2', 51727: 'db2', 51728: 'db2',
+                51729: 'db2', 51730: 'db2', 51731: 'db2', 51732: 'db2', 51733: 'db2',
+                51734: 'db2', 51735: 'db2', 51736: 'db2', 51737: 'db2', 51738: 'db2',
+                51739: 'db2', 51740: 'db2', 51741: 'db2', 51742: 'db2', 51743: 'db2',
+                51744: 'db2', 51745: 'db2', 51746: 'db2', 51747: 'db2', 51748: 'db2',
+                51749: 'db2', 51750: 'db2', 51751: 'db2', 51752: 'db2', 51753: 'db2',
+                51754: 'db2', 51755: 'db2', 51756: 'db2', 51757: 'db2', 51758: 'db2',
+                51759: 'db2', 51760: 'db2', 51761: 'db2', 51762: 'db2', 51763: 'db2',
+                51764: 'db2', 51765: 'db2', 51766: 'db2', 51767: 'db2', 51768: 'db2',
+                51769: 'db2', 51770: 'db2', 51771: 'db2', 51772: 'db2', 51773: 'db2',
+                51774: 'db2', 51775: 'db2', 51776: 'db2', 51777: 'db2', 51778: 'db2',
+                51779: 'db2', 51780: 'db2', 51781: 'db2', 51782: 'db2', 51783: 'db2',
+                51784: 'db2', 51785: 'db2', 51786: 'db2', 51787: 'db2', 51788: 'db2',
+                51789: 'db2', 51790: 'db2', 51791: 'db2', 51792: 'db2', 51793: 'db2',
+                51794: 'db2', 51795: 'db2', 51796: 'db2', 51797: 'db2', 51798: 'db2',
+                51799: 'db2', 51800: 'db2', 51801: 'db2', 51802: 'db2', 51803: 'db2',
+                51804: 'db2', 51805: 'db2', 51806: 'db2', 51807: 'db2', 51808: 'db2',
+                51809: 'db2', 51810: 'db2', 51811: 'db2', 51812: 'db2', 51813: 'db2',
+                51814: 'db2', 51815: 'db2', 51816: 'db2', 51817: 'db2', 51818: 'db2',
+                51819: 'db2', 51820: 'db2', 51821: 'db2', 51822: 'db2', 51823: 'db2',
+                51824: 'db2', 51825: 'db2', 51826: 'db2', 51827: 'db2', 51828: 'db2',
+                51829: 'db2', 51830: 'db2', 51831: 'db2', 51832: 'db2', 51833: 'db2',
+                51834: 'db2', 51835: 'db2', 51836: 'db2', 51837: 'db2', 51838: 'db2',
+                51839: 'db2', 51840: 'db2', 51841: 'db2', 51842: 'db2', 51843: 'db2',
+                51844: 'db2', 51845: 'db2', 51846: 'db2', 51847: 'db2', 51848: 'db2',
+                51849: 'db2', 51850: 'db2', 51851: 'db2', 51852: 'db2', 51853: 'db2',
+                51854: 'db2', 51855: 'db2', 51856: 'db2', 51857: 'db2', 51858: 'db2',
+                51859: 'db2', 51860: 'db2', 51861: 'db2', 51862: 'db2', 51863: 'db2',
+                51864: 'db2', 51865: 'db2', 51866: 'db2', 51867: 'db2', 51868: 'db2',
+                51869: 'db2', 51870: 'db2', 51871: 'db2', 51872: 'db2', 51873: 'db2',
+                51874: 'db2', 51875: 'db2', 51876: 'db2', 51877: 'db2', 51878: 'db2',
+                51879: 'db2', 51880: 'db2', 51881: 'db2', 51882: 'db2', 51883: 'db2',
+                51884: 'db2', 51885: 'db2', 51886: 'db2', 51887: 'db2', 51888: 'db2',
+                51889: 'db2', 51890: 'db2', 51891: 'db2', 51892: 'db2', 51893: 'db2',
+                51894: 'db2', 51895: 'db2', 51896: 'db2', 51897: 'db2', 51898: 'db2',
+                51899: 'db2', 51900: 'db2', 51901: 'db2', 51902: 'db2', 51903: 'db2',
+                51904: 'db2', 51905: 'db2', 51906: 'db2', 51907: 'db2', 51908: 'db2',
+                51909: 'db2', 51910: 'db2', 51911: 'db2', 51912: 'db2', 51913: 'db2',
+                51914: 'db2', 51915: 'db2', 51916: 'db2', 51917: 'db2', 51918: 'db2',
+                51919: 'db2', 51920: 'db2', 51921: 'db2', 51922: 'db2', 51923: 'db2',
+                51924: 'db2', 51925: 'db2', 51926: 'db2', 51927: 'db2', 51928: 'db2',
+                51929: 'db2', 51930: 'db2', 51931: 'db2', 51932: 'db2', 51933: 'db2',
+                51934: 'db2', 51935: 'db2', 51936: 'db2', 51937: 'db2', 51938: 'db2',
+                51939: 'db2', 51940: 'db2', 51941: 'db2', 51942: 'db2', 51943: 'db2',
+                51944: 'db2', 51945: 'db2', 51946: 'db2', 51947: 'db2', 51948: 'db2',
+                51949: 'db2', 51950: 'db2', 51951: 'db2', 51952: 'db2', 51953: 'db2',
+                51954: 'db2', 51955: 'db2', 51956: 'db2', 51957: 'db2', 51958: 'db2',
+                51959: 'db2', 51960: 'db2', 51961: 'db2', 51962: 'db2', 51963: 'db2',
+                51964: 'db2', 51965: 'db2', 51966: 'db2', 51967: 'db2', 51968: 'db2',
+                51969: 'db2', 51970: 'db2', 51971: 'db2', 51972: 'db2', 51973: 'db2',
+                51974: 'db2', 51975: 'db2', 51976: 'db2', 51977: 'db2', 51978: 'db2',
+                51979: 'db2', 51980: 'db2', 51981: 'db2', 51982: 'db2', 51983: 'db2',
+                51984: 'db2', 51985: 'db2', 51986: 'db2', 51987: 'db2', 51988: 'db2',
+                51989: 'db2', 51990: 'db2', 51991: 'db2', 51992: 'db2', 51993: 'db2',
+                51994: 'db2', 51995: 'db2', 51996: 'db2', 51997: 'db2', 51998: 'db2',
+                51999: 'db2', 52000: 'db2', 52001: 'db2', 52002: 'db2', 52003: 'db2',
+                52004: 'db2', 52005: 'db2', 52006: 'db2', 52007: 'db2', 52008: 'db2',
+                52009: 'db2', 52010: 'db2', 52011: 'db2', 52012: 'db2', 52013: 'db2',
+                52014: 'db2', 52015: 'db2', 52016: 'db2', 52017: 'db2', 52018: 'db2',
+                52019: 'db2', 52020: 'db2', 52021: 'db2', 52022: 'db2', 52023: 'db2',
+                52024: 'db2', 52025: 'db2', 52026: 'db2', 52027: 'db2', 52028: 'db2',
+                52029: 'db2', 52030: 'db2', 52031: 'db2', 52032: 'db2', 52033: 'db2',
+                52034: 'db2', 52035: 'db2', 52036: 'db2', 52037: 'db2', 52038: 'db2',
+                52039: 'db2', 52040: 'db2', 52041: 'db2', 52042: 'db2', 52043: 'db2',
+                52044: 'db2', 52045: 'db2', 52046: 'db2', 52047: 'db2', 52048: 'db2',
+                52049: 'db2', 52050: 'db2', 52051: 'db2', 52052: 'db2', 52053: 'db2',
+                52054: 'db2', 52055: 'db2', 52056: 'db2', 52057: 'db2', 52058: 'db2',
+                52059: 'db2', 52060: 'db2', 52061: 'db2', 52062: 'db2', 52063: 'db2',
+                52064: 'db2', 52065: 'db2', 52066: 'db2', 52067: 'db2', 52068: 'db2',
+                52069: 'db2', 52070: 'db2', 52071: 'db2', 52072: 'db2', 52073: 'db2',
+                52074: 'db2', 52075: 'db2', 52076: 'db2', 52077: 'db2', 52078: 'db2',
+                52079: 'db2', 52080: 'db2', 52081: 'db2', 52082: 'db2', 52083: 'db2',
+                52084: 'db2', 52085: 'db2', 52086: 'db2', 52087: 'db2', 52088: 'db2',
+                52089: 'db2', 52090: 'db2', 52091: 'db2', 52092: 'db2', 52093: 'db2',
+                52094: 'db2', 52095: 'db2', 52096: 'db2', 52097: 'db2', 52098: 'db2',
+                52099: 'db2', 52100: 'db2', 52101: 'db2', 52102: 'db2', 52103: 'db2',
+                52104: 'db2', 52105: 'db2', 52106: 'db2', 52107: 'db2', 52108: 'db2',
+                52109: 'db2', 52110: 'db2', 52111: 'db2', 52112: 'db2', 52113: 'db2',
+                52114: 'db2', 52115: 'db2', 52116: 'db2', 52117: 'db2', 52118: 'db2',
+                52119: 'db2', 52120: 'db2', 52121: 'db2', 52122: 'db2', 52123: 'db2',
+                52124: 'db2', 52125: 'db2', 52126: 'db2', 52127: 'db2', 52128: 'db2',
+                52129: 'db2', 52130: 'db2', 52131: 'db2', 52132: 'db2', 52133: 'db2',
+                52134: 'db2', 52135: 'db2', 52136: 'db2', 52137: 'db2', 52138: 'db2',
+                52139: 'db2', 52140: 'db2', 52141: 'db2', 52142: 'db2', 52143: 'db2',
+                52144: 'db2', 52145: 'db2', 52146: 'db2', 52147: 'db2', 52148: 'db2',
+                52149: 'db2', 52150: 'db2', 52151: 'db2', 52152: 'db2', 52153: 'db2',
+                52154: 'db2', 52155: 'db2', 52156: 'db2', 52157: 'db2', 52158: 'db2',
+                52159: 'db2', 52160: 'db2', 52161: 'db2', 52162: 'db2', 52163: 'db2',
+                52164: 'db2', 52165: 'db2', 52166: 'db2', 52167: 'db2', 52168: 'db2',
+                50000: 'db2', 50001: 'db2', 50002: 'db2', 50003: 'db2'
             }
             
             service_info['service'] = service_map.get(port, 'unknown')
             
             # Try to extract version from banner
             if service_info['banner']:
-                service_info['version'] = self._extract_version_from_banner(service_info['banner'], service_info['service'])
+                service_info['version'] = _extract_version_from_banner(service_info['banner'], service_info['service'])
+            
+            return service_info
+        
+        async def _detect_udp_service(self, host, port, data, timeout):
+            """Detect UDP service from response data"""
+            service_info = {'service': 'unknown', 'banner': '', 'version': ''}
+            
+            try:
+                # Decode response data
+                if data:
+                    decoded_data = data.decode('utf-8', errors='ignore').strip()
+                    service_info['banner'] = decoded_data
+                    
+                    # UDP service detection based on port and response patterns
+                    udp_service_map = {
+                        53: 'dns',
+                        67: 'dhcp',
+                        68: 'dhcp',
+                        123: 'ntp',
+                        161: 'snmp',
+                        162: 'snmp-trap',
+                        500: 'ike',
+                        514: 'syslog',
+                        520: 'rip',
+                        1434: 'ms-sql-m',
+                        1701: 'l2tp',
+                        4500: 'ipsec-nat-t',
+                        5353: 'mdns',
+                        11211: 'memcached',
+                        27017: 'mongodb',
+                        6379: 'redis',
+                    }
+                    
+                    service_info['service'] = udp_service_map.get(port, 'unknown')
+                    
+                    # Try to extract version from banner
+                    if service_info['banner']:
+                        service_info['version'] = _extract_version_from_banner(service_info['banner'], service_info['service'])
+                        
+            except Exception as e:
+                logging.debug(f"UDP service detection failed for {host}:{port}: {e}")
+            
+            return service_info
+        
+        async def _detect_sctp_service(self, host, port, timeout):
+            """Detect SCTP service from response data"""
+            service_info = {'service': 'unknown', 'banner': '', 'version': ''}
+            
+            try:
+                # SCTP service detection based on port
+                sctp_service_map = {
+                    384: 'sctp-radius',
+                    386: 'sctp-radius',
+                    387: 'sctp-radius',
+                    388: 'sctp-radius',
+                    389: 'sctp-ldap',
+                    636: 'sctp-ldaps',
+                    2049: 'sctp-nfs',
+                    3868: 'sctp-rsvp',
+                    3869: 'sctp-rsvp',
+                    3870: 'sctp-rsvp',
+                    3784: 'sctp-bfd',
+                    3785: 'sctp-bfd',
+                    4784: 'sctp-bfd',
+                    4785: 'sctp-bfd',
+                    5900: 'sctp-vnc',
+                    7000: 'sctp-cassandra',
+                    7001: 'sctp-weblogic',
+                    8080: 'sctp-http',
+                    9200: 'sctp-elasticsearch',
+                    27017: 'sctp-mongodb',
+                }
+                
+                service_info['service'] = sctp_service_map.get(port, 'unknown')
+                service_info['banner'] = 'SCTP service detected'
+                
+            except Exception as e:
+                logging.debug(f"SCTP service detection failed for {host}:{port}: {e}")
             
             return service_info
         
@@ -47703,7 +48772,37 @@ class SubdomainDiscovery:
                 except Exception as e:
                     logging.debug(f"Database analysis failed for {host}:{port}: {e}")
             
+            # Perform RDP analysis for RDP port
+            elif port == 3389:
+                try:
+                    rdp_info = await self._handle_rdp(host, port, timeout)
+                    service_info['rdp_analysis'] = rdp_info
+                    logging.info(f"RDP analysis completed for {host}:{port}")
+                except Exception as e:
+                    logging.debug(f"RDP analysis failed for {host}:{port}: {e}")
+            
             return service_info
+        
+        def _extract_version_from_banner(banner, service):
+            """Extract version information from service banner"""
+            version = ''
+            
+            # Common version patterns
+            version_patterns = [
+                r'(\d+\.\d+\.\d+)',      # X.Y.Z
+                r'(\d+\.\d+)',            # X.Y
+                r'v(\d+\.\d+\.\d+)',      # vX.Y.Z
+                r'Version (\d+\.\d+\.\d+)', # Version X.Y.Z
+            ]
+            
+            import re
+            for pattern in version_patterns:
+                match = re.search(pattern, banner)
+                if match:
+                    version = match.group(1)
+                    break
+            
+            return version
         
         # Run port scans concurrently with rate limiting
         semaphore = asyncio.Semaphore(50)  # Limit concurrent connections
@@ -47720,6 +48819,18 @@ class SubdomainDiscovery:
                 open_ports.append(result)
         
         self.log(f"Port scan completed for {host}: {len(open_ports)} open ports found")
+        
+        # Log protocol breakdown
+        tcp_ports = [p for p in open_ports if p.get('protocol') == 'tcp' or p.get('scan_type') in ['tcp_connect', 'syn']]
+        udp_ports = [p for p in open_ports if p.get('protocol') == 'udp']
+        sctp_ports = [p for p in open_ports if p.get('protocol') == 'sctp' or p.get('scan_type') == 'sctp']
+        if tcp_ports:
+            self.log(f"TCP ports found: {len(tcp_ports)}")
+        if udp_ports:
+            self.log(f"UDP ports found: {len(udp_ports)}")
+        if sctp_ports:
+            self.log(f"SCTP ports found: {len(sctp_ports)}")
+        
         return open_ports
     
     def _extract_version_from_banner(self, banner, service):
@@ -47786,13 +48897,13 @@ class SubdomainDiscovery:
         
         try:
             if service == 'mysql':
-                db_info = await self._analyze_mysql(host, port, timeout)
+                db_info = await self._handle_mysql(host, port, timeout)
             elif service == 'postgresql':
-                db_info = await self._analyze_postgresql(host, port, timeout)
+                db_info = await self._handle_postgres(host, port, timeout)
             elif service == 'redis':
-                db_info = await self._analyze_redis(host, port, timeout)
+                db_info = await self._handle_redis(host, port, timeout)
             elif service == 'mongodb':
-                db_info = await self._analyze_mongodb(host, port, timeout)
+                db_info = await self._handle_mongodb(host, port, timeout)
         except Exception as e:
             logging.debug(f"Database service analysis failed: {e}")
         
@@ -49827,12 +50938,26 @@ class ScannerWorker(QThread):
             self.scanner = OmegaDAST(self.target, self.config, self, loop=self.loop, pause_event=self.pause_event)
             self.log.emit("OmegaDAST created successfully, starting scan...")
             
+            # Validate signal configuration
+            if not hasattr(self, 'finding'):
+                self.log.emit("WARNING: ScannerWorker does not have 'finding' signal - results may not reach GUI")
+                logging.error("ScannerWorker missing 'finding' signal")
+            if not hasattr(self, 'log'):
+                self.log.emit("WARNING: ScannerWorker does not have 'log' signal - logging may be impaired")
+                logging.error("ScannerWorker missing 'log' signal")
+            
             # Set reporting_engine reference for findings integration
             if hasattr(self.scanner, 'reporting_engine'):
                 self.reporting_engine = self.scanner.reporting_engine
+                self.log.emit("Reporting engine initialized successfully")
+            else:
+                self.log.emit("WARNING: Scanner does not have reporting engine - findings may not be stored")
+                logging.error("Scanner missing reporting_engine")
             
             # Emit scanner_ready signal to allow GUI to access shared FP_Database
             self.scanner_ready.emit(self.scanner)
+            self.log.emit("Scanner ready signal emitted")
+            
             self.loop.run_until_complete(self.scanner.scan())
             
             # Collect safety statistics from injection engine
@@ -52022,13 +53147,34 @@ class ScanTab(QWidget):
             self.log_area.append("[SAFETY] AUTO-RESUME MODE ENABLED - Will automatically resume from most recent checkpoint")
         
         self.worker = ScannerWorker(target, config)
-        self.worker.log.connect(self.log_area.append)
-        self.worker.finding.connect(self.add_finding)
-        self.worker.finished.connect(self.scan_finished)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.status.connect(self.update_status)
-        self.worker.endpoint_progress.connect(self.update_endpoint_progress)
-        self.worker.scanner_ready.connect(self.on_scanner_ready)
+        
+        # Validate worker signals before connecting
+        required_worker_signals = ['log', 'finding', 'finished', 'progress', 'status', 'endpoint_progress', 'scanner_ready']
+        missing_worker_signals = []
+        for signal_name in required_worker_signals:
+            if not hasattr(self.worker, signal_name):
+                missing_worker_signals.append(signal_name)
+        
+        if missing_worker_signals:
+            self.log_area.append(f"ERROR: Worker missing signals: {', '.join(missing_worker_signals)}")
+            logging.error(f"ScannerWorker missing required signals: {', '.join(missing_worker_signals)}")
+            return
+        
+        # Connect signals with error handling
+        try:
+            self.worker.log.connect(self.log_area.append)
+            self.worker.finding.connect(self.add_finding)
+            self.worker.finished.connect(self.scan_finished)
+            self.worker.progress.connect(self.update_progress)
+            self.worker.status.connect(self.update_status)
+            self.worker.endpoint_progress.connect(self.update_endpoint_progress)
+            self.worker.scanner_ready.connect(self.on_scanner_ready)
+            self.log_area.append("All worker signals connected successfully")
+        except Exception as e:
+            self.log_area.append(f"ERROR: Failed to connect worker signals: {e}")
+            logging.error(f"Failed to connect worker signals: {e}", exc_info=True)
+            return
+        
         self.worker.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -52113,6 +53259,14 @@ class ScanTab(QWidget):
             
             if not already_exists:
                 self.worker.all_findings.append(vuln)
+        
+        # Ensure finding is also stored in reporting engine's vulnerability storage
+        if hasattr(self, 'worker') and hasattr(self.worker, 'scanner') and hasattr(self.worker.scanner, 'reporting_engine'):
+            try:
+                self.worker.scanner.reporting_engine.vulnerability_storage.add_vulnerability(vuln)
+                logging.debug(f"Added finding to reporting engine vulnerability storage: {vuln.get('type')} at {vuln.get('url')}")
+            except Exception as e:
+                logging.warning(f"Failed to add finding to reporting engine vulnerability storage: {e}")
     
     def update_findings_table(self):
         """Update the findings table with paginated data"""
@@ -52432,22 +53586,35 @@ class ScanTab(QWidget):
         
         # Ensure all findings from the reporting engine are integrated into GUI
         if hasattr(self.worker, 'scanner') and hasattr(self.worker.scanner, 'reporting_engine'):
-            scanner_findings = self.worker.scanner.reporting_engine.vulnerabilities
-            # Merge findings without duplicates
-            for scanner_finding in scanner_findings:
-                vuln_key = (scanner_finding.get('type', ''), scanner_finding.get('url', ''), scanner_finding.get('parameter', ''))
-                already_exists = False
-                for existing_vuln in self.all_findings:
-                    if (existing_vuln.get('type', '') == vuln_key[0] and 
-                        existing_vuln.get('url', '') == vuln_key[1] and 
-                        existing_vuln.get('parameter', '') == vuln_key[2]):
-                        already_exists = True
-                        break
-                if not already_exists:
-                    self.all_findings.append(scanner_finding)
-            
-            # Update findings table with all integrated findings
-            self.update_findings_table()
+            try:
+                scanner_findings = self.worker.scanner.reporting_engine.vulnerabilities
+                self.log_area.append(f"Found {len(scanner_findings)} total findings in reporting engine")
+                
+                # Merge findings without duplicates
+                merged_count = 0
+                for scanner_finding in scanner_findings:
+                    vuln_key = (scanner_finding.get('type', ''), scanner_finding.get('url', ''), scanner_finding.get('parameter', ''))
+                    already_exists = False
+                    for existing_vuln in self.all_findings:
+                        if (existing_vuln.get('type', '') == vuln_key[0] and 
+                            existing_vuln.get('url', '') == vuln_key[1] and 
+                            existing_vuln.get('parameter', '') == vuln_key[2]):
+                            already_exists = True
+                            break
+                    if not already_exists:
+                        self.all_findings.append(scanner_finding)
+                        merged_count += 1
+                
+                self.log_area.append(f"Merged {merged_count} new findings from reporting engine")
+                
+                # Update findings table with all integrated findings
+                self.update_findings_table()
+            except Exception as e:
+                self.log_area.append(f"Error integrating findings from reporting engine: {e}")
+                logging.error(f"Failed to integrate findings from reporting engine: {e}", exc_info=True)
+        else:
+            self.log_area.append("Warning: Reporting engine not available, using GUI findings only")
+            logging.warning("Reporting engine not available for findings integration")
         
         self.log_area.append(f"\nScan complete. {len(self.all_findings)} findings.")
         
@@ -52478,9 +53645,10 @@ class ScanTab(QWidget):
                                        f"(Confirmed {anomaly['confirmation_count']}x)")
 
 class GrayZoneTab(QWidget):
-    def __init__(self, parent=None, validation_engine=None):
+    def __init__(self, parent=None, validation_engine=None, reporting_engine=None):
         QWidget.__init__(self, parent)
         self.validation_engine = validation_engine
+        self.reporting_engine = reporting_engine  # Set reporting_engine reference
         layout = QVBoxLayout()
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -53034,7 +54202,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v19.7 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v19.9 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -53529,7 +54697,7 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
         
-        tab = GrayZoneTab(validation_engine=None)
+        tab = GrayZoneTab(validation_engine=self.validation_engine, reporting_engine=self.reporting_engine)
         self.tabs.addTab(tab, "🔍 Gray Zone")
         self.tabs.setCurrentIndex(self.tabs.count() - 1)
     
@@ -53539,6 +54707,7 @@ class MainWindow(QMainWindow):
             if isinstance(self.tabs.widget(i), GrayZoneTab):
                 gray_zone_tab = self.tabs.widget(i)
                 gray_zone_tab.validation_engine = self.validation_engine
+                gray_zone_tab.reporting_engine = self.reporting_engine
                 break
     
     def add_selenium_browser_tab(self):
@@ -53892,16 +55061,16 @@ class MainWindow(QMainWindow):
                     config = json.load(f)
                 current_tab = self.tabs.currentWidget()
                 if isinstance(current_tab, ScanTab):
-                    current_tab.url_input.setText(config.get('url', ''))
-                    current_tab.depth_spin.setValue(config.get('depth', 3))
-                    current_tab.threads_spin.setValue(config.get('threads', 100))
-                    current_tab.delay_spin.setValue(config.get('delay', 0.2))
-                    current_tab.conf_spin.setValue(config.get('confidence_threshold', 75))
-                    current_tab.js_check.setChecked(config.get('js_render', True))
-                    current_tab.human_like_behavior.setChecked(config.get('human_like_behavior', True))
+                    current_tab.url_input.setText(self.config.get('url', ''))
+                    current_tab.depth_spin.setValue(self.config.get('depth', 3))
+                    current_tab.threads_spin.setValue(self.config.get('threads', 100))
+                    current_tab.delay_spin.setValue(self.config.get('delay', 0.2))
+                    current_tab.conf_spin.setValue(self.config.get('confidence_threshold', 75))
+                    current_tab.js_check.setChecked(self.config.get('js_render', True))
+                    current_tab.human_like_behavior.setChecked(self.config.get('human_like_behavior', True))
                     
                     # Import traffic shaping settings if available
-                    traffic_shaping = config.get('traffic_shaping', {})
+                    traffic_shaping = self.config.get('traffic_shaping', {})
                     if traffic_shaping:
                         current_tab.traffic_shaping_enabled.setChecked(traffic_shaping.get('enabled', True))
                         current_tab.randomize_interval.setChecked(traffic_shaping.get('randomize_interval', True))
@@ -53910,7 +55079,7 @@ class MainWindow(QMainWindow):
                         current_tab.browser_simulation.setChecked(traffic_shaping.get('browser_simulation', True))
                     
                     # Import dynamic payload settings if available
-                    dynamic_payloads = config.get('dynamic_payloads', {})
+                    dynamic_payloads = self.config.get('dynamic_payloads', {})
                     if dynamic_payloads:
                         current_tab.dynamic_payloads_enabled.setChecked(dynamic_payloads.get('enabled', True))
                         current_tab.environment_detection_enabled.setChecked(dynamic_payloads.get('environment_detection', True))
@@ -53925,8 +55094,22 @@ class MainWindow(QMainWindow):
             filename, _ = QFileDialog.getSaveFileName(self, "Export JUnit XML", "", "XML Files (*.xml)")
             if filename:
                 xml = '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
-                xml += f'  <testsuite name="UltraDAST Scan" tests="{len(current_tab.all_findings)}">\n'
-                for vuln in current_tab.all_findings:
+                
+                # Use reporting engine vulnerabilities if available, otherwise fall back to GUI findings
+                findings_to_export = []
+                if hasattr(current_tab, 'worker') and hasattr(current_tab.worker, 'scanner') and hasattr(current_tab.worker.scanner, 'reporting_engine'):
+                    try:
+                        findings_to_export = current_tab.worker.scanner.reporting_engine.vulnerabilities
+                        logging.info(f"Exporting {len(findings_to_export)} findings from reporting engine")
+                    except Exception as e:
+                        logging.warning(f"Failed to get findings from reporting engine, using GUI findings: {e}")
+                        findings_to_export = current_tab.all_findings
+                else:
+                    findings_to_export = current_tab.all_findings
+                    logging.info(f"Exporting {len(findings_to_export)} findings from GUI memory")
+                
+                xml += f'  <testsuite name="UltraDAST Scan" tests="{len(findings_to_export)}">\n'
+                for vuln in findings_to_export:
                     vuln_type = vuln.get('type', '')
                     url = vuln.get('url', '')
                     severity = vuln.get('severity', '')
@@ -53957,7 +55140,21 @@ class MainWindow(QMainWindow):
                         "results": []
                     }]
                 }
-                for vuln in current_tab.all_findings:
+                
+                # Use reporting engine vulnerabilities if available, otherwise fall back to GUI findings
+                findings_to_export = []
+                if hasattr(current_tab, 'worker') and hasattr(current_tab.worker, 'scanner') and hasattr(current_tab.worker.scanner, 'reporting_engine'):
+                    try:
+                        findings_to_export = current_tab.worker.scanner.reporting_engine.vulnerabilities
+                        logging.info(f"Exporting {len(findings_to_export)} findings from reporting engine")
+                    except Exception as e:
+                        logging.warning(f"Failed to get findings from reporting engine, using GUI findings: {e}")
+                        findings_to_export = current_tab.all_findings
+                else:
+                    findings_to_export = current_tab.all_findings
+                    logging.info(f"Exporting {len(findings_to_export)} findings from GUI memory")
+                
+                for vuln in findings_to_export:
                     vuln_type = vuln.get('type', '')
                     url = vuln.get('url', '')
                     parameter = vuln.get('parameter', '')
@@ -53995,7 +55192,21 @@ class MainWindow(QMainWindow):
             filename, _ = QFileDialog.getSaveFileName(self, "Export Burp XML", "", "XML Files (*.xml)")
             if filename:
                 xml = '<?xml version="1.0"?>\n<issues>\n'
-                for vuln in current_tab.all_findings:
+                
+                # Use reporting engine vulnerabilities if available, otherwise fall back to GUI findings
+                findings_to_export = []
+                if hasattr(current_tab, 'worker') and hasattr(current_tab.worker, 'scanner') and hasattr(current_tab.worker.scanner, 'reporting_engine'):
+                    try:
+                        findings_to_export = current_tab.worker.scanner.reporting_engine.vulnerabilities
+                        logging.info(f"Exporting {len(findings_to_export)} findings from reporting engine")
+                    except Exception as e:
+                        logging.warning(f"Failed to get findings from reporting engine, using GUI findings: {e}")
+                        findings_to_export = current_tab.all_findings
+                else:
+                    findings_to_export = current_tab.all_findings
+                    logging.info(f"Exporting {len(findings_to_export)} findings from GUI memory")
+                
+                for vuln in findings_to_export:
                     vuln_type = vuln.get('type', '')
                     url = vuln.get('url', '')
                     parameter = vuln.get('parameter', '')
@@ -54174,7 +55385,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v19.7']
+                        ['Tool Version', 'UltraDAST v19.9']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -54360,7 +55571,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v19.7",
+                            "tool": "UltraDAST v19.9",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -54650,7 +55861,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v19.7 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v19.9 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -55279,7 +56490,7 @@ class TaintInstrumentor:
         self.runtime_taint_tracker = None
         self.instrumentation_markers = []
         self.marker_counter = 0
-        self.runtime_enabled = config.get('runtime_taint_tracking_enabled', True)
+        self.runtime_enabled = self.config.get('runtime_taint_tracking_enabled', True)
         
         # Initialize runtime tracker if enabled
         if self.runtime_enabled:
@@ -55515,7 +56726,7 @@ class RuntimeTaintTracker:
         self.tainted_variables = set()
         self.runtime_flows = []
         self.flow_counter = 0
-        self.enabled = config.get('runtime_taint_tracking_enabled', True)
+        self.enabled = self.config.get('runtime_taint_tracking_enabled', True)
         
         # Runtime taint sources and sinks
         self.runtime_sources = {
@@ -56454,8 +57665,8 @@ class JavaScriptSymbolicExecutionEngine:
         self.explored_paths = set()
         self.branch_coverage = {}
         self.execution_count = 0
-        self.max_depth = config.get('symbolic_max_depth', 10)
-        self.timeout = config.get('symbolic_timeout', 30)
+        self.max_depth = self.config.get('symbolic_max_depth', 10)
+        self.timeout = self.config.get('symbolic_timeout', 30)
         self.z3_solver = None
         self.z3_variables = {}
         self.js_cache = {}  # Cache for parsed JavaScript
@@ -58874,7 +60085,7 @@ class JavaScriptSymbolicExecutor:
         self.config = config or {}
         self.engine = JavaScriptSymbolicExecutionEngine(config)
         self.session_results = {}
-        self.enabled = config.get('symbolic_execution_enabled', True)
+        self.enabled = self.config.get('symbolic_execution_enabled', True)
         self.js_files_analyzed = set()
         
         logging.info("JavaScriptSymbolicExecutor initialized for client-side security analysis")
@@ -61269,18 +62480,18 @@ class RequestTemplateFuzzer:
         self.mutation_server = DynamicMutationServer(self.schema_engine, config)
         
         # Schema-aware fuzzing configuration
-        self.schema_inference_enabled = config.get('schema_inference', {}).get('enabled', True)
-        self.dynamic_mutation_enabled = config.get('dynamic_mutation', {}).get('enabled', True)
+        self.schema_inference_enabled = self.config.get('schema_inference', {}).get('enabled', True)
+        self.dynamic_mutation_enabled = self.config.get('dynamic_mutation', {}).get('enabled', True)
         
         # Request template structure
         self.templates = []
         self.population = []
         
         # Genetic parameters
-        self.mutation_rate = config.get('mutation_rate', 0.15)
-        self.crossover_rate = config.get('crossover_rate', 0.25)
-        self.population_size = config.get('population_size', 30)
-        self.max_generations = config.get('max_generations', 50)
+        self.mutation_rate = self.config.get('mutation_rate', 0.15)
+        self.crossover_rate = self.config.get('crossover_rate', 0.25)
+        self.population_size = self.config.get('population_size', 30)
+        self.max_generations = self.config.get('max_generations', 50)
         
         # Component generators
         self.url_generators = [
