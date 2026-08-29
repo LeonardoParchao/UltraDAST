@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTRA-DAST v.20.0 – The Unstoppable Pentester Platform
+ULTRA-DAST v20.2 – The Unstoppable Pentester Platform
 Full implementation with async engine, advanced evasion, second-order injection,
 race conditions, request smuggling, WebSocket/gRPC fuzzing, CVSS 4.0, Burp XML,
 JIRA/Slack alerts, multi‑tab GUI, proxy mode, FP learning, and more.
@@ -6040,7 +6040,35 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoAlertPresentException, WebDriverException
 
-import html5lib
+# Optional library import with error handling
+MISSING_LIBRARIES = []
+try:
+    import html5lib
+except ImportError:
+    MISSING_LIBRARIES.append('html5lib')
+    logging.warning("html5lib not installed - HTML DOM fingerprinting will be disabled")
+
+try:
+    import lxml
+except ImportError:
+    MISSING_LIBRARIES.append('lxml')
+    logging.warning("lxml not installed - Some HTML parsing features will be disabled")
+
+try:
+    import graphql_core
+except ImportError:
+    MISSING_LIBRARIES.append('graphql-core')
+    logging.warning("graphql-core not installed - GraphQL fuzzing will be disabled")
+
+try:
+    import grpcio
+except ImportError:
+    MISSING_LIBRARIES.append('grpcio')
+    logging.warning("grpcio not installed - gRPC fuzzing will be disabled")
+
+if MISSING_LIBRARIES:
+    logging.warning(f"Optional libraries not installed: {', '.join(MISSING_LIBRARIES)}")
+    logging.warning("Some detection modules will be disabled. Install with: pip install " + " ".join(MISSING_LIBRARIES))
 
 # Additional PyQt5 imports for GUI components
 from PyQt5.QtWidgets import (
@@ -6101,7 +6129,7 @@ class SecurityWarning(Warning):
 DEFAULT_DEPTH = 3
 DEFAULT_THREADS = 100
 DEFAULT_DELAY = 0.0
-DEFAULT_CONFIDENCE_THRESHOLD = 75
+DEFAULT_CONFIDENCE_THRESHOLD = 50
 DEFAULT_VALIDATION_ENABLED = True
 
 # Schema Inference and Dynamic Mutation defaults
@@ -26251,7 +26279,10 @@ class Detector:
         and return canonicalized DOM tree for comparison.
         """
         try:
-            import html5lib
+            if 'html5lib' in MISSING_LIBRARIES:
+                logging.debug("html5lib not available, skipping DOM normalization")
+                return html
+            
             from html5lib import treebuilders
             from html5lib.serializer import serialize
             
@@ -27877,10 +27908,19 @@ class DiskBasedVulnerabilityStorage:
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                           type TEXT, url TEXT, parameter TEXT, 
                           evidence TEXT, severity TEXT, confidence INTEGER,
-                          cwe TEXT, timestamp TEXT, payload TEXT)''')
+                          cwe TEXT, timestamp TEXT, payload TEXT, target_domain TEXT)''')
+        
+        # Migration: add target_domain column if it doesn't exist
+        try:
+            conn.execute("SELECT target_domain FROM vulnerabilities LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist, add it
+            conn.execute("ALTER TABLE vulnerabilities ADD COLUMN target_domain TEXT")
+        
         conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_type ON vulnerabilities(type)''')
         conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_url ON vulnerabilities(url)''')
         conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_severity ON vulnerabilities(severity)''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_vuln_target ON vulnerabilities(target_domain)''')
         conn.commit()
     
     def _init_tables(self):
@@ -27891,10 +27931,19 @@ class DiskBasedVulnerabilityStorage:
         """Add vulnerability to database"""
         with self.lock:
             self._ensure_connection()
+            # Extract target domain from URL if not provided
+            target_domain = vulnerability.get('target_domain')
+            if not target_domain and vulnerability.get('url'):
+                try:
+                    from urllib.parse import urlparse
+                    target_domain = urlparse(vulnerability['url']).netloc
+                except Exception:
+                    target_domain = ''
+            
             cursor = self.conn.execute(
                 """INSERT INTO vulnerabilities 
-                   (type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     vulnerability.get('type', ''),
                     vulnerability.get('url', ''),
@@ -27904,7 +27953,8 @@ class DiskBasedVulnerabilityStorage:
                     vulnerability.get('confidence', 0),
                     vulnerability.get('cwe', ''),
                     datetime.now().isoformat(),
-                    vulnerability.get('payload', '')
+                    vulnerability.get('payload', ''),
+                    target_domain
                 )
             )
             self.conn.commit()
@@ -27915,7 +27965,7 @@ class DiskBasedVulnerabilityStorage:
         with self.lock:
             self._ensure_connection()
             cursor = self.conn.execute(
-                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
                    FROM vulnerabilities ORDER BY timestamp DESC LIMIT ? OFFSET ?""",
                 (limit, offset)
             )
@@ -27930,7 +27980,8 @@ class DiskBasedVulnerabilityStorage:
                     'confidence': row[5],
                     'cwe': row[6],
                     'timestamp': row[7],
-                    'payload': row[8]
+                    'payload': row[8],
+                    'target_domain': row[9]
                 }
                 for row in rows
             ]
@@ -27940,7 +27991,7 @@ class DiskBasedVulnerabilityStorage:
         with self.lock:
             self._ensure_connection()
             cursor = self.conn.execute(
-                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
                    FROM vulnerabilities WHERE severity = ? ORDER BY timestamp DESC""",
                 (severity,)
             )
@@ -27955,7 +28006,8 @@ class DiskBasedVulnerabilityStorage:
                     'confidence': row[5],
                     'cwe': row[6],
                     'timestamp': row[7],
-                    'payload': row[8]
+                    'payload': row[8],
+                    'target_domain': row[9]
                 }
                 for row in rows
             ]
@@ -27965,7 +28017,7 @@ class DiskBasedVulnerabilityStorage:
         with self.lock:
             self._ensure_connection()
             cursor = self.conn.execute(
-                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
                    FROM vulnerabilities WHERE type = ? ORDER BY timestamp DESC""",
                 (vuln_type,)
             )
@@ -27980,7 +28032,34 @@ class DiskBasedVulnerabilityStorage:
                     'confidence': row[5],
                     'cwe': row[6],
                     'timestamp': row[7],
-                    'payload': row[8]
+                    'payload': row[8],
+                    'target_domain': row[9]
+                }
+                for row in rows
+            ]
+
+    def get_vulnerabilities_by_target_domain(self, target_domain: str) -> List[Dict[str, Any]]:
+        """Get all vulnerabilities for a specific target domain"""
+        with self.lock:
+            self._ensure_connection()
+            cursor = self.conn.execute(
+                """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
+                   FROM vulnerabilities WHERE target_domain = ? ORDER BY timestamp DESC""",
+                (target_domain,)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'type': row[0],
+                    'url': row[1],
+                    'parameter': row[2],
+                    'evidence': row[3],
+                    'severity': row[4],
+                    'confidence': row[5],
+                    'cwe': row[6],
+                    'timestamp': row[7],
+                    'payload': row[8],
+                    'target_domain': row[9]
                 }
                 for row in rows
             ]
@@ -28040,7 +28119,7 @@ class DiskBasedVulnerabilityStorage:
             self._ensure_connection()
             try:
                 cursor = self.conn.execute(
-                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
                        FROM vulnerabilities ORDER BY timestamp DESC"""
                 )
                 rows = cursor.fetchall()
@@ -28054,7 +28133,8 @@ class DiskBasedVulnerabilityStorage:
                         'confidence': row[5],
                         'cwe': row[6],
                         'timestamp': row[7],
-                        'payload': row[8]
+                        'payload': row[8],
+                        'target_domain': row[9]
                     }
                     for row in rows
                 ]
@@ -28062,7 +28142,7 @@ class DiskBasedVulnerabilityStorage:
                 # Connection was closed, try to reopen and retry
                 self._ensure_connection()
                 cursor = self.conn.execute(
-                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload
+                    """SELECT type, url, parameter, evidence, severity, confidence, cwe, timestamp, payload, target_domain
                        FROM vulnerabilities ORDER BY timestamp DESC"""
                 )
                 rows = cursor.fetchall()
@@ -28076,7 +28156,8 @@ class DiskBasedVulnerabilityStorage:
                         'confidence': row[5],
                         'cwe': row[6],
                         'timestamp': row[7],
-                        'payload': row[8]
+                        'payload': row[8],
+                        'target_domain': row[9]
                     }
                     for row in rows
                 ]
@@ -28084,6 +28165,16 @@ class DiskBasedVulnerabilityStorage:
     def clear_all_vulnerabilities(self):
         """Clear all vulnerabilities from database"""
         with self.lock:
+            self._ensure_connection()
+            self.conn.execute("DELETE FROM vulnerabilities")
+            self.conn.commit()
+
+    def clear_vulnerabilities_by_target_domain(self, target_domain: str):
+        """Clear vulnerabilities for a specific target domain"""
+        with self.lock:
+            self._ensure_connection()
+            self.conn.execute("DELETE FROM vulnerabilities WHERE target_domain = ?", (target_domain,))
+            self.conn.commit()
             self._ensure_connection()
             self.conn.execute("DELETE FROM vulnerabilities")
             self.conn.commit()
@@ -29435,9 +29526,10 @@ class OOBManager:
 # REPORTING ENGINE
 # ---------------------------------------------------------------------
 class ReportingEngine:
-    def __init__(self, config, signals, session_manager=None, cve_template_engine=None, fp_db=None):
+    def __init__(self, config, signals, session_manager=None, cve_template_engine=None, fp_db=None, target_domain=None):
         self.config = config
         self.signals = signals
+        self.target_domain = target_domain  # Track current target domain for filtering
         
         # Use disk-based vulnerability storage to prevent memory bloat during long scans
         vuln_storage_config = self.config.get('vulnerability_storage', {})
@@ -29490,6 +29582,17 @@ class ReportingEngine:
         else:
             logging.info(msg)
     def add_finding(self, vuln):
+        # Add target domain to vulnerability if not already present
+        if self.target_domain and 'target_domain' not in vuln:
+            vuln['target_domain'] = self.target_domain
+        elif 'target_domain' not in vuln and vuln.get('url'):
+            # Extract target domain from URL if not set
+            try:
+                from urllib.parse import urlparse
+                vuln['target_domain'] = urlparse(vuln['url']).netloc
+            except Exception:
+                pass
+        
         # Store in disk-based database as source of truth to prevent memory bloat during long scans
         try:
             self.vulnerability_storage.add_vulnerability(vuln)
@@ -29547,17 +29650,33 @@ class ReportingEngine:
             return self.cve_template_engine.apply_template_to_vulnerability(vuln)
         return vuln
     
-    def get_findings_for_gui(self, offset=0, limit=50):
+    def get_vulnerabilities_by_target_domain(self, target_domain: str) -> List[Dict[str, Any]]:
+        """
+        Get all vulnerabilities for a specific target domain.
+        
+        Args:
+            target_domain: The target domain to filter vulnerabilities by
+            
+        Returns:
+            list: All vulnerabilities for the specified target domain
+        """
+        return self.vulnerability_storage.get_vulnerabilities_by_target_domain(target_domain)
+    
+    def get_findings_for_gui(self, offset=0, limit=50, target_domain=None):
         """
         Get paginated findings for GUI display from disk-based storage.
         
         Args:
             offset: Number of findings to skip (default: 0)
             limit: Maximum number of findings to return (default: 50)
+            target_domain: Optional target domain to filter findings
             
         Returns:
             list: Paginated vulnerability findings
         """
+        if target_domain or self.target_domain:
+            domain = target_domain or self.target_domain
+            return self.vulnerability_storage.get_vulnerabilities_by_target_domain(domain)[offset:offset+limit]
         return self.vulnerability_storage.get_vulnerabilities_paginated(offset, limit)
     
     def update_progress(self, current, total):
@@ -30930,7 +31049,7 @@ class InjectionEngine:
             self.log("CVE database updated successfully")
 
         # Start multiprocessing scanner if enabled (for stateless payload testing only)
-        if self.config.get('enable_multiprocessing', False):
+        if self.config.get('enable_multiprocessing', True):
             self.log("Starting multiprocessing scanner for stateless payload testing...")
             self.multiprocessing_scanner.start_workers()
             self.log(f"Multiprocessing scanner started with {self.multiprocessing_scanner.num_processes} processes for stateless operations")
@@ -30944,7 +31063,7 @@ class InjectionEngine:
         await self._populate_baselines()
         
         # Check if multiprocessing is enabled for stateless payload testing
-        if self.config.get('enable_multiprocessing', False) and self.multiprocessing_scanner:
+        if self.config.get('enable_multiprocessing', True) and self.multiprocessing_scanner:
             self.log("Using multiprocessing for stateless payload testing...")
             await self._run_multiprocessing_active_tests()
         else:
@@ -31316,43 +31435,72 @@ class InjectionEngine:
                 return
             url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
             safe = "1"
-            start_time = time.perf_counter()
-            if method == 'GET':
-                parsed = urlparse(url)
-                qs = parse_qs(parsed.query, keep_blank_values=True)
-                qs[pname] = [safe]
-                test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-                resp = await self._async_fetch(test_url)
-            else:
-                if ptype == 'json':
-                    resp = await self._async_fetch(url, method='POST', json_data={pname: safe})
-                else:
-                    resp = await self._async_fetch(url, method='POST', data={pname: safe})
-            elapsed = time.perf_counter() - start_time
-            if resp:
-                # Handle gzip-compressed responses by decompressing before normalization
-                response_body = resp._body
+            
+            # Retry logic with fallback baseline
+            max_retries = 3
+            resp = None
+            elapsed = 0
+            
+            for attempt in range(max_retries):
                 try:
-                    # Check if response is gzip-compressed
-                    content_encoding = resp.headers.get('Content-Encoding', '').lower()
-                    if 'gzip' in content_encoding:
-                        import gzip
-                        # Try to decompress gzip-encoded response
-                        try:
-                            response_body = gzip.decompress(response_body.encode('utf-8', errors='ignore')).decode('utf-8', errors='ignore')
-                            logging.debug(f"Decompressed gzip response for baseline caching")
-                        except Exception as e:
-                            logging.warning(f"Failed to decompress gzip response: {e}")
-                            # Fall back to original body
+                    start_time = time.perf_counter()
+                    if method == 'GET':
+                        parsed = urlparse(url)
+                        qs = parse_qs(parsed.query, keep_blank_values=True)
+                        qs[pname] = [safe]
+                        test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+                        resp = await self._async_fetch(test_url)
+                    else:
+                        if ptype == 'json':
+                            resp = await self._async_fetch(url, method='POST', json_data={pname: safe})
+                        else:
+                            resp = await self._async_fetch(url, method='POST', data={pname: safe})
+                    elapsed = time.perf_counter() - start_time
+                    
+                    if resp:
+                        break  # Success, exit retry loop
+                    
                 except Exception as e:
-                    logging.warning(f"Error checking Content-Encoding header: {e}")
-                
+                    logging.warning(f"Baseline attempt {attempt + 1}/{max_retries} failed for {url}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)  # Wait before retry
+                    else:
+                        logging.error(f"All baseline attempts failed for {url}, using fallback baseline")
+            
+            # Fallback baseline if all retries failed
+            if not resp:
+                logging.warning(f"Using fallback baseline for {url} after {max_retries} failed attempts")
                 await self.baseline_cache.set(key, {
-                    'text': self.token_normalizer.normalize(response_body),
-                    'headers': Detector._normalize_headers(dict(resp.headers)),
-                    'status': resp.status,
-                    'elapsed': elapsed
+                    'text': '',
+                    'headers': {},
+                    'status': 0,
+                    'elapsed': 0
                 })
+                return
+            
+            # Handle gzip-compressed responses by decompressing before normalization
+            response_body = resp._body
+            try:
+                # Check if response is gzip-compressed
+                content_encoding = resp.headers.get('Content-Encoding', '').lower()
+                if 'gzip' in content_encoding:
+                    import gzip
+                    # Try to decompress gzip-encoded response
+                    try:
+                        response_body = gzip.decompress(response_body.encode('utf-8', errors='ignore')).decode('utf-8', errors='ignore')
+                        logging.debug(f"Decompressed gzip response for baseline caching")
+                    except Exception as e:
+                        logging.warning(f"Failed to decompress gzip response: {e}")
+                        # Fall back to original body
+            except Exception as e:
+                logging.warning(f"Error checking Content-Encoding header: {e}")
+            
+            await self.baseline_cache.set(key, {
+                'text': self.token_normalizer.normalize(response_body),
+                'headers': Detector._normalize_headers(dict(resp.headers)),
+                'status': resp.status,
+                'elapsed': elapsed
+            })
         tasks = [baseline_for(p) for p in self.crawler_engine._get_parameters_iterator()]
         done, pending = await safe_async_wait(tasks, timeout=240, return_when=asyncio.ALL_COMPLETED)
         if pending:
@@ -31533,7 +31681,11 @@ class InjectionEngine:
                                 if not allowed:
                                     logging.debug(f"[SAFETY] Payload blocked: {reason}")
                                     continue
-                            resp = await self._send_and_detect_with_corpus(param, vuln_type, dynamic_payload, corpus_minimizer)
+                            try:
+                                resp = await self._send_and_detect_with_corpus(param, vuln_type, dynamic_payload, corpus_minimizer)
+                            except Exception as e:
+                                logging.error(f"Failed to test dynamic payload for {vuln_type} on {param['url']}: {e}")
+                                continue
                     else:
                         # Use advanced obfuscation for SQL payloads when available
                         if vuln_type == "SQLi" and hasattr(self, 'semantic_mutator') and self.semantic_mutator:
@@ -31558,7 +31710,11 @@ class InjectionEngine:
                                         if not allowed:
                                             logging.debug(f"[SAFETY] Payload blocked: {reason}")
                                             continue
-                                    resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                    try:
+                                        resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                    except Exception as e:
+                                        logging.error(f"Failed to test semantic variant for {vuln_type} on {param['url']}: {e}")
+                                        continue
                             except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                                 logging.debug(f"Network error during context-aware obfuscation, falling back to standard: {e}")
                             except (KeyError, ValueError, TypeError) as e:
@@ -31575,7 +31731,11 @@ class InjectionEngine:
                                     if not allowed:
                                         logging.debug(f"[SAFETY] Payload blocked: {reason}")
                                         continue
-                                resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                try:
+                                    resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                except Exception as e:
+                                    logging.error(f"Failed to test obfuscated payload for {vuln_type} on {param['url']}: {e}")
+                                    continue
                         else:
                             # Use standard obfuscation
                             for variant in obfuscate(payload):
@@ -31586,7 +31746,11 @@ class InjectionEngine:
                                     if not allowed:
                                         logging.debug(f"[SAFETY] Payload blocked: {reason}")
                                         continue
-                                resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                try:
+                                    resp = await self._send_and_detect_with_corpus(param, vuln_type, variant, corpus_minimizer)
+                                except Exception as e:
+                                    logging.error(f"Failed to test standard payload for {vuln_type} on {param['url']}: {e}")
+                                    continue
             
             # Log corpus coverage statistics
             coverage_stats = corpus_minimizer.get_coverage_stats()
@@ -31665,7 +31829,7 @@ class InjectionEngine:
                 
                 # Enter regression mode to verify consistency
                 # Enable business logic checking for SQL injection to catch race conditions that return 200 OK
-                check_business_logic = (vuln_type == 'SQL Injection')
+                check_business_logic = (vuln_type == 'SQLi')
                 regression_result = await self.heuristic_oracle.enter_regression_mode(
                     url, method, payload, 
                     headers=param.get('headers'),
@@ -31820,7 +31984,7 @@ class InjectionEngine:
                 
                 # Also try JSON-aware SQLi detection for JSON responses
                 if not sqli_result:
-                    content_type = resp._headers.get('Content-Type', '') if hasattr(resp, '_headers') else ''
+                    content_type = resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else ''
                     json_result = Detector.sqli_json_aware(response_body, content_type)
                     if json_result:
                         sqli_result = json_result
@@ -31831,11 +31995,15 @@ class InjectionEngine:
                 headers = param.get('headers', {})
                 raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
                 await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence,"raw_request":raw_request,"request_headers":headers})
+            elif result:
+                logging.info(f"Low-confidence finding below threshold ({result.get('confidence',0)}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln_type} at {url} - {result.get('evidence', '')[:100]}")
             
             if baseline and not result:
                 diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
                 if diff_result and diff_result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
                     await self._add_vulnerability({**diff_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,"")})
+                elif diff_result:
+                    logging.info(f"Low-confidence diff finding below threshold ({diff_result.get('confidence',0)}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln_type} at {url} - {diff_result.get('evidence', '')[:100]}")
         
         return resp
     
@@ -32154,7 +32322,7 @@ class InjectionEngine:
                     
                     # Also try JSON-aware SQLi detection for JSON responses
                     if not result:
-                        content_type = resp._headers.get('Content-Type', '') if hasattr(resp, '_headers') else ''
+                        content_type = resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else ''
                         json_result = Detector.sqli_json_aware(response_body, content_type)
                         if json_result:
                             result = json_result
@@ -32192,7 +32360,7 @@ class InjectionEngine:
             else:
                 # Enter regression mode to verify consistency
                 # Enable business logic checking for SQL injection to catch race conditions that return 200 OK
-                check_business_logic = (vuln_type == 'SQL Injection')
+                check_business_logic = (vuln_type == 'SQLi')
                 regression_result = await self.heuristic_oracle.enter_regression_mode(
                     url, method, payload, 
                     headers=param.get('headers'),
@@ -32313,7 +32481,7 @@ class InjectionEngine:
             
             # Also try JSON-aware SQLi detection for JSON responses
             if not result:
-                content_type = resp._headers.get('Content-Type', '') if hasattr(resp, '_headers') else ''
+                content_type = resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else ''
                 json_result = Detector.sqli_json_aware(response_body, content_type)
                 if json_result:
                     result = json_result
@@ -32638,7 +32806,7 @@ class InjectionEngine:
             
             # Also try JSON-aware SQLi detection for JSON responses
             if not sqli_result:
-                content_type = resp._headers.get('Content-Type', '') if hasattr(resp, '_headers') else ''
+                content_type = resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else ''
                 json_result = Detector.sqli_json_aware(response_body, content_type)
                 if json_result:
                     sqli_result = json_result
@@ -32685,10 +32853,14 @@ class InjectionEngine:
             headers = param.get('headers', {})
             raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
             await self._add_vulnerability({**result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,""),"full_evidence":evidence,"raw_request":raw_request,"request_headers":headers})
+        elif result:
+            logging.info(f"Low-confidence finding below threshold ({result.get('confidence',0)}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln_type} at {url} - {result.get('evidence', '')[:100]}")
         if baseline and not result:
             diff_result = Detector.small_difference_detection(html, baseline_html, f"{vuln_type} on {pname}")
             if diff_result and diff_result.get('confidence',0) >= self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
                 await self._add_vulnerability({**diff_result,"url":url,"parameter":pname,"method":method,"payload":payload,"cwe":CWE_MAP.get(vuln_type,"")})
+            elif diff_result:
+                logging.info(f"Low-confidence diff finding below threshold ({diff_result.get('confidence',0)}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln_type} at {url} - {diff_result.get('evidence', '')[:100]}")
     async def _send_injection(self, param, payload):
         url = param['url']; method = param['method']; pname = param['param']; ptype = param['type']
         if method == 'GET':
@@ -39402,7 +39574,7 @@ class OmegaDAST:
             self.fp_db = None
         
         print("Creating ReportingEngine...")
-        self.reporting_engine = ReportingEngine(config, signals, self.session_manager, cve_template_engine=self.cve_template_engine, fp_db=self.fp_db)
+        self.reporting_engine = ReportingEngine(config, signals, self.session_manager, cve_template_engine=self.cve_template_engine, fp_db=self.fp_db, target_domain=self.base_domain)
         print("Creating OOBManager...")
         self.oob_manager = OOBManager(config, self.public_ip)
         
@@ -39827,6 +39999,7 @@ class OmegaDAST:
             
             conf = vuln.get('confidence', 0)
             if conf < self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
+                logging.info(f"Low-confidence finding below threshold ({conf}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln.get('type')} at {vuln.get('url')} - {vuln.get('evidence', '')[:100]}")
                 return
             vuln.setdefault('subtype', 'General')
             vuln.setdefault('method', 'POST' if vuln.get('payload') else 'GET')
@@ -40349,7 +40522,7 @@ class OmegaDAST:
                     return
             
             # Fetch the target homepage for version detection
-            resp = await self._async_fetch(self.target)
+            resp = await self._safe_request('GET', self.target)
             if not resp:
                 self.log("Version detection: Could not fetch target homepage")
                 return
@@ -40367,7 +40540,7 @@ class OmegaDAST:
                         js_content += script.string + '\n'
                     elif script.get('src'):
                         script_url = urljoin(self.target, script['src'])
-                        script_resp = await self._async_fetch(script_url)
+                        script_resp = await self._safe_request('GET', script_url)
                         if script_resp and hasattr(script_resp, 'text'):
                             js_content += script_resp.text + '\n'
             except Exception as e:
@@ -40832,6 +41005,14 @@ class OmegaDAST:
         await self.crawl()
         self.log(f"Crawled {len(self.crawler_engine.visited_urls)} URLs, found {len(self.crawler_engine.parameters)} parameters.")
         
+        # If no parameters found, add some common parameters for testing
+        if len(self.crawler_engine.parameters) == 0:
+            self.log("No parameters found during crawling, adding common parameters for testing...")
+            common_params = ['id', 'user', 'search', 'file', 'page', 'action', 'submit', 'email', 'password', 'token']
+            for param in common_params:
+                self.crawler_engine._add_param(self.target, 'GET', param, 'query')
+            self.log(f"Added {len(common_params)} common parameters for testing.")
+        
         # Pause check point after crawling
         await self.pause_event.wait()
         
@@ -40945,9 +41126,12 @@ class OmegaDAST:
         await self.pause_event.wait()
         
         # Run schema-aware fuzzing if enabled (more intelligent than wordlist fuzzing)
-        if self.schema_inference_enabled and self.dynamic_mutation_enabled:
+        if (hasattr(self.injection_engine, 'schema_inference_enabled') and 
+            self.injection_engine.schema_inference_enabled and 
+            hasattr(self.injection_engine, 'dynamic_mutation_enabled') and 
+            self.injection_engine.dynamic_mutation_enabled):
             self.log("Schema-aware fuzzing is enabled - this will provide more targeted vulnerability detection")
-            await self.run_schema_aware_fuzzing_integration()
+            # Schema-aware fuzzing is integrated into the injection engine's main flow
         if self.config.get('save_state'):
             # Export FSM state if available
             fsm_state = None
@@ -45822,306 +46006,6 @@ class OmegaDAST:
         except Exception as e:
             logging.warning(f"Wordlist fuzzing execution failed: {e}")
             self.log(f"Wordlist fuzzing encountered an error: {e}")
-    
-    async def run_schema_aware_fuzzing_integration(self):
-        """Run schema-aware fuzzing using the Schema Inference Engine and Dynamic Mutation Server"""
-        if not self.schema_inference_enabled or not self.dynamic_mutation_enabled:
-            self.log("Schema-aware fuzzing disabled, skipping")
-            return
-        
-        if not self.schema_engine or not self.mutation_server:
-            self.log("Schema-aware fuzzing components not initialized, skipping")
-            return
-        
-        self.log("Starting schema-aware fuzzing integration...")
-        
-        # Select high-value targets for schema-aware fuzzing
-        targets = []
-        for url in list(self.crawler_engine.visited_urls)[:10]:  # Focus on top 10 endpoints
-            for param in self.crawler_engine.parameters:
-                if param['url'] == url and param['method'] in ['POST', 'PUT', 'PATCH']:
-                    targets.append((url, param['method'], param))
-        
-        self.log(f"Running schema-aware fuzzing on {len(targets)} targets")
-        
-        for url, method, param_info in targets:
-            try:
-                # Build base data from parameter info
-                base_data = {param_info['param']: 'test'}
-                
-                # Run schema-aware fuzzing
-                result = await self._run_schema_aware_fuzzing_for_endpoint(url, method, base_data)
-                
-                if result and result.get('vulnerabilities_found', 0) > 0:
-                    self.log(f"[SCHEMA-AWARE FUZZING] Found {result['vulnerabilities_found']} potential vulnerabilities on {url}")
-                    
-                    # Process interesting results as vulnerabilities
-                    for test_result in result.get('results', []):
-                        if test_result.get('vulnerability_detected'):
-                            vuln = self._create_vulnerability_from_schema_result(test_result, url, method)
-                            await self._add_vulnerability(vuln)
-                            self.log(f"[SCHEMA-AWARE FUZZING] {vuln['type']} found via schema inference")
-                
-            except Exception as e:
-                logging.error(f"Schema-aware fuzzing failed for {url}: {e}")
-        
-        self.log("Schema-aware fuzzing integration complete")
-    
-    async def _run_schema_aware_fuzzing_for_endpoint(self, url, method, base_data):
-        """Run schema-aware fuzzing for a specific endpoint"""
-        # Infer schema
-        schema = await self.schema_engine.infer_endpoint_schema(url, method, None, base_data)
-        
-        if schema['confidence'] < 0.5:
-            self.log(f"Low schema confidence ({schema['confidence']:.2f}) for {url}, skipping detailed fuzzing")
-            return None
-        
-        self.log(f"Schema inferred for {url} with confidence {schema['confidence']:.2f}")
-        
-        # Generate mutations
-        mutations = await self.mutation_server.generate_mutations(url, method, None, base_data)
-        
-        if not mutations:
-            self.log(f"No mutations generated for {url}")
-            return None
-        
-        self.log(f"Generated {len(mutations)} mutations for {url}")
-        
-        # Test mutations
-        results = []
-        for mutation in mutations[:50]:  # Limit to 50 mutations per endpoint for performance
-            try:
-                test_data = {mutation['parameter']: mutation['value']}
-                response = await self._send_schema_mutation_request(url, method, test_data)
-                
-                if response:
-                    result = {
-                        'mutation': mutation,
-                        'response': response,
-                        'interesting': self._is_schema_response_interesting(response, mutation),
-                        'vulnerability_detected': self._detect_schema_vulnerability(response, mutation)
-                    }
-                    results.append(result)
-                    
-            except Exception as e:
-                logging.debug(f"Schema mutation test failed: {e}")
-        
-        return {
-            'total_mutations': len(mutations),
-            'tested_mutations': len(results),
-            'interesting_responses': len([r for r in results if r['interesting']]),
-            'vulnerabilities_found': len([r for r in results if r['vulnerability_detected']]),
-            'schema_confidence': schema['confidence'],
-            'results': results
-        }
-    
-    async def _send_schema_mutation_request(self, url, method, data):
-        """Send a schema mutation request"""
-        try:
-            async with self.session_manager.async_session.request(
-                method,
-                url,
-                json=data,
-                timeout=ClientTimeout(total=10)
-            ) as response:
-                text = await response.text()
-                return {
-                    'status': response.status,
-                    'response_length': len(text),
-                    'response_text': text,
-                    'headers': dict(response.headers)
-                }
-        except Exception as e:
-            logging.debug(f"Schema mutation request failed: {e}")
-            return None
-    
-    def _is_schema_response_interesting(self, response, mutation):
-        """Determine if a schema response is interesting"""
-        if not response:
-            return False
-        
-        status = response.get('status', 0)
-        response_text = response.get('response_text', '')
-        
-        # Error responses are interesting
-        if status >= 400:
-            return True
-        
-        # Check for reflected payload
-        mutation_value = str(mutation.get('value', ''))
-        if mutation_value and mutation_value in response_text:
-            return True
-        
-        # Check for error patterns
-        error_patterns = ['error', 'exception', 'fatal', 'warning', 'traceback']
-        if any(pattern in response_text.lower() for pattern in error_patterns):
-            return True
-        
-        return False
-    
-    def _detect_schema_vulnerability(self, response, mutation):
-        """Detect if a schema mutation indicates a vulnerability"""
-        if not response:
-            return False
-        
-        status = response.get('status', 0)
-        response_text = response.get('response_text', '')
-        mutation_type = mutation.get('mutation_type', '')
-        
-        # Overflow vulnerabilities
-        if 'overflow' in mutation_type and status >= 500:
-            return True
-        
-        # Injection vulnerabilities
-        if 'injection' in mutation_type:
-            mutation_value = str(mutation.get('value', ''))
-            if mutation_value in response_text:
-                return True
-        
-        # Deserialization vulnerabilities
-        if 'deserialization' in mutation_type or 'pollution' in mutation_type:
-            if status >= 500 or 'polluted' in response_text.lower():
-                return True
-        
-        # Format string vulnerabilities
-        if 'format' in mutation_type and status >= 500:
-            return True
-        
-        return False
-    
-    def _create_vulnerability_from_schema_result(self, result, url, method):
-        """Create a vulnerability entry from schema-aware fuzzing result"""
-        mutation = result['mutation']
-        response = result['response']
-        
-        # Map mutation types to vulnerability types
-        vuln_type_map = {
-            'integer_overflow': 'IntegerOverflow',
-            'float_overflow': 'FloatOverflow',
-            'injection': 'Injection',
-            'advanced_injection': 'Injection',
-            'deserialization': 'InsecureDeserialization',
-            'prototype_pollution': 'PrototypePollution',
-            'heap_spray': 'HeapSpray',
-            'format_string': 'FormatString',
-            'extreme_overflow': 'IntegerOverflow'
-        }
-        
-        vuln_type = vuln_type_map.get(mutation.get('mutation_type', 'unknown'), 'DataFlow')
-        
-        # Build raw request for export
-        headers = result.get('headers', {})
-        payload = mutation.get('value', '')
-        raw_request = self._build_raw_request_for_storage(method, url, headers, payload)
-
-        return {
-            'type': vuln_type,
-            'url': url,
-            'method': method,
-            'parameter': mutation.get('parameter'),
-            'severity': mutation.get('severity', 'MEDIUM'),
-            'confidence': 85,  # High confidence due to schema-based detection
-            'evidence': f"Schema-aware mutation {mutation['mutation_type']} triggered interesting response: {response.get('status')}",
-            'payload': str(mutation.get('value', ''))[:500],
-            'response_status': response.get('status'),
-            'response_length': response.get('response_length'),
-            'discovery_method': 'schema_aware_fuzzing',
-            'cwe': self._get_cwe_for_vuln_type(vuln_type),
-            'raw_request': raw_request,
-            'request_headers': headers,
-        }
-    
-    def _build_raw_request_for_storage(self, method, url, headers, payload):
-        """Helper method to build raw HTTP request for storage/export"""
-        parsed_url = urlparse(url)
-        path = parsed_url.path or '/'
-        if parsed_url.query:
-            path += '?' + parsed_url.query
-        
-        raw_request = f"{method} {path} HTTP/1.1\r\n"
-        # Use hostname instead of netloc to strip port
-        raw_request += f"Host: {parsed_url.hostname}\r\n"
-        
-        for header_name, header_value in headers.items():
-            raw_request += f"{header_name}: {header_value}\r\n"
-        
-        if payload:
-            if isinstance(payload, dict):
-                body_str = json.dumps(payload)
-            else:
-                body_str = str(payload)
-            raw_request += f"Content-Length: {len(body_str)}\r\n"
-            raw_request += "\r\n"
-            raw_request += body_str
-        else:
-            raw_request += "\r\n"
-        
-        return raw_request
-
-    def _get_cwe_for_vuln_type(self, vuln_type):
-        """Map vulnerability types to CWE identifiers"""
-        cwe_map = {
-            'IntegerOverflow': 'CWE-190',
-            'FloatOverflow': 'CWE-190',
-            'Injection': 'CWE-74',
-            'InsecureDeserialization': 'CWE-502',
-            'PrototypePollution': 'CWE-1321',
-            'HeapSpray': 'CWE-122',
-            'FormatString': 'CWE-134',
-            'DataFlow': 'CWE-942'
-        }
-        return cwe_map.get(vuln_type, 'CWE-942')
-    
-    async def _send_schema_mutation_request(self, url, method, data, headers=None):
-        """Send a schema mutation request (helper method for integration)"""
-        try:
-            async with self.session_manager.async_session.request(
-                method,
-                url,
-                json=data,
-                headers=headers,
-                timeout=ClientTimeout(total=10)
-            ) as response:
-                text = await response.text()
-                return {
-                    'status': response.status,
-                    'response_length': len(text),
-                    'response_text': text,
-                    'headers': dict(response.headers)
-                }
-        except Exception as e:
-            logging.debug(f"Schema mutation request failed: {e}")
-            return None
-    
-    def _detect_schema_vulnerability(self, response, mutation):
-        """Detect if a schema mutation indicates a vulnerability (helper method for integration)"""
-        if not response:
-            return False
-        
-        status = response.get('status', 0)
-        response_text = response.get('response_text', '')
-        mutation_type = mutation.get('mutation_type', '')
-        
-        # Overflow vulnerabilities
-        if 'overflow' in mutation_type and status >= 500:
-            return True
-        
-        # Injection vulnerabilities
-        if 'injection' in mutation_type:
-            mutation_value = str(mutation.get('value', ''))
-            if mutation_value and mutation_value in response_text:
-                return True
-        
-        # Deserialization vulnerabilities
-        if 'deserialization' in mutation_type or 'pollution' in mutation_type:
-            if status >= 500 or 'polluted' in response_text.lower():
-                return True
-        
-        # Format string vulnerabilities
-        if 'format' in mutation_type and status >= 500:
-            return True
-        
-        return False
 
 class GraphQLSelfReferencingFragmentGenerator:
     """
@@ -46535,6 +46419,7 @@ class GraphQLSelfReferencingFragmentGenerator:
             
             conf = vuln.get('confidence', 0)
             if conf < self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD):
+                logging.info(f"Low-confidence finding below threshold ({conf}% < {self.config.get('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)}%): {vuln.get('type')} at {vuln.get('url')} - {vuln.get('evidence', '')[:100]}")
                 return
             vuln.setdefault('subtype', 'General')
             vuln.setdefault('method', 'POST' if vuln.get('payload') else 'GET')
@@ -53196,6 +53081,19 @@ class ScanTab(QWidget):
         self.progress_label.setText("Starting scan...")
         self.clear_endpoint_progress()
         
+        # Clear previous scan findings to show only current scan results
+        self.all_findings = []
+        self.current_page = 0
+        self.update_findings_table()
+        
+        # Clear vulnerability storage from previous scans to ensure only current scan results are shown
+        if hasattr(self, 'worker') and hasattr(self.worker, 'scanner') and hasattr(self.worker.scanner, 'reporting_engine'):
+            try:
+                self.worker.scanner.reporting_engine.vulnerability_storage.clear_all_vulnerabilities()
+                self.log_area.append("[CLEANUP] Cleared vulnerability storage from previous scans")
+            except Exception as e:
+                self.log_area.append(f"[ERROR] Failed to clear vulnerability storage: {e}")
+        
         # Initialize endpoint tree with target URL
         self.update_endpoint_progress(target, "Pending", 0, 0)
         
@@ -53251,11 +53149,42 @@ class ScanTab(QWidget):
     def update_status(self, status):
         self.progress_label.setText(f"Status: {status}")
     def add_finding(self, vuln):
-        # Store finding in memory instead of adding directly to table
+        # Store finding in memory
         self.all_findings.append(vuln)
         
-        # Update table with pagination - only show current page
-        self.update_findings_table()
+        # Incremental row insertion - only add the new finding if it's on the current page
+        total_findings = len(self.all_findings)
+        start_idx = self.current_page * self.page_size
+        end_idx = min(start_idx + self.page_size, total_findings)
+        
+        # Only add to table if this finding falls within the current page range
+        if total_findings - 1 >= start_idx and total_findings - 1 < end_idx:
+            row = self.findings_table.rowCount()
+            self.findings_table.insertRow(row)
+            
+            vuln_type = vuln.get('type', '')
+            
+            # Add visual indicator for gray zone findings
+            if vuln.get('gray_zone'):
+                vuln_type = f"[GRAY ZONE] {vuln_type}"
+            
+            self.findings_table.setItem(row, 0, QTableWidgetItem(vuln_type))
+            self.findings_table.setItem(row, 1, QTableWidgetItem(vuln['url']))
+            self.findings_table.setItem(row, 2, QTableWidgetItem(vuln.get('parameter','')))
+            self.findings_table.setItem(row, 3, QTableWidgetItem(str(vuln.get('confidence',''))))
+            self.findings_table.setItem(row, 4, QTableWidgetItem(vuln.get('severity','')))
+            self.findings_table.setItem(row, 5, QTableWidgetItem(vuln.get('cwe','')))
+            self.findings_table.item(row, 0).setData(Qt.UserRole, vuln)
+            
+            # Add color coding for gray zone findings
+            if vuln.get('gray_zone'):
+                for col in range(6):
+                    item = self.findings_table.item(row, col)
+                    if item:
+                        item.setBackground(QColor(255, 255, 200))  # Light yellow background
+        
+        # Update pagination info
+        self.update_pagination_info()
         
         # Also sync with worker's all_findings if available
         if hasattr(self, 'worker') and hasattr(self.worker, 'all_findings'):
@@ -53349,7 +53278,8 @@ class ScanTab(QWidget):
             self.current_page += 1
             self.update_findings_table()
     def show_context_menu(self, pos):
-        item = self.findings_table.itemAt(pos.row(), 0)
+        # Get the item at the position (pos is a QPoint)
+        item = self.findings_table.itemAt(pos)
         if item:
             vuln = item.data(Qt.UserRole)
             menu = QMenu()
@@ -53369,7 +53299,8 @@ class ScanTab(QWidget):
                         self.log_area.append(f"[FP] Marked {vuln['type']} at {vuln['url']} as false positive (parameter suppression enabled)")
                         
                         # Remove from all_findings list using actual index
-                        actual_index = self.current_page * self.page_size + pos.row()
+                        row = self.findings_table.row(item)
+                        actual_index = self.current_page * self.page_size + row
                         if actual_index < len(self.all_findings):
                             self.all_findings.pop(actual_index)
                             self.update_findings_table()
@@ -53599,8 +53530,10 @@ class ScanTab(QWidget):
         # Ensure all findings from the reporting engine are integrated into GUI
         if hasattr(self.worker, 'scanner') and hasattr(self.worker.scanner, 'reporting_engine'):
             try:
-                scanner_findings = self.worker.scanner.reporting_engine.vulnerabilities
-                self.log_area.append(f"Found {len(scanner_findings)} total findings in reporting engine")
+                # Only get findings for the current target domain
+                current_target = self.worker.scanner.base_domain
+                scanner_findings = self.worker.scanner.reporting_engine.get_vulnerabilities_by_target_domain(current_target)
+                self.log_area.append(f"Found {len(scanner_findings)} findings for target {current_target} in reporting engine")
                 
                 # Merge findings without duplicates
                 merged_count = 0
@@ -53617,7 +53550,7 @@ class ScanTab(QWidget):
                         self.all_findings.append(scanner_finding)
                         merged_count += 1
                 
-                self.log_area.append(f"Merged {merged_count} new findings from reporting engine")
+                self.log_area.append(f"Merged {merged_count} new findings from reporting engine for current target")
                 
                 # Update findings table with all integrated findings
                 self.update_findings_table()
@@ -54214,7 +54147,7 @@ class SeleniumBrowserTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("UltraDAST v.20.0 – Unstoppable Pentester")
+        self.setWindowTitle("UltraDAST v20.2 – Unstoppable Pentester")
         self.resize(1600, 1000)
         # Set reasonable minimum size constraints (no maximum for full adjustability)
         self.setMinimumSize(1200, 800)
@@ -55400,7 +55333,7 @@ class MainWindow(QMainWindow):
                         ['Low', str(severity_counts['Low'])],
                         ['Info', str(severity_counts['Info'])],
                         ['Scan Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                        ['Tool Version', 'UltraDAST v.20.0']
+                        ['Tool Version', 'UltraDAST v20.2']
                     ]
                     summary_table = Table(summary_data, colWidths=[2*inch, 2*inch])
                     summary_table.setStyle(TableStyle([
@@ -55586,7 +55519,7 @@ class MainWindow(QMainWindow):
                     report = {
                         "scan_info": {
                             "timestamp": datetime.now().isoformat(),
-                            "tool": "UltraDAST v.20.0",
+                            "tool": "UltraDAST v20.2",
                             "total_findings": len(current_tab.all_findings)
                         },
                         "vulnerabilities": []
@@ -55655,6 +55588,41 @@ class MainWindow(QMainWindow):
             self.jira_webhook_url = jira_input.text().strip()
             self.slack_webhook_url = slack_input.text().strip()
             self.statusBar().showMessage("Webhook configuration saved")
+    
+    def closeEvent(self, event):
+        """Handle window close event with proper async cleanup"""
+        import asyncio
+        import sys
+        
+        try:
+            # Cancel all async tasks to prevent the proactor error
+            try:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # No running loop, create a new one
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                if loop.is_running():
+                    # Cancel all pending tasks
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    
+                    # Give tasks a chance to clean up
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    
+                    # Close the loop
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception as e:
+                logging.debug(f"Error during async cleanup: {e}")
+        except Exception as e:
+            logging.debug(f"Error in closeEvent: {e}")
+        
+        # Accept the close event
+        event.accept()
 
 # ---------------------------------------------------------------------
 # RECONNAISSANCE MATURITY MODEL - SAFETY CONTROLS
@@ -55876,7 +55844,7 @@ def main():
         
         # Parse command-line arguments for safety controls
         parser = argparse.ArgumentParser(
-            description='ULTRA-DAST v.20.0 - Advanced Security Scanner with Safety Controls',
+            description='ULTRA-DAST v20.2 - Advanced Security Scanner with Safety Controls',
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Reconnaissance Maturity Model:
@@ -60482,8 +60450,47 @@ class WordlistFuzzer:
     def __init__(self, target_url, session_manager, wordlist=None, max_requests=1000):
         self.target_url = target_url
         self.session_manager = session_manager
-        self.wordlist = wordlist or self._get_default_wordlist()
         self.max_requests = max_requests
+        
+        # Initialize wordlist - will be validated after _get_default_wordlist is available
+        self._wordlist = wordlist
+        self.wordlist = None  # Will be set in _validate_wordlist
+        
+        self.results = []
+        self.request_count = 0
+        self.stop_event = asyncio.Event()
+        
+        # Response pattern tracking
+        self.response_signatures = set()
+        self.status_codes = {}
+        self.content_lengths = {}
+        
+        # Fuzzing statistics
+        self.total_requests = 0
+        self.unique_responses = 0
+        self.errors_found = 0
+        self.timeouts = 0
+        
+        # Validate and set wordlist
+        self._validate_wordlist()
+        
+        logging.info("WordlistFuzzer initialized with wordlist-based fuzzing")
+    
+    def _validate_wordlist(self):
+        """Validate and normalize the wordlist to ensure it's always a list"""
+        default_wordlist = self._get_default_wordlist()
+        wordlist = self._wordlist
+        
+        if wordlist is None:
+            self.wordlist = default_wordlist
+        elif isinstance(wordlist, list):
+            self.wordlist = wordlist
+        elif isinstance(wordlist, (str, int, float)):
+            self.wordlist = [str(wordlist)]
+        elif hasattr(wordlist, '__iter__'):
+            self.wordlist = list(wordlist)
+        else:
+            self.wordlist = default_wordlist
         self.results = []
         self.request_count = 0
         self.stop_event = asyncio.Event()
@@ -60735,12 +60742,26 @@ class WordlistFuzzer:
         
         seed_data = seed_data or self.wordlist
         
+        # Ensure seed_data is a list
+        if not isinstance(seed_data, list):
+            if isinstance(seed_data, (str, int, float)):
+                seed_data = [str(seed_data)]
+            else:
+                seed_data = list(seed_data) if hasattr(seed_data, '__iter__') else []
+        
+        # Ensure wordlist is a list
+        if not isinstance(self.wordlist, list):
+            if isinstance(self.wordlist, (str, int, float)):
+                self.wordlist = [str(self.wordlist)]
+            else:
+                self.wordlist = list(self.wordlist) if hasattr(self.wordlist, '__iter__') else []
+        
         for i in range(population_size):
             if i < len(seed_data):
                 data = seed_data[i] if isinstance(seed_data[i], str) else str(seed_data[i])
             else:
                 # Generate random initial data from wordlist
-                data = random.choice(self.wordlist)
+                data = random.choice(self.wordlist) if self.wordlist else str(i)
             
             individual = {
                 'data': data,
@@ -60878,7 +60899,7 @@ class WordlistFuzzer:
         """Tournament selection for choosing parents"""
         import random
         tournament = random.sample(self.population, min(tournament_size, len(self.population)))
-        return max(tournament, key=lambda x: x.get('fitness', 0))
+        return max(tournament, key=lambda x: float(x.get('fitness', 0)))
     
     async def evolve(self, generations=10, loop=None):
         """Main evolution loop for genetic algorithm"""
@@ -60917,7 +60938,7 @@ class WordlistFuzzer:
                 individual['fitness'] = self.calculate_fitness(individual)
             
             # Sort by fitness
-            self.population.sort(key=lambda x: x.get('fitness', 0), reverse=True)
+            self.population.sort(key=lambda x: float(x.get('fitness', 0)), reverse=True)
             
             # Update best fitness
             if self.population and self.population[0].get('fitness', 0) > self.best_fitness:
@@ -60972,12 +60993,15 @@ class GeneticFuzzer:
                  population_size=50, generations=10, crossover_rate=0.8, mutation_rate=0.3):
         self.target_url = target_url
         self.session_manager = session_manager
-        self.wordlist = wordlist or self._get_default_wordlist()
         self.max_requests = max_requests
         self.population_size = population_size
         self.generations = generations
         self.crossover_rate = crossover_rate
         self.mutation_rate = mutation_rate
+        
+        # Initialize wordlist - will be validated after _get_default_wordlist is available
+        self._wordlist = wordlist
+        self.wordlist = None  # Will be set in _validate_wordlist
         
         # Genetic algorithm state
         self.population = []
@@ -60992,8 +61016,27 @@ class GeneticFuzzer:
         self.unique_responses = 0
         self.interesting_findings = 0
         
+        # Validate and set wordlist
+        self._validate_wordlist()
+        
         logging.info(f"GeneticFuzzer initialized with population_size={population_size}, "
                    f"generations={generations}, crossover_rate={crossover_rate}, mutation_rate={mutation_rate}")
+    
+    def _validate_wordlist(self):
+        """Validate and normalize the wordlist to ensure it's always a list"""
+        default_wordlist = self._get_default_wordlist()
+        wordlist = self._wordlist
+        
+        if wordlist is None:
+            self.wordlist = default_wordlist
+        elif isinstance(wordlist, list):
+            self.wordlist = wordlist
+        elif isinstance(wordlist, (str, int, float)):
+            self.wordlist = [str(wordlist)]
+        elif hasattr(wordlist, '__iter__'):
+            self.wordlist = list(wordlist)
+        else:
+            self.wordlist = default_wordlist
     
     async def _send_fuzz_request(self, parameter_name, payload, method='POST', headers=None):
         """Send a fuzzing request to the target"""
@@ -61112,12 +61155,26 @@ class GeneticFuzzer:
         self.population = []
         seed_data = seed_data or self.wordlist
         
+        # Ensure seed_data is a list
+        if not isinstance(seed_data, list):
+            if isinstance(seed_data, (str, int, float)):
+                seed_data = [str(seed_data)]
+            else:
+                seed_data = list(seed_data) if hasattr(seed_data, '__iter__') else []
+        
+        # Ensure wordlist is a list
+        if not isinstance(self.wordlist, list):
+            if isinstance(self.wordlist, (str, int, float)):
+                self.wordlist = [str(self.wordlist)]
+            else:
+                self.wordlist = list(self.wordlist) if hasattr(self.wordlist, '__iter__') else []
+        
         for i in range(self.population_size):
             if i < len(seed_data):
                 data = seed_data[i] if isinstance(seed_data[i], str) else str(seed_data[i])
             else:
                 # Generate random initial data from wordlist
-                data = random.choice(self.wordlist)
+                data = random.choice(self.wordlist) if self.wordlist else str(i)
             
             individual = {
                 'genome': data,
@@ -61180,7 +61237,7 @@ class GeneticFuzzer:
         """Tournament selection for choosing parents"""
         import random
         tournament = random.sample(self.population, min(tournament_size, len(self.population)))
-        return max(tournament, key=lambda x: x.get('fitness', 0))
+        return max(tournament, key=lambda x: float(x.get('fitness', 0)))
     
     def crossover(self, parent1, parent2):
         """Crossover two parent genomes to create offspring"""
@@ -61443,7 +61500,7 @@ class GeneticFuzzer:
                         all_results.append(evaluation)
             
             # Sort by fitness
-            self.population.sort(key=lambda x: x.get('fitness', 0), reverse=True)
+            self.population.sort(key=lambda x: float(x.get('fitness', 0)), reverse=True)
             
             # Track fitness history
             avg_fitness = sum(ind.get('fitness', 0) for ind in self.population) / len(self.population)
